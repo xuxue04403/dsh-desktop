@@ -1,0 +1,14 @@
+# 构建产物
+DSHDesktop.exe
+*.old-*.exe
+
+# 本地运行数据（不入库）
+logs/
+settings.ini
+crash-*.log
+
+# IDE / 系统
+.vs/
+.vscode/
+*.user
+Thumbs.db
