@@ -95,7 +95,8 @@ namespace DSHDesktop
         private Process dshProc;
         private volatile bool starting = false;
         private volatile bool manuallyStopped = false;
-        private volatile bool alreadyOpened = false;
+        private int autoOpenedFlag = 0;              // 就绪自动开浏览器的跨线程一次性闸门
+        private DateTime lastAutoOpen = DateTime.MinValue;
         private volatile bool running = false;
         private volatile bool forceNpx = false;      // 检测到新版本时强制走 npx 更新
         private volatile bool cancelStart = false;   // 取消待执行的启动（更新检查期间点停止）
@@ -610,7 +611,7 @@ namespace DSHDesktop
 
                 starting = true;
                 manuallyStopped = false;
-                alreadyOpened = false;
+                autoOpenedFlag = 0;
                 tailOffset = 0;
                 lastOutputTime = DateTime.Now;
                 phaseStart = DateTime.Now;
@@ -692,7 +693,7 @@ namespace DSHDesktop
 
                 starting = true;
                 manuallyStopped = false;
-                alreadyOpened = false;
+                autoOpenedFlag = 0;
                 lastOutputTime = DateTime.Now;
                 phaseStart = DateTime.Now;
                 startWaitDeadline = DateTime.Now.AddSeconds(240);
@@ -719,7 +720,7 @@ namespace DSHDesktop
             if (forceNpx)
             {
                 launchSource = "npx";
-                args = "/d /s /c \"npx --yes --prefer-online @deepseek-ai/dsh web >> \"" + logPath + "\" 2>&1\"";
+                args = "/d /s /c \"npx --yes --prefer-online @deepseek-ai/dsh web --no-open >> \"" + logPath + "\" 2>&1\"";
                 desc = "检测到新版本，使用 npx 强制获取最新版并启动";
                 return true;
             }
@@ -731,20 +732,20 @@ namespace DSHDesktop
 
             if (source == "cache")
             {
-                args = "/d /s /c \"" + Quote(FindNodeExe()) + " " + Quote(cacheBin) + " web >> \"" + logPath + "\" 2>&1\"";
+                args = "/d /s /c \"" + Quote(FindNodeExe()) + " " + Quote(cacheBin) + " web --no-open >> \"" + logPath + "\" 2>&1\"";
                 desc = "使用 npm 缓存中的 dsh " + (ver ?? "") + " (direct)";
                 return true;
             }
 
             if (source == "global")
             {
-                args = "/d /s /c \"" + Quote(globalCmd) + " web >> \"" + logPath + "\" 2>&1\"";
+                args = "/d /s /c \"" + Quote(globalCmd) + " web --no-open >> \"" + logPath + "\" 2>&1\"";
                 desc = "使用全局安装的 dsh " + (ver ?? "");
                 return true;
             }
 
             // 方式3：本机没有任何 dsh → 回退 npx 首次下载安装
-            args = "/d /s /c \"npx --yes @deepseek-ai/dsh web >> \"" + logPath + "\" 2>&1\"";
+            args = "/d /s /c \"npx --yes @deepseek-ai/dsh web --no-open >> \"" + logPath + "\" 2>&1\"";
             desc = "未找到本机 dsh，使用 npx 自动下载安装并启动";
             return true;
         }
@@ -1260,18 +1261,20 @@ namespace DSHDesktop
                 bool alive = IsAlive(url);
                 if (alive)
                 {
+                    // 立即停止轮询：防止后续 tick 再排队"就绪回调"，导致重复打开浏览器
+                    StopHealthPolling();
+                    // 跨线程一次性闸门：并发到达的多个路径中，只有一个能拿到 first=true
+                    bool isFirstReady = Interlocked.CompareExchange(ref autoOpenedFlag, 1, 0) == 0;
                     OnUiThread(delegate
                     {
-                        StopHealthPolling();
                         starting = false;
                         running = true;
                         UpdateStatusText("[ 运行中 ] dsh 已就绪  " + url, Color.ForestGreen);
                         AppendLog("[就绪] dsh 服务已就绪: " + url);
-                        if (autoOpenBrowser && !alreadyOpened)
+                        if (autoOpenBrowser && isFirstReady)
                         {
-                            alreadyOpened = true;
                             ShowBalloon("dsh 服务已就绪", "浏览器即将打开 " + url);
-                            OpenBrowser();
+                            OpenBrowser(true);
                         }
                     });
                 }
@@ -1377,13 +1380,24 @@ namespace DSHDesktop
         }
 
         // ---------------- 浏览器 ----------------
-        private void OpenBrowser()
+        private void OpenBrowser(bool auto = false)
         {
             int p;
             if (int.TryParse(txtPort.Text, out p) && p > 0 && p <= 65535) port = p;
             string url = "http://127.0.0.1:" + port + "/";
             try
             {
+                // 自动打开去重：3 秒内的第二次自动调用直接忽略（手动点击不受限）
+                if (auto)
+                {
+                    DateTime now = DateTime.Now;
+                    if ((now - lastAutoOpen).TotalSeconds < 3)
+                    {
+                        AppendLog("[提示] 检测到重复的自动打开请求，已忽略。");
+                        return;
+                    }
+                    lastAutoOpen = now;
+                }
                 if (!IsAlive(url)) AppendLog("[提示] 服务尚未就绪：" + url + "（仍会尝试打开）");
                 Process.Start(url);
                 AppendLog("[打开] 已在默认浏览器中打开 " + url);
