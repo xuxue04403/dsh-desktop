@@ -124,8 +124,28 @@ if (Test-Path $exe) {
         }
 
         $up = "https://uploads.github.com/repos/$login/$RepoName/releases/" + $rel.id + "/assets?name=DSHDesktop.exe"
-        Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType 'application/octet-stream' -InFile $exe | Out-Null
-        Write-Host '[OK] Release asset uploaded: DSHDesktop.exe' -ForegroundColor Green
+        try {
+            Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType 'application/octet-stream' -InFile $exe | Out-Null
+            Write-Host '[OK] Release asset uploaded: DSHDesktop.exe' -ForegroundColor Green
+        } catch {
+            $status = 0
+            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            if ($status -eq 422) {
+                # same-name asset exists: GitHub forbids overwrite, so delete old asset first
+                Write-Host '[..] Asset name already exists on this release; replacing...' -ForegroundColor Yellow
+                $assets = Api 'GET' "$repoUri/releases/$($rel.id)/assets"
+                foreach ($a in $assets) {
+                    if ($a.name -eq 'DSHDesktop.exe') {
+                        Invoke-RestMethod -Method Delete -Uri $a.url -Headers $headers | Out-Null
+                        Write-Host '[OK] Old asset deleted.'
+                    }
+                }
+                Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType 'application/octet-stream' -InFile $exe | Out-Null
+                Write-Host '[OK] Release asset replaced: DSHDesktop.exe' -ForegroundColor Green
+            } else {
+                Write-Host ('[WARN] Release asset upload failed (HTTP ' + $status + '): ' + $_.Exception.Message) -ForegroundColor Yellow
+            }
+        }
     } catch {
         Write-Host ('[WARN] Release step failed: ' + $_.Exception.Message) -ForegroundColor Yellow
     }
