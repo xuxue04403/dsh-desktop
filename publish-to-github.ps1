@@ -79,6 +79,9 @@ $count = 0
 Get-ChildItem $root -Recurse -File | ForEach-Object {
     $rel = $_.FullName.Substring($root.Length + 1).Replace('\', '/')
     if ($rel -eq 'DSHDesktop.exe') { return }                 # exe goes to Release assets
+    if ($rel -like 'dist/*') { return }                       # dist/ builds go to Release assets, not the repo
+    if ($rel -like '*.old-*.exe') { return }                  # locked-exe backups never belong in the repo
+    if ($rel -like '*.old-*.zip') { return }
     if ($rel -like '.git/*' -or $rel -eq '.git') { return }
 
     $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName))
