@@ -79,6 +79,10 @@ namespace DSHDesktop
 
     class MainForm : Form
     {
+        // 无 BOM 的 UTF-8：写 JSON / ini 配置文件必须无 BOM（.NET Encoding.UTF8 默认带 BOM，
+        // Node JSON.parse 会因 BOM 字符失败——网关启动失败根因，修复 N1）
+        private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
+
         // ---------- 设置 ----------
         private string settingsDir;
         private string settingsFile;
@@ -130,7 +134,8 @@ namespace DSHDesktop
         private ComboBox cmbInstall;
         private Button btnGwStart, btnGwStop, btnGwWrite, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen;
         private Label lblGwStatus, lblGwHint;
-        private TextBox txtGwPort, txtGwKey;
+        private TextBox txtGwPort, txtGwKey, txtGwUA;
+        private string gwClientUA = "";                    // 上游请求 UA 覆盖（P3）：空=透传 dsh UA
         private DataGridView gvProviders;
         private NotifyIcon tray;
         private ContextMenuStrip trayMenu;
@@ -374,17 +379,26 @@ namespace DSHDesktop
             txtGwKey = new TextBox(); txtGwKey.Text = gwKey; txtGwKey.SetBounds(630, 15, 80, 24); txtGwKey.BorderStyle = BorderStyle.FixedSingle; txtGwKey.PasswordChar = '●';
 
             // —— 供应商可视化编辑表 ——
+            // 第 2 行（y=56）：上游请求UA（P3 客户端白名单绕过）——留空=透传 dsh 原始 UA（防屏蔽）
+            Label lg3 = new Label(); lg3.Text = "请求UA(可选):"; lg3.SetBounds(16, 58, 90, 20);
+            txtGwUA = new TextBox(); txtGwUA.Text = gwClientUA; txtGwUA.SetBounds(108, 55, 300, 24); txtGwUA.BorderStyle = BorderStyle.FixedSingle;
+            Label lg4 = new Label(); lg4.Text = "留空=透传dsh标识；填 claude-cli/2.0.0 等可过客户端白名单检测"; lg4.SetBounds(416, 58, 300, 20);
+            lg4.ForeColor = Color.FromArgb(120, 120, 120);
+
             Label lh = new Label(); lh.Text = "多供应商管理（同一模型多供应商时，网关自动探测可用性并按优先级路由、故障切换）：";
-            lh.SetBounds(16, 56, 690, 20);
+            lh.SetBounds(16, 82, 690, 16);
             lh.ForeColor = Color.FromArgb(80, 80, 80);
 
             gvProviders = new DataGridView();
-            gvProviders.SetBounds(16, 80, 702, 380);
-            gvProviders.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            gvProviders.SetBounds(16, 100, 702, 360);
+            // 修复 N3：高度固定（去 Bottom anchor），否则 TabPage 布局重算时 gv 溢出并遮挡下方按钮
+            gvProviders.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             gvProviders.AllowUserToAddRows = false;
             gvProviders.AllowUserToDeleteRows = false;
             gvProviders.RowHeadersVisible = false;
-            gvProviders.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            // 列宽用显式 Width（N4）：AutoSize Fill + MinimumWidth 组合会把列撑出表格出现滚动条，
+            // 显式宽度按比例固定，窗口拉伸时表格变宽、列保持比例稳定。
+            gvProviders.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None;
             gvProviders.BackgroundColor = Color.White;
             gvProviders.BorderStyle = BorderStyle.FixedSingle;
             gvProviders.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
@@ -400,12 +414,13 @@ namespace DSHDesktop
             colEnabled.HeaderText = "启用";
             colEnabled.Name = "cEnabled";
             gvProviders.Columns.Add(colEnabled);
-            gvProviders.Columns[0].FillWeight = 70;
-            gvProviders.Columns[1].FillWeight = 110;
-            gvProviders.Columns[2].FillWeight = 90;
-            gvProviders.Columns[3].FillWeight = 120;
-            gvProviders.Columns[4].FillWeight = 45;
-            gvProviders.Columns[5].FillWeight = 35;
+            // 显式列宽（合计 ≈ 680 ≤ 702，无滚动条）：ID 窄 / baseURL 最宽 / Key 适中 / 模型列表次宽 / 优先级窄 / 启用最窄
+            gvProviders.Columns[0].Width = 60;    // 供应商ID
+            gvProviders.Columns[1].Width = 220;   // 上游地址（最宽）
+            gvProviders.Columns[2].Width = 150;   // 上游 Key
+            gvProviders.Columns[3].Width = 180;   // 模型列表
+            gvProviders.Columns[4].Width = 40;    // 优先级
+            gvProviders.Columns[5].Width = 30;    // 启用（勾选框）
 
             // —— 表格下面操作按钮行 ——
             btnGwAdd = new Button(); btnGwAdd.Text = "＋ 添加供应商"; btnGwAdd.SetBounds(16, 472, 105, 30); btnGwAdd.FlatStyle = FlatStyle.Flat;
@@ -423,9 +438,9 @@ namespace DSHDesktop
             lblGwHint.Text = "提示：修改后点「保存配置」写入 gateway.config.json；重启网关生效。也可用「写入 dsh 配置」注册到 dsh。";
             lblGwHint.ForeColor = Color.FromArgb(120, 120, 120);
             lblGwHint.SetBounds(16, 510, 700, 20);
-            lblGwHint.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            // 修复 N3：不设 anchor（默认 None），TabPage 页面固定 576 高，避免布局重算时尺寸被扭曲（曾出现 1228px 宽、y=748）
 
-            tpGateway.Controls.AddRange(new Control[] { btnGwStart, btnGwStop, btnGwWrite, lblGwStatus, lg1, txtGwPort, lg2, txtGwKey, lh, gvProviders, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen, lblGwHint });
+            tpGateway.Controls.AddRange(new Control[] { btnGwStart, btnGwStop, btnGwWrite, lblGwStatus, lg1, txtGwPort, lg2, txtGwKey, lg3, txtGwUA, lg4, lh, gvProviders, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen, lblGwHint });
 
             tabs.TabPages.Add(tpService);
             tabs.TabPages.Add(tpGateway);
@@ -588,6 +603,16 @@ namespace DSHDesktop
             if (txtGwKey != null)
             {
                 gwKey = txtGwKey.Text.Trim();
+            }
+            if (txtGwUA != null)
+            {
+                gwClientUA = txtGwUA.Text.Trim();
+            }
+
+            // 关窗前自动落盘供应商表格（修复 N2：编辑后直接关窗/退出不再丢数据）
+            if (gvProviders != null && gvProviders.Rows.Count > 0)
+            {
+                try { GwSaveToFile(false); } catch { }
             }
 
             SaveSettings();
@@ -1627,6 +1652,9 @@ namespace DSHDesktop
         {
             try
             {
+                // 先自动落盘表格中的供应商（修复 N2：用户编辑后直接点启动会被丢弃）
+                if (gvProviders != null && gvProviders.Rows.Count > 0) GwSaveToFile(false);
+
                 // 清理旧的 gwProc 对象（已退出的直接释放；仍在运行的先停掉再继续）
                 if (gwProc != null)
                 {
@@ -1642,6 +1670,7 @@ namespace DSHDesktop
                 int p; if (int.TryParse(txtGwPort.Text, out p) && p > 0 && p <= 65535) gwPort = p;
                 txtGwPort.Text = gwPort.ToString();
                 gwKey = txtGwKey.Text.Trim();
+                if (txtGwUA != null) gwClientUA = txtGwUA.Text.Trim();
                 SaveSettings();
 
                 string dir = GatewayDir();
@@ -1777,8 +1806,8 @@ namespace DSHDesktop
                     AppendLog("[网关] 已将界面统一 Key 同步到 gateway.config.json。");
                 }
 
-                // port 或 key 有变动才写盘
-                File.WriteAllText(gwConfigPath, json, Encoding.UTF8);
+                // port 或 key 有变动才写盘（无 BOM——修复 N1：带 BOM 的 JSON 无法被 Node 解析）
+                File.WriteAllText(gwConfigPath, json, Utf8NoBom);
 
                 if (cfgKey.Length == 0 || cfgKey == "change-me" || cfgKey == "dsh-gateway-change-me")
                 {
@@ -1882,6 +1911,7 @@ namespace DSHDesktop
 
                 if (cfg.ContainsKey("port")) { int p; if (int.TryParse(cfg["port"], out p) && p > 0) gwPort = p; txtGwPort.Text = gwPort.ToString(); }
                 if (cfg.ContainsKey("apiKey")) { gwKey = cfg["apiKey"]; txtGwKey.Text = gwKey; }
+                if (cfg.ContainsKey("clientUA")) { gwClientUA = cfg["clientUA"]; if (txtGwUA != null) txtGwUA.Text = gwClientUA; }
 
                 // 提取 providers 数组
                 List<string> provList = null;
@@ -2068,12 +2098,17 @@ namespace DSHDesktop
         }
 
         // —— 从表格写回 gateway.config.json ——
-        private void GwSaveToFile()
+        // 保存供应商表格到 gateway.config.json（无 BOM）
+        // notify=true 时给出界面/日志提示（按钮点击）；false 供启动/写 dsh 前自动落盘（静默）
+        private void GwSaveToFile() { GwSaveToFile(true); }
+
+        private void GwSaveToFile(bool notify)
         {
             try
             {
                 int p; if (int.TryParse(txtGwPort.Text, out p) && p > 0 && p <= 65535) gwPort = p;
                 gwKey = txtGwKey.Text.Trim();
+                if (txtGwUA != null) gwClientUA = txtGwUA.Text.Trim();
 
                 var provs = new List<Dictionary<string, object>>();
                 foreach (DataGridViewRow row in gvProviders.Rows)
@@ -2102,10 +2137,13 @@ namespace DSHDesktop
                 }
 
                 if (!Directory.Exists(Path.GetDirectoryName(gwConfigPath))) Directory.CreateDirectory(Path.GetDirectoryName(gwConfigPath));
-                File.WriteAllText(gwConfigPath, BuildGatewayJson(provs), Encoding.UTF8);
+                File.WriteAllText(gwConfigPath, BuildGatewayJson(provs), Utf8NoBom);   // 无 BOM（N1）
 
-                lblGwHint.Text = "已保存 " + provs.Count + " 个供应商 → " + gwConfigPath;
-                AppendLog("[网关] 供应商配置已保存（" + provs.Count + " 家）。重启网关生效；可点「写入 dsh 配置」注册到 dsh。");
+                if (notify)
+                {
+                    lblGwHint.Text = "已保存 " + provs.Count + " 个供应商 → " + gwConfigPath;
+                    AppendLog("[网关] 供应商配置已保存（" + provs.Count + " 家）。重启网关生效；可点「写入 dsh 配置」注册到 dsh。");
+                }
                 SaveSettings();
             }
             catch (Exception ex)
@@ -2122,6 +2160,8 @@ namespace DSHDesktop
             sb.AppendLine("{");
             sb.AppendLine("  \"port\": " + gwPort + ",");
             sb.AppendLine("  \"apiKey\": \"" + JsonEsc(gwKey) + "\",");
+            if (!string.IsNullOrEmpty(gwClientUA))
+                sb.AppendLine("  \"clientUA\": \"" + JsonEsc(gwClientUA) + "\",");
             sb.AppendLine("  \"providers\": [");
             for (int i = 0; i < provs.Count; i++)
             {
@@ -2185,7 +2225,7 @@ namespace DSHDesktop
                     string src = Path.Combine(GatewayDir(), "gateway.config.example.json");
                     if (!Directory.Exists(Path.GetDirectoryName(gwConfigPath))) Directory.CreateDirectory(Path.GetDirectoryName(gwConfigPath));
                     if (File.Exists(src)) File.Copy(src, gwConfigPath, true);
-                    else { File.WriteAllText(gwConfigPath, "{\n  \"port\": 3090,\n  \"apiKey\": \"change-me\",\n  \"providers\": []\n}", System.Text.Encoding.UTF8); }
+                    else { File.WriteAllText(gwConfigPath, "{\n  \"port\": 3090,\n  \"apiKey\": \"change-me\",\n  \"providers\": []\n}", Utf8NoBom); }
                     AppendLog("[网关] 已创建配置模板: " + gwConfigPath);
                 }
                 Process.Start("notepad.exe", "\"" + gwConfigPath + "\"");
@@ -2198,6 +2238,9 @@ namespace DSHDesktop
         {
             try
             {
+                // 先自动落盘表格中的供应商（修复 N2：用户编辑后直接点「写入 dsh 配置」会被丢弃）
+                if (gvProviders != null && gvProviders.Rows.Count > 0) GwSaveToFile(false);
+
                 int p; if (int.TryParse(txtGwPort.Text, out p) && p > 0 && p <= 65535) gwPort = p;
                 gwKey = txtGwKey.Text.Trim();
                 SaveSettings();
@@ -2343,6 +2386,7 @@ namespace DSHDesktop
                     else if (k == "installMode" && (v == "auto" || v == "global" || v == "cache")) installMode = v;
                     else if (k == "gwPort") { int p; if (int.TryParse(v, out p) && p > 0 && p <= 65535) gwPort = p; }
                     else if (k == "gwKey") gwKey = v;
+                    else if (k == "gwUA") gwClientUA = v;
                 }
             }
             catch { }
@@ -2362,7 +2406,8 @@ namespace DSHDesktop
                 sb.AppendLine("installMode=" + installMode);
                 sb.AppendLine("gwPort=" + gwPort);
                 sb.AppendLine("gwKey=" + gwKey);
-                File.WriteAllText(settingsFile, sb.ToString(), Encoding.UTF8);
+                sb.AppendLine("gwUA=" + gwClientUA);
+                File.WriteAllText(settingsFile, sb.ToString(), Utf8NoBom);   // 无 BOM（N1：ini 首行键名不能被 BOM 污染）
 
                 // 开机自启（注册表 HKCU Run）
                 try
