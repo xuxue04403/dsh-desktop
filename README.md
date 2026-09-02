@@ -32,13 +32,14 @@
 
 **环境要求**：Windows 10/11（系统自带 .NET Framework 4.x，无需装任何运行时）+ 已安装 Node.js/npm
 
-**获取程序**（二选一）：
+**获取程序**：
 
-- 下载编译好的：到 [Releases](../../releases) 页下载 `DSHDesktop.exe`
-- 自己编译（一行命令，用 Windows 自带的 C# 编译器，无需 SDK）：
+- **安装版（推荐）**：到 [Releases](../../releases) 下载 `DSHDesktopSetup.exe`（单文件安装器）→ 双击安装 → 自动创建桌面/开始菜单快捷方式与卸载入口（卸载时保留 `data\` 用户数据）
+- **便携版**：下载 `DSHDesktop-portable.zip`，解压到任意目录双击 `DSHDesktop.exe` 即用（数据随程序目录）
+- **自己编译**（一行命令，用 Windows 自带的 C# 编译器，无需 SDK）：
 
   ```powershell
-  powershell -ExecutionPolicy Bypass -File build.ps1
+  powershell -ExecutionPolicy Bypass -File build.ps1   # 同时产出 DSHDesktop.exe 与 DSHDesktopSetup.exe
   ```
 
 **使用**：双击 `DSHDesktop.exe` → 点「一键启动」。首次未安装 dsh 时会引导你选择 npm 全局 / npx 缓存方式。
