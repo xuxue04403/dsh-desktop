@@ -196,6 +196,37 @@ function providersForModel(cfg, model) {
     .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
 }
 
+/**
+ * 防屏蔽透传（K1）：保留 dsh 客户端的原始请求标识（尤其是 User-Agent，
+ * dsh 的 attribution 机制强制带 `deepseek-harness/<版本> (+url)`），
+ * 仅替换鉴权头与必要的协议头，其余原样转发——让上游看到的就是"dsh 直连"。
+ */
+function passthroughHeaders(reqHeaders, apiKey) {
+  const out = {};
+  // 需要替换或禁止透传的头部（hop-by-hop / 由本网关维护）
+  const skip = new Set([
+    'authorization', 'host', 'content-length', 'connection',
+    'transfer-encoding', 'keep-alive', 'proxy-connection', 'upgrade',
+    'te', 'trailer', 'content-type', 'accept', 'accept-encoding',
+    'x-api-key', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
+    'cookie', 'origin', 'referer',
+  ]);
+  for (const [k, v] of Object.entries(reqHeaders || {})) {
+    const lk = k.toLowerCase();
+    if (skip.has(lk)) continue;
+    if (lk.startsWith('sec-') || lk.startsWith('proxy-') || lk.startsWith('cf-')) continue;
+    // 数组值合并为单个字符串
+    out[k] = Array.isArray(v) ? v.join(', ') : String(v);
+  }
+  out['authorization'] = `Bearer ${apiKey}`;
+  out['accept'] = 'application/json, text/event-stream';
+  out['content-type'] = 'application/json';
+  // 强制上游不压缩（K7）：undici 对流式 gzip 不自动解压，直接把压缩字节交给网关转发，
+  // 会污染 SSE 输出。OpenAI 兼容上游均尊重 identity。
+  out['accept-encoding'] = 'identity';
+  return out;
+}
+
 /** Forward to one provider; returns true when the response was written. */
 async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
   const controller = new AbortController();
@@ -305,7 +336,8 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
   }
   for (const p of ordered) {
     log(`try ${p.id} for ${model}`);
-    const ok = await forward(p, upstreamPath.replace(/^\/v1/, ''), {}, body, res);
+    // 透传 dsh 原始请求标识（K1 防屏蔽）：clientHeaders = req.headers
+    const ok = await forward(p, upstreamPath.replace(/^\/v1/, ''), passthroughHeaders(req.headers, p.apiKey), body, res);
     if (ok) {
       log(`served ${model} via ${p.id}`);
       return;
