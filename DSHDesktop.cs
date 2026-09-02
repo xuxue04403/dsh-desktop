@@ -115,6 +115,8 @@ namespace DSHDesktop
         private DateTime phaseStart;                 // 本次启动阶段起点（用于 15 分钟绝对超时上限）
         private DateTime lastOutputTime;             // 子进程最后一次产生输出的时间
         private long tailOffset;                     // 日志文件已读取到的偏移
+        private long gwLogTailOffset;                 // 网关日志已读取偏移（T1）
+        private string gwLogPath = "";                // 网关日志文件路径（T1）
         private int healthBusy = 0;                  // 健康轮询防重入
         private System.Threading.Timer healthTimer;
         private bool forceExit = false;
@@ -125,7 +127,8 @@ namespace DSHDesktop
         private Button btnOpen;
         private Button btnStop;
         private ToolStripStatusLabel lblStatus;
-        private TextBox txtLog;
+        private RichTextBox txtLog;
+        private RichTextBox txtGwLog;
         private TextBox txtPort;
         private TextBox txtWorkDir;
         private CheckBox chkAutoOpen;
@@ -135,7 +138,9 @@ namespace DSHDesktop
         private Button btnGwStart, btnGwStop, btnGwWrite, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen;
         private Label lblGwStatus, lblGwHint;
         private TextBox txtGwPort, txtGwKey, txtGwUA;
+        private ComboBox cmbGwRouting;
         private string gwClientUA = "";                    // 上游请求 UA 覆盖（P3）：空=透传 dsh UA
+        private string gwRouting = "failover";              // 路由模式（S1）：failover 主备 | round-robin 轮询
         private DataGridView gvProviders;
         private NotifyIcon tray;
         private ContextMenuStrip trayMenu;
@@ -266,6 +271,24 @@ namespace DSHDesktop
             }
         }
 
+        // 按钮统一样式（T2/T3）：Flat + 主题色/白字 + hover 亮色 + 按下深色 + 手型光标
+        private static void UiBtnStyle(Button b, Color normal, Color hover)
+        {
+            try
+            {
+                b.FlatStyle = FlatStyle.Flat;
+                b.FlatAppearance.BorderSize = 0;
+                b.FlatAppearance.MouseOverBackColor = hover;
+                b.FlatAppearance.MouseDownBackColor = Color.FromArgb(
+                    Math.Max(0, normal.R - 40), Math.Max(0, normal.G - 40), Math.Max(0, normal.B - 40));  // 按下变深反馈
+                b.BackColor = normal;
+                b.ForeColor = Color.White;
+                b.Cursor = Cursors.Hand;
+                b.FlatAppearance.BorderColor = Color.FromArgb(0, 0, 0, 30);
+            }
+            catch { }
+        }
+
         // ---------- UI（网关）----------
         private bool gwRunningCached = false;          // 网关运行状态缓存（后台轮询填充）
         private DateTime gwCacheTime = DateTime.MinValue;
@@ -288,20 +311,19 @@ namespace DSHDesktop
             btnStart = new Button();
             btnStart.Text = "一键启动";
             btnStart.Width = 110; btnStart.Height = 36; btnStart.Left = 16; btnStart.Top = 16;
-            btnStart.BackColor = Color.FromArgb(0, 120, 212); btnStart.ForeColor = Color.White;
-            btnStart.FlatStyle = FlatStyle.Flat;
+            UiBtnStyle(btnStart, Color.FromArgb(0, 120, 212), Color.FromArgb(40, 150, 240));   // T3：主操作蓝 + hover 反馈
             btnStart.Click += OnStartClick;
 
             btnOpen = new Button();
             btnOpen.Text = "打开浏览器";
             btnOpen.Width = 110; btnOpen.Height = 36; btnOpen.Left = 134; btnOpen.Top = 16;
-            btnOpen.FlatStyle = FlatStyle.Flat;
+            UiBtnStyle(btnOpen, Color.FromArgb(90, 100, 130), Color.FromArgb(115, 128, 165));
             btnOpen.Click += OnOpenClick;
 
             btnStop = new Button();
             btnStop.Text = "停止服务";
             btnStop.Width = 110; btnStop.Height = 36; btnStop.Left = 252; btnStop.Top = 16;
-            btnStop.FlatStyle = FlatStyle.Flat;
+            UiBtnStyle(btnStop, Color.FromArgb(180, 60, 50), Color.FromArgb(210, 80, 65));
             btnStop.Click += OnStopClick;
 
             Label lblUrl = new Label();
@@ -345,13 +367,16 @@ namespace DSHDesktop
             gb.Controls.AddRange(new Control[] { l1, txtPort, l2, txtWorkDir, btnBrowse, chkAutoOpen, chkAutoStart, chkUpdate, lInst, cmbInstall });
 
             Label l3 = new Label(); l3.Text = "运行日志:"; l3.SetBounds(16, 196, 80, 20);
-            txtLog = new TextBox();
+            txtLog = new RichTextBox();                 // T3：RichTextBox 行级着色 + 自动换行
             txtLog.Multiline = true;
             txtLog.ReadOnly = true;
-            txtLog.ScrollBars = ScrollBars.Vertical;
-            txtLog.BackColor = Color.FromArgb(30, 30, 30);
-            txtLog.ForeColor = Color.FromArgb(220, 220, 220);
+            txtLog.ScrollBars = RichTextBoxScrollBars.Vertical;
+            txtLog.WordWrap = true;
+            txtLog.DetectUrls = false;
+            txtLog.BackColor = Color.FromArgb(26, 26, 26);
+            txtLog.ForeColor = Color.FromArgb(200, 200, 200);
             txtLog.BorderStyle = BorderStyle.FixedSingle;
+            txtLog.Font = new Font("Consolas", 9F);
             txtLog.SetBounds(16, 220, 702, 360);
             txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
 
@@ -361,11 +386,15 @@ namespace DSHDesktop
             TabPage tpGateway = new TabPage("模型网关");
             tpGateway.Padding = new Padding(0);
 
-            btnGwStart = new Button(); btnGwStart.Text = "启动网关"; btnGwStart.SetBounds(16, 14, 105, 30); btnGwStart.FlatStyle = FlatStyle.Flat;
+            // T2：按钮交互反馈——统一 Flat 样式 + hover/按下变色 + 手型光标
+            btnGwStart = new Button(); btnGwStart.Text = "启动网关"; btnGwStart.SetBounds(16, 14, 105, 30);
+            UiBtnStyle(btnGwStart, Color.FromArgb(0, 140, 60), Color.FromArgb(0, 170, 75));
             btnGwStart.Click += delegate { StartGateway(); };
-            btnGwStop = new Button(); btnGwStop.Text = "停止网关"; btnGwStop.SetBounds(127, 14, 105, 30); btnGwStop.FlatStyle = FlatStyle.Flat;
+            btnGwStop = new Button(); btnGwStop.Text = "停止网关"; btnGwStop.SetBounds(127, 14, 105, 30);
+            UiBtnStyle(btnGwStop, Color.FromArgb(180, 60, 50), Color.FromArgb(210, 80, 65));
             btnGwStop.Click += delegate { StopGateway(); };
-            btnGwWrite = new Button(); btnGwWrite.Text = "写入 dsh 配置"; btnGwWrite.SetBounds(238, 14, 115, 30); btnGwWrite.FlatStyle = FlatStyle.Flat;
+            btnGwWrite = new Button(); btnGwWrite.Text = "写入 dsh 配置"; btnGwWrite.SetBounds(238, 14, 115, 30);
+            UiBtnStyle(btnGwWrite, Color.FromArgb(90, 100, 130), Color.FromArgb(115, 128, 165));
             btnGwWrite.Click += delegate { WriteGatewayToDsh(); };
 
             lblGwStatus = new Label();
@@ -379,18 +408,25 @@ namespace DSHDesktop
             txtGwKey = new TextBox(); txtGwKey.Text = gwKey; txtGwKey.SetBounds(630, 15, 80, 24); txtGwKey.BorderStyle = BorderStyle.FixedSingle; txtGwKey.PasswordChar = '●';
 
             // —— 供应商可视化编辑表 ——
-            // 第 2 行（y=56）：上游请求UA（P3 客户端白名单绕过）——留空=透传 dsh 原始 UA（防屏蔽）
+            // 第 2 行（y=56）：请求UA（P3 客户端白名单绕过）+ 路由模式（S1：主备/轮询）
             Label lg3 = new Label(); lg3.Text = "请求UA(可选):"; lg3.SetBounds(16, 58, 90, 20);
-            txtGwUA = new TextBox(); txtGwUA.Text = gwClientUA; txtGwUA.SetBounds(108, 55, 300, 24); txtGwUA.BorderStyle = BorderStyle.FixedSingle;
-            Label lg4 = new Label(); lg4.Text = "留空=透传dsh标识；填 claude-cli/2.0.0 等可过客户端白名单检测"; lg4.SetBounds(416, 58, 300, 20);
+            txtGwUA = new TextBox(); txtGwUA.Text = gwClientUA; txtGwUA.SetBounds(108, 55, 280, 24); txtGwUA.BorderStyle = BorderStyle.FixedSingle;
+            Label lg5 = new Label(); lg5.Text = "路由:"; lg5.SetBounds(402, 58, 40, 20);
+            cmbGwRouting = new ComboBox();
+            cmbGwRouting.DropDownStyle = ComboBoxStyle.DropDownList;
+            cmbGwRouting.Items.AddRange(new object[] { "主备(优先级)", "轮询(流量分摊)" });
+            cmbGwRouting.SelectedIndex = (gwRouting == "round-robin") ? 1 : 0;
+            cmbGwRouting.SetBounds(444, 55, 130, 24);
+            Label lg4 = new Label(); lg4.Text = "UA留空=透传dsh标识；填 claude-cli/2.0.0 等可过白名单检测";
+            lg4.SetBounds(584, 58, 140, 20);
             lg4.ForeColor = Color.FromArgb(120, 120, 120);
 
-            Label lh = new Label(); lh.Text = "多供应商管理（同一模型多供应商时，网关自动探测可用性并按优先级路由、故障切换）：";
-            lh.SetBounds(16, 82, 690, 16);
+            Label lh = new Label(); lh.Text = "多供应商管理（同一模型多供应商时：主备=固定优先失败切换；轮询=轮流分摊+失败切换）：";
+            lh.SetBounds(16, 82, 700, 16);
             lh.ForeColor = Color.FromArgb(80, 80, 80);
 
             gvProviders = new DataGridView();
-            gvProviders.SetBounds(16, 100, 702, 360);
+            gvProviders.SetBounds(16, 98, 702, 216);   // T1 布局：表格压缩，底部让位给网关日志区
             // 修复 N3：高度固定（去 Bottom anchor），否则 TabPage 布局重算时 gv 溢出并遮挡下方按钮
             gvProviders.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
             gvProviders.AllowUserToAddRows = false;
@@ -423,24 +459,64 @@ namespace DSHDesktop
             gvProviders.Columns[5].Width = 30;    // 启用（勾选框）
 
             // —— 表格下面操作按钮行 ——
-            btnGwAdd = new Button(); btnGwAdd.Text = "＋ 添加供应商"; btnGwAdd.SetBounds(16, 472, 105, 30); btnGwAdd.FlatStyle = FlatStyle.Flat;
+            btnGwAdd = new Button(); btnGwAdd.Text = "＋ 添加供应商"; btnGwAdd.SetBounds(16, 320, 105, 28);
+            UiBtnStyle(btnGwAdd, Color.FromArgb(60, 120, 60), Color.FromArgb(85, 155, 85));
             btnGwAdd.Click += delegate { GwAddRow(); };
-            btnGwDel = new Button(); btnGwDel.Text = "－ 删除选中"; btnGwDel.SetBounds(127, 472, 105, 30); btnGwDel.FlatStyle = FlatStyle.Flat;
+            btnGwDel = new Button(); btnGwDel.Text = "－ 删除选中"; btnGwDel.SetBounds(127, 320, 105, 28);
+            UiBtnStyle(btnGwDel, Color.FromArgb(160, 70, 60), Color.FromArgb(195, 90, 75));
             btnGwDel.Click += delegate { GwDeleteRow(); };
-            btnGwSave = new Button(); btnGwSave.Text = "💾 保存配置"; btnGwSave.SetBounds(238, 472, 105, 30); btnGwSave.BackColor = Color.FromArgb(0, 120, 212); btnGwSave.ForeColor = Color.White; btnGwSave.FlatStyle = FlatStyle.Flat;
+            btnGwSave = new Button(); btnGwSave.Text = "💾 保存配置"; btnGwSave.SetBounds(238, 320, 105, 28);
+            UiBtnStyle(btnGwSave, Color.FromArgb(0, 120, 212), Color.FromArgb(40, 150, 240));
             btnGwSave.Click += delegate { GwSaveToFile(); };
-            btnGwReload = new Button(); btnGwReload.Text = "↻ 重新加载"; btnGwReload.SetBounds(349, 472, 105, 30); btnGwReload.FlatStyle = FlatStyle.Flat;
+            btnGwReload = new Button(); btnGwReload.Text = "↻ 重新加载"; btnGwReload.SetBounds(349, 320, 105, 28);
+            UiBtnStyle(btnGwReload, Color.FromArgb(110, 105, 90), Color.FromArgb(150, 142, 120));
             btnGwReload.Click += delegate { LoadProvidersGrid(); };
-            btnGwOpen = new Button(); btnGwOpen.Text = "打开配置文件"; btnGwOpen.SetBounds(460, 472, 120, 30); btnGwOpen.FlatStyle = FlatStyle.Flat;
+            btnGwOpen = new Button(); btnGwOpen.Text = "打开配置文件"; btnGwOpen.SetBounds(460, 320, 120, 28);
+            UiBtnStyle(btnGwOpen, Color.FromArgb(110, 105, 90), Color.FromArgb(150, 142, 120));
             btnGwOpen.Click += delegate { EditGatewayConfig(); };
+
+            // —— 网关日志独立展示（T1：与 dsh 日志分开，含调用记录）——
+            Label lgLog = new Label(); lgLog.Text = "网关日志（运行 + 调用记录，文件 logs/gateway.log）：";
+            lgLog.SetBounds(16, 354, 420, 18);
+            lgLog.ForeColor = Color.FromArgb(80, 80, 80);
+            Button btnGwLogClear = new Button(); btnGwLogClear.Text = "清屏"; btnGwLogClear.SetBounds(648, 350, 56, 24);
+            UiBtnStyle(btnGwLogClear, Color.FromArgb(110, 105, 90), Color.FromArgb(150, 142, 120));
+            btnGwLogClear.Click += delegate
+            {
+                if (txtGwLog != null)
+                {
+                    txtGwLog.Clear();
+                    // 修复：offset 置 0 会让下一次 tick 把整个文件重新读回（清屏无效）。
+                    // 改为快进到当前文件末尾——清屏后只显示新产生的日志。
+                    try { gwLogTailOffset = (File.Exists(gwLogPath)) ? new FileInfo(gwLogPath).Length : 0; }
+                    catch { gwLogTailOffset = 0; }
+                }
+            };
+
+            txtGwLog = new RichTextBox();
+            txtGwLog.Multiline = true;
+            txtGwLog.ReadOnly = true;
+            txtGwLog.ScrollBars = RichTextBoxScrollBars.Vertical;
+            txtGwLog.WordWrap = true;                       // T2：长行自动折行（错误体/URL 不再横向溢出）
+            txtGwLog.DetectUrls = false;
+            txtGwLog.BackColor = Color.FromArgb(26, 26, 26);
+            txtGwLog.ForeColor = Color.FromArgb(200, 200, 200);
+            txtGwLog.BorderStyle = BorderStyle.FixedSingle;
+            txtGwLog.Font = new Font("Consolas", 9F);
+            txtGwLog.SetBounds(16, 376, 688, 156);
+            txtGwLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
 
             lblGwHint = new Label();
             lblGwHint.Text = "提示：修改后点「保存配置」写入 gateway.config.json；重启网关生效。也可用「写入 dsh 配置」注册到 dsh。";
             lblGwHint.ForeColor = Color.FromArgb(120, 120, 120);
-            lblGwHint.SetBounds(16, 510, 700, 20);
+            lblGwHint.SetBounds(16, 540, 700, 18);
             // 修复 N3：不设 anchor（默认 None），TabPage 页面固定 576 高，避免布局重算时尺寸被扭曲（曾出现 1228px 宽、y=748）
 
-            tpGateway.Controls.AddRange(new Control[] { btnGwStart, btnGwStop, btnGwWrite, lblGwStatus, lg1, txtGwPort, lg2, txtGwKey, lg3, txtGwUA, lg4, lh, gvProviders, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen, lblGwHint });
+            gwLogPath = Path.Combine(logDir, "gateway.log");
+            // 初始偏移 0：首次进入网关 Tab 时从文件头加载全部已有日志（T1 修正：用户应能立刻看到历史）
+            gwLogTailOffset = 0;
+
+            tpGateway.Controls.AddRange(new Control[] { btnGwStart, btnGwStop, btnGwWrite, lblGwStatus, lg1, txtGwPort, lg2, txtGwKey, lg3, txtGwUA, lg5, cmbGwRouting, lg4, lh, gvProviders, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen, lgLog, btnGwLogClear, txtGwLog, lblGwHint });
 
             tabs.TabPages.Add(tpService);
             tabs.TabPages.Add(tpGateway);
@@ -459,6 +535,7 @@ namespace DSHDesktop
             ResumeLayout(false);
             PerformLayout();
             LoadProvidersGrid();
+            UpdateServiceButtons();   // T3：初始按钮状态
 
             UpdateStatusText("[ 就绪 ] 点击「一键启动」或从托盘启动 dsh", Color.DimGray);
         }
@@ -510,6 +587,15 @@ namespace DSHDesktop
         private void OnUiTimerTick(object sender, EventArgs e)
         {
             TailLog(); // 实时跟踪 dsh 日志文件（无论状态如何都刷新显示）
+
+            // T3：dsh 服务按钮状态与 running/starting 同步（轮询兜底，覆盖所有状态变更路径）
+            if (btnStart != null) UpdateServiceButtons();
+
+            // 网关日志：仅在网关 Tab 激活时跟踪（T1 分离展示）
+            if (txtGwLog != null && txtGwLog.Visible)
+            {
+                TailFile(gwLogPath, ref gwLogTailOffset, txtGwLog);
+            }
 
             // 网关状态灯：读后台轮询缓存（绝不在此处发起 HTTP，避免阻塞 UI——修复 B1）
             if (lblGwStatus != null && gwTimerEnabled)
@@ -608,6 +694,10 @@ namespace DSHDesktop
             {
                 gwClientUA = txtGwUA.Text.Trim();
             }
+            if (cmbGwRouting != null)
+            {
+                gwRouting = (cmbGwRouting.SelectedIndex == 1) ? "round-robin" : "failover";
+            }
 
             // 关窗前自动落盘供应商表格（修复 N2：编辑后直接关窗/退出不再丢数据）
             if (gvProviders != null && gvProviders.Rows.Count > 0)
@@ -667,6 +757,7 @@ namespace DSHDesktop
                 running = false;
                 StopHealthPolling();
                 dshProc = null;
+                UpdateServiceButtons();
 
                 // 等待端口释放（最多 8 秒）
                 DateTime freeDeadline = DateTime.Now.AddSeconds(8);
@@ -728,6 +819,7 @@ namespace DSHDesktop
             if (autoUpdate)
             {
                 starting = true;
+                UpdateServiceButtons();   // T3：启动中禁用全部
                 // 关键：更新检查阶段就要初始化超时基线，否则会拿上一轮的过期时间误判
                 startWaitDeadline = DateTime.Now.AddSeconds(150);
                 phaseStart = DateTime.Now;
@@ -853,6 +945,7 @@ namespace DSHDesktop
                 dshProc.Start();
 
                 starting = true;
+                UpdateServiceButtons();   // T3：启动中禁用服务按钮
                 manuallyStopped = false;
                 autoOpenedFlag = 0;
                 tailOffset = 0;
@@ -935,6 +1028,7 @@ namespace DSHDesktop
                 dshProc.Start();
 
                 starting = true;
+                UpdateServiceButtons();   // T3：启动中禁用服务按钮
                 manuallyStopped = false;
                 autoOpenedFlag = 0;
                 lastOutputTime = DateTime.Now;
@@ -1303,6 +1397,7 @@ namespace DSHDesktop
             starting = false;
             StopHealthPolling();
             running = false;
+            UpdateServiceButtons();
 
             if (killed)
             {
@@ -1504,6 +1599,7 @@ namespace DSHDesktop
                     {
                         starting = false;
                         running = true;
+                        UpdateServiceButtons();
                         UpdateStatusText("[ 运行中 ] dsh 已就绪  " + url, Color.ForestGreen);
                         AppendLog("[就绪] dsh 服务已就绪: " + url);
                         if (autoOpenBrowser && isFirstReady)
@@ -1556,19 +1652,25 @@ namespace DSHDesktop
         // ---------------- 日志文件跟踪 ----------------
         private void TailLog()
         {
+            TailFile(logPath, ref tailOffset, txtLog);
+        }
+
+        // 通用日志尾部跟踪：把 path 自 offset 起的新增内容追加到 box（修复 T1：网关日志独立展示复用同一机制）
+        private void TailFile(string path, ref long offset, TextBoxBase box)
+        {
             try
             {
-                if (logPath == null || !File.Exists(logPath)) return;
-                using (FileStream fs = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                if (path == null || box == null || !File.Exists(path)) return;
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 {
-                    if (fs.Length < tailOffset)
+                    if (fs.Length < offset)
                     {
-                        tailOffset = 0;
-                        AppendRaw("\r\n[日志已重建]\r\n");
+                        offset = 0;
+                        AppendRawTo(box, "\r\n[日志已重建]\r\n");
                     }
-                    if (fs.Length == tailOffset) return;
-                    fs.Seek(tailOffset, SeekOrigin.Begin);
-                    int remain = (int)Math.Min(fs.Length - tailOffset, 256 * 1024);
+                    if (fs.Length == offset) return;
+                    fs.Seek(offset, SeekOrigin.Begin);
+                    int remain = (int)Math.Min(fs.Length - offset, 256 * 1024);
                     byte[] buf = new byte[remain];
                     int total = 0;
                     while (total < remain)
@@ -1589,16 +1691,89 @@ namespace DSHDesktop
                         trailing = (need > trailing + 1) ? (trailing + 1) : 0;
                         break;
                     }
-                    tailOffset += total - trailing;
+                    offset += total - trailing;
                     if (total > trailing)
                     {
-                        lastOutputTime = DateTime.Now; // 子进程确实有输出 → 用于超时续期判断
-                        AppendRaw(Encoding.UTF8.GetString(buf, 0, total - trailing));
+                        if (box == txtLog) lastOutputTime = DateTime.Now; // 子进程确实有输出 → 用于超时续期判断
+                        AppendRawTo(box, Encoding.UTF8.GetString(buf, 0, total - trailing));
                     }
-
                 }
             }
             catch { }
+        }
+
+        // 追加到指定日志框（带 6 万字符上限）。RichTextBox 时按行语义着色（T2/T3 可读性增强）
+        private void AppendRawTo(TextBoxBase box, string text)
+        {
+            try
+            {
+                if (box == null || box.IsDisposed) return;
+                RichTextBox rtb = box as RichTextBox;
+                if (rtb == null)
+                {
+                    if (box.TextLength > 60000) box.Clear();
+                    box.AppendText(text);
+                    return;
+                }
+                bool isDsh = (box == txtLog);
+                if (rtb.TextLength > 60000) rtb.Clear();
+                rtb.SelectionStart = rtb.TextLength;
+                rtb.SelectionLength = 0;
+                string[] lines = text.Replace("\r\n", "\n").Split('\n');
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string ln = lines[i];
+                    if (i > 0) ln = "\n" + ln;   // 保留行分隔（首行不带前缀换行）
+                    Color c = isDsh ? DshLogLineColor(ln) : GwLogLineColor(ln);
+                    rtb.SelectionColor = c;
+                    rtb.AppendText(ln);
+                }
+                rtb.SelectionColor = rtb.ForeColor;
+                rtb.SelectionStart = rtb.TextLength;
+                rtb.ScrollToCaret();
+            }
+            catch { }
+        }
+
+        // dsh 页日志行着色（T3）：错误红 / 警告黄 / 信息步骤白 / JSON 暗青 / 就绪绿 / 其余灰
+        private static Color DshLogLineColor(string line)
+        {
+            try
+            {
+                if (line.Contains("[错误]") || line.Contains("[error]") || line.Contains("Error:") || line.Contains("failed")) 
+                    return Color.FromArgb(240, 130, 110);
+                if (line.Contains("[警告]") || line.Contains("[warning]") || line.Contains("Warning:")) 
+                    return Color.FromArgb(235, 205, 130);
+                if (line.Contains("[重启]")) 
+                    return Color.FromArgb(230, 180, 110);
+                if (line.Contains("[就绪]") || line.Contains("listening") || line.Contains("http://127.0.0.1") && line.Contains("dsh web") || line.Contains("ready"))
+                    return Color.FromArgb(140, 210, 140);
+                if (line.Contains("[信息]") || line.Contains("[提示]")) 
+                    return Color.FromArgb(210, 210, 210);
+                if (line.Contains("ExperimentalWarning") || line.Contains("trace-warnings")) 
+                    return Color.FromArgb(170, 170, 120);
+                if (line.TrimStart().StartsWith("{")) 
+                    return Color.FromArgb(120, 180, 200);   // dsh/MCP JSON 行：暗青
+                return Color.FromArgb(150, 150, 150);
+            }
+            catch { return Color.FromArgb(150, 150, 150); }
+        }
+
+        // 网关日志行着色（T2）：时间戳灰、[call] 调用记录青、成功绿、错误/失败红/橙、其余浅灰
+        private static Color GwLogLineColor(string line)
+        {
+            try
+            {
+                if (line.Contains("[call]")) return Color.FromArgb(120, 200, 230);       // 调用记录：淡青
+                if (line.Contains("served ") || line.Contains("listening") || (line.Contains("catalog ") && !line.Contains("FAILED") && !line.Contains("HTTP")))
+                    return Color.FromArgb(140, 210, 140);                                 // 成功类：淡绿
+                if (line.Contains("FAILED") || line.Contains("HTTP 4") || line.Contains("HTTP 5") || line.Contains("error") || line.Contains("failed"))
+                    return Color.FromArgb(240, 140, 110);                                 // 错误类：橙红
+                if (line.Contains("try ") || line.Contains("catalog "))
+                    return Color.FromArgb(230, 210, 140);                                 // 过程类：淡黄
+                return Color.FromArgb(150, 150, 150);                                     // 默认：灰
+            }
+            catch { return Color.FromArgb(150, 150, 150); }
         }
 
         private void OpenLogsFolder()
@@ -1671,6 +1846,7 @@ namespace DSHDesktop
                 txtGwPort.Text = gwPort.ToString();
                 gwKey = txtGwKey.Text.Trim();
                 if (txtGwUA != null) gwClientUA = txtGwUA.Text.Trim();
+                if (cmbGwRouting != null) gwRouting = (cmbGwRouting.SelectedIndex == 1) ? "round-robin" : "failover";
                 SaveSettings();
 
                 string dir = GatewayDir();
@@ -1703,6 +1879,9 @@ namespace DSHDesktop
                 psi.WorkingDirectory = dir;
                 psi.EnvironmentVariables["DSH_GATEWAY_CONFIG"] = gwConfigPath;
                 psi.EnvironmentVariables["DSH_GATEWAY_LOG"] = Path.Combine(logDir, "gateway.log");
+                // T1：UI 网关日志跟踪路径与实际写入保持一致
+                gwLogPath = Path.Combine(logDir, "gateway.log");
+                gwLogTailOffset = 0;
 
                 gwProc = new Process();
                 gwProc.StartInfo = psi;
@@ -1912,6 +2091,7 @@ namespace DSHDesktop
                 if (cfg.ContainsKey("port")) { int p; if (int.TryParse(cfg["port"], out p) && p > 0) gwPort = p; txtGwPort.Text = gwPort.ToString(); }
                 if (cfg.ContainsKey("apiKey")) { gwKey = cfg["apiKey"]; txtGwKey.Text = gwKey; }
                 if (cfg.ContainsKey("clientUA")) { gwClientUA = cfg["clientUA"]; if (txtGwUA != null) txtGwUA.Text = gwClientUA; }
+                if (cfg.ContainsKey("routing") && (cfg["routing"] == "failover" || cfg["routing"] == "round-robin")) { gwRouting = cfg["routing"]; if (cmbGwRouting != null) cmbGwRouting.SelectedIndex = (gwRouting == "round-robin") ? 1 : 0; }
 
                 // 提取 providers 数组
                 List<string> provList = null;
@@ -2109,6 +2289,7 @@ namespace DSHDesktop
                 int p; if (int.TryParse(txtGwPort.Text, out p) && p > 0 && p <= 65535) gwPort = p;
                 gwKey = txtGwKey.Text.Trim();
                 if (txtGwUA != null) gwClientUA = txtGwUA.Text.Trim();
+                if (cmbGwRouting != null) gwRouting = (cmbGwRouting.SelectedIndex == 1) ? "round-robin" : "failover";
 
                 var provs = new List<Dictionary<string, object>>();
                 foreach (DataGridViewRow row in gvProviders.Rows)
@@ -2162,6 +2343,8 @@ namespace DSHDesktop
             sb.AppendLine("  \"apiKey\": \"" + JsonEsc(gwKey) + "\",");
             if (!string.IsNullOrEmpty(gwClientUA))
                 sb.AppendLine("  \"clientUA\": \"" + JsonEsc(gwClientUA) + "\",");
+            if (gwRouting == "round-robin")
+                sb.AppendLine("  \"routing\": \"round-robin\",");
             sb.AppendLine("  \"providers\": [");
             for (int i = 0; i < provs.Count; i++)
             {
@@ -2303,6 +2486,22 @@ namespace DSHDesktop
             catch (Exception ex) { AppendLog("[错误] 写入 dsh 配置失败: " + ex.Message); }
         }
 
+        // T3：dsh 服务三按钮状态联动——运行中禁用「启动」启用「停止/打开」；停止态反之；启动中全禁
+        private void UpdateServiceButtons()
+        {
+            try
+            {
+                if (btnStart == null) return;
+                bool e1, e2, e3;
+                if (starting) { e1 = false; e2 = false; e3 = false; }
+                else { e1 = !running; e2 = running; e3 = running; }   // 启动 / 打开 / 停止
+                if (btnStart.Enabled != e1) { btnStart.Enabled = e1; btnStart.BackColor = e1 ? Color.FromArgb(0, 120, 212) : Color.FromArgb(110, 110, 110); }
+                if (btnOpen.Enabled != e2) { btnOpen.Enabled = e2; btnOpen.BackColor = e2 ? Color.FromArgb(90, 100, 130) : Color.FromArgb(110, 110, 110); }
+                if (btnStop.Enabled != e3) { btnStop.Enabled = e3; btnStop.BackColor = e3 ? Color.FromArgb(180, 60, 50) : Color.FromArgb(110, 110, 110); }
+            }
+            catch { }
+        }
+
         private void SetGwStatus(bool running)
         {
             try
@@ -2312,6 +2511,9 @@ namespace DSHDesktop
                 if (lblGwStatus == null) return;
                 lblGwStatus.Text = running ? "● 运行中" : "● 已停止";
                 lblGwStatus.ForeColor = running ? Color.ForestGreen : Color.DimGray;
+                // T2：运行态按钮联动反馈——运行中禁用"启动"、启用"停止"；停止态反之
+                if (btnGwStart != null) { btnGwStart.Enabled = !running; btnGwStart.BackColor = btnGwStart.Enabled ? Color.FromArgb(0, 140, 60) : Color.FromArgb(110, 110, 110); }
+                if (btnGwStop != null) { btnGwStop.Enabled = running; btnGwStop.BackColor = btnGwStop.Enabled ? Color.FromArgb(180, 60, 50) : Color.FromArgb(110, 110, 110); }
             }
             catch { }
         }
@@ -2387,6 +2589,7 @@ namespace DSHDesktop
                     else if (k == "gwPort") { int p; if (int.TryParse(v, out p) && p > 0 && p <= 65535) gwPort = p; }
                     else if (k == "gwKey") gwKey = v;
                     else if (k == "gwUA") gwClientUA = v;
+                    else if (k == "gwRouting" && (v == "failover" || v == "round-robin")) gwRouting = v;
                 }
             }
             catch { }
@@ -2407,6 +2610,7 @@ namespace DSHDesktop
                 sb.AppendLine("gwPort=" + gwPort);
                 sb.AppendLine("gwKey=" + gwKey);
                 sb.AppendLine("gwUA=" + gwClientUA);
+                sb.AppendLine("gwRouting=" + gwRouting);
                 File.WriteAllText(settingsFile, sb.ToString(), Utf8NoBom);   // 无 BOM（N1：ini 首行键名不能被 BOM 污染）
 
                 // 开机自启（注册表 HKCU Run）
@@ -2456,13 +2660,7 @@ namespace DSHDesktop
 
         private void AppendRaw(string text)
         {
-            try
-            {
-                if (txtLog == null || txtLog.IsDisposed) return;
-                TrimLogIfNeeded();
-                txtLog.AppendText(text);
-            }
-            catch { }
+            AppendRawTo(txtLog, text);
         }
 
         private void AppendLogSafe(string text) { OnUiThread(delegate { AppendLog(text); }); }
