@@ -58,14 +58,13 @@ namespace DSHDesktop
             }
         }
 
-        // 崩溃转储：%APPDATA%\DSHDesktop\logs\crash-时间.log
-        private static void WriteCrashLog(string kind, Exception ex)
+        // 崩溃转储：exe 旁 data\logs\crash-时间.log（无便携目录则 %APPDATA%）
+        internal static void WriteCrashLog(string kind, Exception ex)
         {
             try
             {
-                string dir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "DSHDesktop", "logs");
+                string dataDir = MainForm.ResolveDataDir();
+                string dir = Path.Combine(dataDir, "logs");
                 if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
                 string file = Path.Combine(dir, "crash-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + ".log");
                 StringBuilder sb = new StringBuilder();
@@ -93,6 +92,11 @@ namespace DSHDesktop
 
         // ---------- 运行状态 ----------
         private Process dshProc;
+        private Process gwProc = null;                     // 模型网关进程
+        private int gwPort = 3090;                          // 网关监听端口
+        private string gwKey = "";                          // 网关统一 key（留空则随机生成）
+        private string gwConfigPath = "";                   // gateway.config.json 路径
+        private bool gwTimerEnabled = false;               // 网关状态轮询开关（UI 构建后开启）
         private volatile bool starting = false;
         private volatile bool manuallyStopped = false;
         private int autoOpenedFlag = 0;              // 就绪自动开浏览器的跨线程一次性闸门
@@ -123,24 +127,103 @@ namespace DSHDesktop
         private CheckBox chkAutoStart;
         private CheckBox chkUpdate;
         private ComboBox cmbInstall;
+        private GroupBox gbGateway;
+        private Button btnGwStart, btnGwStop, btnGwWrite, btnGwEdit;
+        private Label lblGwStatus;
+        private TextBox txtGwPort, txtGwKey;
         private NotifyIcon tray;
         private ContextMenuStrip trayMenu;
         private ToolStripMenuItem miStart, miOpen, miStop, miShow, miLog, miExit;
         private StatusStrip statusStrip;
 
+        // 解析数据目录：优先 exe 旁 data\（绿色便携），不可写则回退 %APPDATA%\DSHDesktop；
+        // 存在旧 %APPDATA% 数据时一次性迁移到新位置（幂等，迁移后不删除旧副本）。
+        internal static string ResolveDataDir()
+        {
+            // 显式覆盖：DSH_DATA_DIR 环境变量优先（也便于测试与高级用户在任意位置放置数据）
+            try
+            {
+                string overrideDir = Environment.GetEnvironmentVariable("DSH_DATA_DIR");
+                if (!string.IsNullOrWhiteSpace(overrideDir))
+                {
+                    if (!Directory.Exists(overrideDir)) Directory.CreateDirectory(overrideDir);
+                    string p = Path.Combine(overrideDir, ".write-test");
+                    File.WriteAllText(p, "1"); File.Delete(p);
+                    return overrideDir;
+                }
+            }
+            catch { }
+
+            string portable = null;
+            try
+            {
+                string exeDir = Path.GetDirectoryName(Application.ExecutablePath);
+                if (!string.IsNullOrEmpty(exeDir))
+                {
+                    portable = Path.Combine(exeDir, "data");
+                    if (!Directory.Exists(portable)) Directory.CreateDirectory(portable);
+                    // 可写性探测：尝试创建临时文件
+                    string probe = Path.Combine(portable, ".write-test");
+                    File.WriteAllText(probe, "1");
+                    File.Delete(probe);
+                }
+            }
+            catch { portable = null; }
+
+            if (portable != null)
+            {
+                // 迁移：便携 data 刚创建且为空时，把 %APPDATA% 旧数据复制过来
+                try
+                {
+                    string legacy = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DSHDesktop");
+                    if (Directory.Exists(legacy))
+                    {
+                        bool needsMigrate = false;
+                        foreach (string f in new string[] { "settings.ini", "gateway.config.json" })
+                        {
+                            string src = Path.Combine(legacy, f);
+                            string dst = Path.Combine(portable, f);
+                            if (File.Exists(src) && !File.Exists(dst)) { File.Copy(src, dst, false); needsMigrate = true; }
+                        }
+                        string srcLog = Path.Combine(legacy, "logs");
+                        string dstLog = Path.Combine(portable, "logs");
+                        if (Directory.Exists(srcLog) && !Directory.Exists(dstLog))
+                        {
+                            Directory.CreateDirectory(dstLog);
+                            foreach (string f in Directory.GetFiles(srcLog))
+                            {
+                                try { File.Copy(f, Path.Combine(dstLog, Path.GetFileName(f)), false); } catch { }
+                            }
+                        }
+                        if (needsMigrate)
+                            System.Diagnostics.Debug.WriteLine("[data] migrated from " + legacy);
+                    }
+                }
+                catch { }
+                return portable;
+            }
+            // 回退：%APPDATA%
+            string fallback = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DSHDesktop");
+            try { if (!Directory.Exists(fallback)) Directory.CreateDirectory(fallback); } catch { }
+            return fallback;
+        }
+
         public MainForm(bool autoStartFlag)
         {
             Text = "DSH 桌面助手";
-            ClientSize = new Size(580, 440);
-            MinimumSize = new Size(520, 380);
+            ClientSize = new Size(580, 560);
+            MinimumSize = new Size(520, 480);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.White;
             Font = new Font("Microsoft YaHei UI", 9F);
 
-            settingsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DSHDesktop");
+            // 解析数据目录：优先 exe 旁 data\（绿色便携），不可写则回退 %APPDATA%\DSHDesktop，
+            // 并把旧 %APPDATA% 数据一次性迁移到新位置。
+            settingsDir = ResolveDataDir();
             settingsFile = Path.Combine(settingsDir, "settings.ini");
             logDir = Path.Combine(settingsDir, "logs");
             logPath = Path.Combine(logDir, "dsh-web.log");
+            gwConfigPath = Path.Combine(settingsDir, "gateway.config.json");
 
             // 界面只显示本次会话的日志：跳过磁盘上已有历史，避免打开窗口时刷出上次的日志
             try { if (File.Exists(logPath)) tailOffset = new FileInfo(logPath).Length; } catch { }
@@ -154,6 +237,17 @@ namespace DSHDesktop
             BuildUi();
             BuildTray();
 
+            // 网关面板就绪后启用状态轮询
+            gwTimerEnabled = true;
+            // 初始探测（后台），让状态灯尽快反映真实状态
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate(object st)
+            {
+                bool running = GatewayIsRunning();
+                gwRunningCached = running;
+                gwCacheTime = DateTime.Now;
+                OnUiThread(delegate { SetGwStatus(running); });
+            });
+
             uiTimer = new System.Windows.Forms.Timer();
             uiTimer.Interval = 800;
             uiTimer.Tick += OnUiTimerTick;
@@ -165,6 +259,11 @@ namespace DSHDesktop
                 Shown += delegate { BeginInvoke(new Action(StartService)); };
             }
         }
+
+        // ---------- UI（网关）----------
+        private bool gwRunningCached = false;          // 网关运行状态缓存（后台轮询填充）
+        private DateTime gwCacheTime = DateTime.MinValue;
+        private int gwProbing = 0;                     // 网关后台探测防重入闸
 
         private void BuildUi()
         {
@@ -237,8 +336,37 @@ namespace DSHDesktop
             txtLog.BackColor = Color.FromArgb(30, 30, 30);
             txtLog.ForeColor = Color.FromArgb(220, 220, 220);
             txtLog.BorderStyle = BorderStyle.FixedSingle;
-            txtLog.SetBounds(16, 220, 548, 172);
-            txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            txtLog.SetBounds(16, 220, 548, 216);
+            txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right; // 不锚底部：底部空间由网关面板占据
+
+            // —— 模型网关面板 ——（面板净高需容纳两行控件：行1 y=24、行2 y=52；修复 I1/I2 重叠与溢出）
+            gbGateway = new GroupBox();
+            gbGateway.Text = "模型网关（统一多供应商模型代理）";
+            gbGateway.SetBounds(16, 444, 548, 90);   // 底部=534，状态栏约 538 起，无重叠
+            gbGateway.BackColor = Color.White;
+            gbGateway.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+
+            btnGwStart = new Button(); btnGwStart.Text = "启动网关"; btnGwStart.SetBounds(10, 24, 84, 26); btnGwStart.FlatStyle = FlatStyle.Flat;
+            btnGwStart.Click += delegate { StartGateway(); };
+            btnGwStop = new Button(); btnGwStop.Text = "停止网关"; btnGwStop.SetBounds(100, 24, 84, 26); btnGwStop.FlatStyle = FlatStyle.Flat;
+            btnGwStop.Click += delegate { StopGateway(); };
+            btnGwWrite = new Button(); btnGwWrite.Text = "写入 dsh 配置"; btnGwWrite.SetBounds(190, 24, 100, 26); btnGwWrite.FlatStyle = FlatStyle.Flat;
+            btnGwWrite.Click += delegate { WriteGatewayToDsh(); };
+            btnGwEdit = new Button(); btnGwEdit.Text = "编辑供应商"; btnGwEdit.SetBounds(296, 24, 84, 26); btnGwEdit.FlatStyle = FlatStyle.Flat;
+            btnGwEdit.Click += delegate { EditGatewayConfig(); };
+
+            lblGwStatus = new Label();
+            lblGwStatus.Text = "● 已停止";
+            lblGwStatus.ForeColor = Color.DimGray;
+            lblGwStatus.SetBounds(392, 28, 150, 20);
+
+            Label lg1 = new Label(); lg1.Text = "端口:"; lg1.SetBounds(10, 54, 40, 20);
+            txtGwPort = new TextBox(); txtGwPort.Text = gwPort.ToString(); txtGwPort.SetBounds(48, 51, 52, 24); txtGwPort.BorderStyle = BorderStyle.FixedSingle;
+            Label lg2 = new Label(); lg2.Text = "统一Key:"; lg2.SetBounds(112, 54, 54, 20);
+            txtGwKey = new TextBox(); txtGwKey.Text = gwKey; txtGwKey.SetBounds(164, 51, 200, 24); txtGwKey.BorderStyle = BorderStyle.FixedSingle; txtGwKey.PasswordChar = '●';
+            Label lg3 = new Label(); lg3.Text = "对外接口: http://127.0.0.1:" + gwPort + "/v1"; lg3.SetBounds(372, 54, 174, 20); lg3.ForeColor = Color.DimGray;
+
+            gbGateway.Controls.AddRange(new Control[] { btnGwStart, btnGwStop, btnGwWrite, btnGwEdit, lblGwStatus, lg1, txtGwPort, lg2, txtGwKey, lg3 });
 
             statusStrip = new StatusStrip();
             lblStatus = new ToolStripStatusLabel();
@@ -249,7 +377,7 @@ namespace DSHDesktop
             statusStrip.Dock = DockStyle.Bottom;
             statusStrip.SizingGrip = false;
 
-            Controls.AddRange(new Control[] { btnStart, btnOpen, btnStop, lblUrl, txtUrl, gb, l3, txtLog, statusStrip });
+            Controls.AddRange(new Control[] { btnStart, btnOpen, btnStop, lblUrl, txtUrl, gb, l3, txtLog, gbGateway, statusStrip });
 
             ResumeLayout(false);
             PerformLayout();
@@ -304,6 +432,33 @@ namespace DSHDesktop
         private void OnUiTimerTick(object sender, EventArgs e)
         {
             TailLog(); // 实时跟踪 dsh 日志文件（无论状态如何都刷新显示）
+
+            // 网关状态灯：读后台轮询缓存（绝不在此处发起 HTTP，避免阻塞 UI——修复 B1）
+            if (lblGwStatus != null && gwTimerEnabled)
+            {
+                if (!gwRunningCached && (DateTime.Now - gwCacheTime).TotalSeconds > 3)
+                {
+                    // 缓存过期且当前显示"未运行"：后台重新探测一次（外部可能已启动网关）
+                    if (Interlocked.CompareExchange(ref gwProbing, 1, 0) == 0)
+                    {
+                        System.Threading.ThreadPool.QueueUserWorkItem(delegate(object st)
+                        {
+                            try
+                            {
+                                bool running = GatewayIsRunning();
+                                gwRunningCached = running;
+                                gwCacheTime = DateTime.Now;
+                                OnUiThread(delegate { SetGwStatus(running); });
+                            }
+                            finally { Interlocked.Exchange(ref gwProbing, 0); }
+                        });
+                    }
+                }
+                else
+                {
+                    SetGwStatus(gwRunningCached);
+                }
+            }
 
             if (starting)
             {
@@ -360,6 +515,18 @@ namespace DSHDesktop
             autoUpdate = chkUpdate.Checked;
             int ci = cmbInstall.SelectedIndex;
             installMode = (ci == 1) ? "global" : (ci == 2) ? "cache" : "auto";
+
+            // 网关端口与统一 key 同步持久化（修复 G2：修改后即使不点启动，关窗也不丢失）
+            if (txtGwPort != null)
+            {
+                int gp;
+                if (int.TryParse(txtGwPort.Text, out gp) && gp > 0 && gp <= 65535) gwPort = gp;
+            }
+            if (txtGwKey != null)
+            {
+                gwKey = txtGwKey.Text.Trim();
+            }
+
             SaveSettings();
         }
 
@@ -478,16 +645,15 @@ namespace DSHDesktop
                 phaseStart = DateTime.Now;
                 UpdateStatusText("[ 更新检查… ] 正在联网检查 dsh 是否可更新", Color.OrangeRed);
                 AppendLog("[更新] 正在联网检查 dsh 是否有新版本…");
-                ThreadPool.QueueUserWorkItem(delegate(object st) { CheckThenStart(false); });
+                ThreadPool.QueueUserWorkItem(delegate(object st) { CheckThenStart(); });
                 return;
             }
 
             StartProcessCore();
         }
 
-        // 后台线程：联网对比 dsh 版本
-        // notifyOnly=true：仅提示有新版（服务正在运行，不打断）；false：发现新版则强制更新后启动
-        private void CheckThenStart(bool notifyOnly)
+        // 后台线程：联网对比 dsh 版本。发现新版则按来源更新后启动；否则按现有版本启动
+        private void CheckThenStart()
         {
             string installed = null, latest = null, source = null;
             bool newer = false;
@@ -514,49 +680,38 @@ namespace DSHDesktop
                 if (!checkOk)
                 {
                     AppendLog("[更新] 检查更新失败（" + err + "），按现有版本继续。");
-                    if (!notifyOnly) StartProcessCore();
+                    StartProcessCore();
                     return;
                 }
                 if (newer)
                 {
-                    if (notifyOnly)
+                    AppendLog("[更新] 发现新版本 " + installed + " → " + latest + "，正在自动更新并启动…");
+                    if (source == "global")
                     {
-                        AppendLog("[更新] 发现新版本 " + installed + " → " + latest + "（当前服务未中断；下次「一键启动」将自动更新）。");
-                        ShowBalloon("dsh 有新版本 " + latest, "当前 " + installed + "，下次一键启动时自动更新");
+                        // 全局安装来源：用 npm 更新全局包，成功后继续启动
+                        StartGlobalUpdateThenStart();
                     }
                     else
                     {
-                        AppendLog("[更新] 发现新版本 " + installed + " → " + latest + "，正在自动更新并启动…");
-                        if (source == "global")
-                        {
-                            // 全局安装来源：用 npm 更新全局包，成功后继续启动
-                            StartGlobalUpdateThenStart();
-                        }
-                        else
-                        {
-                            // 缓存来源：用 npx prefer-online 刷新缓存后启动
-                            forceNpx = true;
-                            StartProcessCore();
-                        }
+                        // 缓存来源：用 npx prefer-online 刷新缓存后启动
+                        forceNpx = true;
+                        StartProcessCore();
                     }
                 }
                 else
                 {
-                    if (!notifyOnly)
+                    if (installed == null)
                     {
-                        if (installed == null)
-                        {
-                            AppendLog("[更新] 未检测到本机 dsh。" + (installMode == "global" ? "按全局方式（npm -g）安装…" : "将由 npx 自动下载并启动。"));
-                            if (installMode == "global")
-                                StartGlobalUpdateThenStart();
-                            else
-                                StartProcessCore();
-                        }
+                        AppendLog("[更新] 未检测到本机 dsh。" + (installMode == "global" ? "按全局方式（npm -g）安装…" : "将由 npx 自动下载并启动。"));
+                        if (installMode == "global")
+                            StartGlobalUpdateThenStart();
                         else
-                        {
-                            AppendLog("[更新] 已是最新版本（" + (source == "global" ? "全局" : "缓存") + " " + installed + "）。");
                             StartProcessCore();
-                        }
+                    }
+                    else
+                    {
+                        AppendLog("[更新] 已是最新版本（" + (source == "global" ? "全局" : "缓存") + " " + installed + "）。");
+                        StartProcessCore();
                     }
                 }
             });
@@ -938,14 +1093,6 @@ namespace DSHDesktop
             {
                 ver = null; source = null;
             }
-        }
-
-        // 当前最佳来源的 dsh 版本（缓存与全局中取版本更高者）
-        private string InstalledDshVersion()
-        {
-            string ver, source, cb, gc;
-            GetBestInstall(out ver, out source, out cb, out gc);
-            return ver;
         }
 
         // 从 npm 源查询 dsh 最新版本（失败返回 null）
@@ -1379,6 +1526,365 @@ namespace DSHDesktop
             catch (Exception ex) { AppendLog("[错误] 打开日志文件夹失败: " + ex.Message); }
         }
 
+        // ---------------- 模型网关 ----------------
+        private string GatewayDir()
+        {
+            string d = "";
+            try { d = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "gateway"); }
+            catch { }
+            // 兼容开发/部署：若 exe 目录下无 gateway，尝试源码目录
+            if (!File.Exists(Path.Combine(d, "model-gateway.mjs")))
+            {
+                string alt = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh-desktop", "gateway");
+                if (File.Exists(Path.Combine(alt, "model-gateway.mjs"))) d = alt;
+            }
+            return d;
+        }
+
+        private bool GatewayIsRunning()
+        {
+            // 快速路径：我们启动的进程仍存活
+            if (gwProc != null && !gwProc.HasExited) return true;
+            return GatewayIsRunningHttpOnly();
+        }
+
+        // 纯 HTTP 探测：仅当 /health 返回 200 才算运行（用于等待就绪/权威判定）
+        private bool GatewayIsRunningHttpOnly()
+        {
+            try
+            {
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + gwPort + "/health");
+                req.Method = "GET"; req.Timeout = 1200;
+                using (HttpWebResponse rsp = (HttpWebResponse)req.GetResponse()) { return rsp.StatusCode == HttpStatusCode.OK; }
+            }
+            catch { return false; }
+        }
+
+        private void StartGateway()
+        {
+            try
+            {
+                // 清理旧的 gwProc 对象（已退出的直接释放；仍在运行的先停掉再继续）
+                if (gwProc != null)
+                {
+                    if (!gwProc.HasExited)
+                    {
+                        KillTreePrivate(gwProc.Id);
+                        gwProc.WaitForExit(3000);
+                    }
+                    try { gwProc.Dispose(); } catch { }
+                    gwProc = null;
+                }
+
+                int p; if (int.TryParse(txtGwPort.Text, out p) && p > 0 && p <= 65535) gwPort = p;
+                txtGwPort.Text = gwPort.ToString();
+                gwKey = txtGwKey.Text.Trim();
+                SaveSettings();
+
+                string dir = GatewayDir();
+                string gwMjs = Path.Combine(dir, "model-gateway.mjs");
+                if (!File.Exists(gwMjs)) { AppendLog("[错误] 找不到 model-gateway.mjs（应位于 " + dir + "）"); return; }
+
+                // 首次运行：若配置不存在则生成模板并提示编辑
+                if (!File.Exists(gwConfigPath))
+                {
+                    try
+                    {
+                        if (!Directory.Exists(Path.GetDirectoryName(gwConfigPath))) Directory.CreateDirectory(Path.GetDirectoryName(gwConfigPath));
+                        File.Copy(Path.Combine(dir, "gateway.config.example.json"), gwConfigPath, true);
+                        AppendLog("[网关] 已生成配置模板: " + gwConfigPath + "，请点击「编辑供应商」填入上游后重新启动网关");
+                    }
+                    catch (Exception ex) { AppendLog("[错误] 生成网关配置失败: " + ex.Message); }
+                }
+
+                // key 前置校验 + 同步：界面填的统一 key 写入 config，且必须是有效值（避免 change-me 默认值）
+                if (!SyncGwKeyToConfig()) { return; }
+
+                if (GatewayIsRunning()) { AppendLog("[网关] 网关已在运行 (http://127.0.0.1:" + gwPort + "/v1)"); SetGwStatus(true); return; }
+
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = "node.exe";
+                psi.Arguments = "\"" + gwMjs + "\"";
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.WindowStyle = ProcessWindowStyle.Hidden;
+                psi.WorkingDirectory = dir;
+                psi.EnvironmentVariables["DSH_GATEWAY_CONFIG"] = gwConfigPath;
+                psi.EnvironmentVariables["DSH_GATEWAY_LOG"] = Path.Combine(logDir, "gateway.log");
+
+                gwProc = new Process();
+                gwProc.StartInfo = psi;
+                gwProc.EnableRaisingEvents = true;
+                gwProc.Exited += delegate(object s, EventArgs e) { OnUiThread(delegate { SetGwStatus(false); }); };
+                gwProc.Start();
+                AppendLog("[网关] 启动中 (PID " + gwProc.Id + ")，端口 " + gwPort + "，统一Key=" + (gwKey.Length > 4 ? gwKey.Substring(0, 4) + "***" : "(未设置)"));
+                // 等待就绪：放到后台线程，避免阻塞 UI（修复 A1）
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate(object st)
+                {
+                    DateTime until = DateTime.Now.AddSeconds(6);
+                    bool ready = false;
+                    while (DateTime.Now < until)
+                    {
+                        // 注意：必须做真实 HTTP 探测（不能走 gwProc 快速路径——
+                        // 进程刚启动但端口未必监听好），因此临时让快速路径失效
+                        ready = GatewayIsRunningHttpOnly();
+                        if (ready) break;
+                        System.Threading.Thread.Sleep(300);
+                    }
+                    OnUiThread(delegate
+                    {
+                        SetGwStatus(ready);
+                        AppendLog(ready
+                            ? ("[网关] 就绪——统一接口 http://127.0.0.1:" + gwPort + "/v1（Authorization: Bearer <统一Key>）")
+                            : "[网关] 未在预期时间内就绪，请查看日志 logs/gateway.log");
+                    });
+                });
+            }
+            catch (Exception ex)
+            {
+                AppendLog("[错误] 启动网关失败: " + ex.Message);
+            }
+        }
+
+        // 把界面填的统一 key 与端口同步进 gateway.config.json；返回 false 表示配置不可用（应中止启动）
+        // 修复 F8：网关监听端口取自 config 的 "port" 字段，必须与 UI 端口一致，否则 UI 探测/写 dsh 全部错位
+        private bool SyncGwKeyToConfig()
+        {
+            try
+            {
+                if (!File.Exists(gwConfigPath))
+                {
+                    AppendLog("[网关] 缺失配置文件，无法同步。请先「编辑供应商」保存配置。");
+                    return false;
+                }
+                string json = File.ReadAllText(gwConfigPath, Encoding.UTF8);
+
+                // —— 端口同步（顶层 "port"，无锚定：该字段在整个配置中只出现在顶层，第一处即正确）——
+                // 修复 F8+：单行 JSON 下 ^ 锚定会因串首 { 失配，改用无锚定匹配
+                var portM = Regex.Match(json, "\"port\"\\s*:\\s*\\d+");
+                if (portM.Success)
+                {
+                    json = json.Substring(0, portM.Index) + "\"port\": " + gwPort + json.Substring(portM.Index + portM.Length);
+                }
+                else
+                {
+                    // 顶层无 port：在首个顶层键前插入
+                    var firstKey = Regex.Match(json, "\\s*\"", RegexOptions.RightToLeft);
+                    if (firstKey.Success && firstKey.Index >= 0)
+                    {
+                        // 取串开头到首个顶层键前的空白边界：简单方案——在第一个 { 后插入
+                        int brace = json.IndexOf('{');
+                        if (brace >= 0)
+                            json = json.Substring(0, brace + 1) + "\"port\": " + gwPort + "," + json.Substring(brace + 1);
+                    }
+                    else
+                    {
+                        json = "{\"port\": " + gwPort + "," + json.TrimStart().TrimStart('{');
+                    }
+                }
+
+                // 稳健的顶层定位：先把 providers 数组体剔除（仅匹配数组内第一个 ]，供 provider 无嵌套数组的配置使用），
+                // 剩下文本里第一个 "apiKey" 即顶层字段（不受单行/多行、缩进影响）。
+                string jsonCore = Regex.Replace(json, "\"providers\"\\s*:\\s*\\[[\\s\\S]*?\\]", "\"providers\": []");
+                var m = Regex.Match(jsonCore, "\"apiKey\"\\s*:\\s*\"([^\"]*)\"");
+                if (!m.Success)
+                {
+                    AppendLog("[网关] gateway.config.json 顶层缺少 apiKey 字段，请先「编辑供应商」补充。");
+                    return false;
+                }
+                string cfgKey = m.Groups[1].Value;
+
+                // 界面 key 非空且与配置文件不一致时，写入配置文件。
+                // 替换基于 jsonCore 中匹配到的字段片段（"apiKey":"..."）；apiKey 位于 providers 之前时，
+                // json 与 jsonCore 在片段起始处完全一致，index 可直接用于原串。
+                if (gwKey.Length > 0 && gwKey != cfgKey)
+                {
+                    var fm = Regex.Match(jsonCore, "\"apiKey\"\\s*:\\s*\"[^\"]*\"");
+                    // 防御：若 apiKey 意外出现在 providers 之后，json 该位置与 jsonCore 不再等长，禁止替换并提示
+                    int provIdx = json.IndexOf("\"providers\"", StringComparison.Ordinal);
+                    if (provIdx >= 0 && fm.Index > provIdx)
+                    {
+                        AppendLog("[网关] gateway.config.json 中 apiKey 位于 providers 之后，无法安全同步。请将顶层 apiKey 移到 providers 之前。");
+                        return false;
+                    }
+                    string escaped = gwKey.Replace("\\", "\\\\").Replace("\"", "\\\"");
+                    string replacement = "\"apiKey\": \"" + escaped + "\"";
+                    json = json.Substring(0, fm.Index) + replacement + json.Substring(fm.Index + fm.Length);
+                    cfgKey = gwKey;
+                    AppendLog("[网关] 已将界面统一 Key 同步到 gateway.config.json。");
+                }
+
+                // port 或 key 有变动才写盘
+                File.WriteAllText(gwConfigPath, json, Encoding.UTF8);
+
+                if (cfgKey.Length == 0 || cfgKey == "change-me" || cfgKey == "dsh-gateway-change-me")
+                {
+                    AppendLog("[网关] 统一 Key 未设置或仍为模板默认值，拒绝启动。请在界面填写统一 Key 或编辑 gateway.config.json。");
+                    return false;
+                }
+                // providers 非空校验：匹配字段片段 "providers":[...]（单个 [ 到首个匹配的 ] 为数组体）
+                var pm = Regex.Match(json, "\"providers\"\\s*:\\s*\\[([\\s\\S]*?)\\]");
+                if (!pm.Success || string.IsNullOrWhiteSpace(pm.Groups[1].Value))
+                {
+                    AppendLog("[网关] gateway.config.json 的 providers 为空，拒绝启动。请先「编辑供应商」添加至少一个上游。");
+                    return false;
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                AppendLog("[错误] 同步网关 key 失败: " + ex.Message);
+                return false;
+            }
+        }
+
+        private void StopGateway()
+        {
+            try
+            {
+                bool killed = false;
+                if (gwProc != null && !gwProc.HasExited)
+                {
+                    KillTreePrivate(gwProc.Id);
+                    killed = gwProc.HasExited;
+                    gwProc = null;
+                }
+                // 兜底：按端口查找（兼容上次会话遗留进程），且必须与真实 PID 一致或经身份校验
+                if (!killed)
+                {
+                    int pid = FindListenerPid(gwPort);
+                    if (pid > 0)
+                    {
+                        string nm = GetProcessName(pid);
+                        // 只允许结束 node 进程；若其 PID 正是我们启动的网关则直接结束，否则仍按进程名鉴权
+                        if (IsPlausibleDshName(nm))
+                        {
+                            KillTreePrivate(pid);
+                            killed = true;
+                        }
+                        else
+                        {
+                            AppendLog("[网关] 端口 " + gwPort + " 的进程是 " + (nm ?? "<未知>") + "（PID " + pid + "），不是 node，已跳过以免误杀。");
+                        }
+                    }
+                }
+                SetGwStatus(false);
+                AppendLog(killed ? "[网关] 已停止。" : "[网关] 未发现运行中的网关进程。");
+            }
+            catch (Exception ex) { AppendLog("[错误] 停止网关失败: " + ex.Message); }
+        }
+
+        private void KillTreePrivate(int pid)
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo();
+                psi.FileName = "taskkill.exe";
+                psi.Arguments = "/PID " + pid + " /T /F";
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                using (Process p = Process.Start(psi)) { p.WaitForExit(5000); }
+            }
+            catch { }
+        }
+
+        private void EditGatewayConfig()
+        {
+            try
+            {
+                if (!File.Exists(gwConfigPath))
+                {
+                    string src = Path.Combine(GatewayDir(), "gateway.config.example.json");
+                    if (!Directory.Exists(Path.GetDirectoryName(gwConfigPath))) Directory.CreateDirectory(Path.GetDirectoryName(gwConfigPath));
+                    if (File.Exists(src)) File.Copy(src, gwConfigPath, true);
+                    else { File.WriteAllText(gwConfigPath, "{\n  \"port\": 3090,\n  \"apiKey\": \"change-me\",\n  \"providers\": []\n}", System.Text.Encoding.UTF8); }
+                    AppendLog("[网关] 已创建配置模板: " + gwConfigPath);
+                }
+                Process.Start("notepad.exe", "\"" + gwConfigPath + "\"");
+                AppendLog("[网关] 已用记事本打开配置文件，保存后回到助手点「启动网关」。");
+            }
+            catch (Exception ex) { AppendLog("[错误] 打开网关配置失败: " + ex.Message); }
+        }
+
+        private void WriteGatewayToDsh()
+        {
+            try
+            {
+                int p; if (int.TryParse(txtGwPort.Text, out p) && p > 0 && p <= 65535) gwPort = p;
+                gwKey = txtGwKey.Text.Trim();
+                SaveSettings();
+
+                if (!File.Exists(gwConfigPath)) { AppendLog("[网关] 网关配置不存在，请先「编辑供应商」保存后再执行。"); return; }
+                // 统一 key 同步与校验（与 StartGateway 共用一套逻辑）
+                if (!SyncGwKeyToConfig()) { return; }
+
+                string dir = GatewayDir();
+                string gwMjs = Path.Combine(dir, "model-gateway.mjs");
+                if (!File.Exists(gwMjs)) { AppendLog("[错误] 找不到 model-gateway.mjs"); return; }
+
+                string args = "\"" + gwMjs + "\" --write-dsh --config \"" + gwConfigPath + "\" --port " + gwPort;
+                AppendLog("[网关→dsh] 正在写入 dsh 配置…");
+
+                // 后台执行，避免阻塞 UI 线程（修复 G4：原同步 ReadToEnd+WaitForExit 最坏卡 15 秒）
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate(object st)
+                {
+                    try
+                    {
+                        ProcessStartInfo psi = new ProcessStartInfo();
+                        psi.FileName = "node.exe";
+                        psi.Arguments = args;
+                        psi.UseShellExecute = false;
+                        psi.CreateNoWindow = true;
+                        psi.RedirectStandardOutput = true;
+                        psi.RedirectStandardError = true;
+                        psi.StandardOutputEncoding = Encoding.UTF8;
+                        psi.StandardErrorEncoding = Encoding.UTF8;
+                        string outp, err;
+                        int exitCode;
+                        using (Process proc = Process.Start(psi))
+                        {
+                            // 双流读取防死锁：先异步读完再等待
+                            string so = "", se = "";
+                            System.Threading.Tasks.Task<string> taskOut = proc.StandardOutput.ReadToEndAsync();
+                            System.Threading.Tasks.Task<string> taskErr = proc.StandardError.ReadToEndAsync();
+                            if (!proc.WaitForExit(30000)) { try { proc.Kill(); } catch { } }
+                            exitCode = proc.HasExited ? proc.ExitCode : -1;
+                            so = taskOut.Result; se = taskErr.Result;
+                            outp = so; err = se;
+                        }
+                        int fc = exitCode;
+                        OnUiThread(delegate
+                        {
+                            AppendLog("[网关→dsh] " + (outp + err).Trim().Replace("\n", " | "));
+                            if (fc == 0)
+                                AppendLog("[网关→dsh] 已完成：settings.yaml 已注册「gateway」提供商、credentials.yaml 已写入 DSH_GATEWAY_API_KEY。重启 dsh web 后即可在模型选择器里选用（需要网关保持运行）。");
+                            else
+                                AppendLog("[网关→dsh] 失败（退出码 " + fc + "），请确认 gateway.config.json 已填写 apiKey（非 change-me）与至少一个供应商。");
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        string msg = ex.Message;
+                        OnUiThread(delegate { AppendLog("[错误] 写入 dsh 配置失败: " + msg); });
+                    }
+                });
+            }
+            catch (Exception ex) { AppendLog("[错误] 写入 dsh 配置失败: " + ex.Message); }
+        }
+
+        private void SetGwStatus(bool running)
+        {
+            try
+            {
+                gwRunningCached = running;   // 任何状态变更同步到缓存，供 UI 轮询读取
+                gwCacheTime = DateTime.Now;
+                if (lblGwStatus == null) return;
+                lblGwStatus.Text = running ? "● 运行中" : "● 已停止";
+                lblGwStatus.ForeColor = running ? Color.ForestGreen : Color.DimGray;
+            }
+            catch { }
+        }
+
         // ---------------- 浏览器 ----------------
         private void OpenBrowser(bool auto = false)
         {
@@ -1447,6 +1953,8 @@ namespace DSHDesktop
                     else if (k == "autoStart") autoStartService = (v == "1");
                     else if (k == "autoUpdate") autoUpdate = (v == "1");
                     else if (k == "installMode" && (v == "auto" || v == "global" || v == "cache")) installMode = v;
+                    else if (k == "gwPort") { int p; if (int.TryParse(v, out p) && p > 0 && p <= 65535) gwPort = p; }
+                    else if (k == "gwKey") gwKey = v;
                 }
             }
             catch { }
@@ -1464,6 +1972,8 @@ namespace DSHDesktop
                 sb.AppendLine("autoStart=" + (autoStartService ? "1" : "0"));
                 sb.AppendLine("autoUpdate=" + (autoUpdate ? "1" : "0"));
                 sb.AppendLine("installMode=" + installMode);
+                sb.AppendLine("gwPort=" + gwPort);
+                sb.AppendLine("gwKey=" + gwKey);
                 File.WriteAllText(settingsFile, sb.ToString(), Encoding.UTF8);
 
                 // 开机自启（注册表 HKCU Run）
@@ -1555,6 +2065,13 @@ namespace DSHDesktop
                     ShowBalloon("DSH 桌面助手", "已最小化到系统托盘（右键托盘图标可操作）。");
                 return;
             }
+
+            // 用户主动退出（托盘"退出"/ForceExit）也要落盘；系统关闭（关机/注销/任务管理器）跳过避免拖慢关闭（修复 H1）
+            if (forceExit && !systemClose)
+            {
+                try { ApplyUiSettings(); } catch { }
+            }
+
             base.OnFormClosing(e);
         }
 
@@ -1569,6 +2086,27 @@ namespace DSHDesktop
                 }
                 if (uiTimer != null) { uiTimer.Stop(); uiTimer.Dispose(); }
                 StopHealthPolling();
+
+                // 退出时停止网关并释放进程句柄（修复 B2：避免孤儿进程占端口 + 句柄泄漏）
+                try
+                {
+                    if (gwProc != null)
+                    {
+                        if (!gwProc.HasExited)
+                        {
+                            KillTreePrivate(gwProc.Id);
+                            gwProc.WaitForExit(3000);
+                        }
+                        gwProc.Dispose();
+                        gwProc = null;
+                    }
+                    // 兜底：遗留网关进程按端口清理（带身份校验）
+                    int gwPid = FindListenerPid(gwPort);
+                    if (gwPid > 0 && IsPlausibleDshName(GetProcessName(gwPid)))
+                        KillTreePrivate(gwPid);
+                    try { if (File.Exists(logPath)) File.AppendAllText(logPath, "[" + DateTime.Now.ToString("HH:mm:ss") + "] [信息] 助手退出，网关已停止。\r\n", Encoding.UTF8); } catch { }
+                }
+                catch { }
             }
             base.Dispose(disposing);
         }
