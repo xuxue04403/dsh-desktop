@@ -1,4 +1,4 @@
-# Gateway E2E (PowerShell version — harness sandbox allows Start-Process children to
+﻿# Gateway E2E (PowerShell version — harness sandbox allows Start-Process children to
 # reach localhost, while Node-spawned children inherit the sandbox network isolation).
 $ErrorActionPreference = 'Stop'
 $gatewayDir = 'D:\IDE\dsh\dsh-desktop\gateway'
