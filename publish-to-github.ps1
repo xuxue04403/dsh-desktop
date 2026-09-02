@@ -99,8 +99,27 @@ Get-ChildItem $root -Recurse -File | ForEach-Object {
         if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
         Write-Host "  !! $rel failed (HTTP $status)" -ForegroundColor Yellow
         if ($rel -like '.github/workflows/*') {
-            Write-Host '     -> Workflow files need extra permission.' -ForegroundColor Yellow
-            Write-Host '     -> Edit your fine-grained token: set Workflows = Read and write, then re-run.' -ForegroundColor Yellow
+            Write-Host ''
+            Write-Host '  ============================================================' -ForegroundColor Red
+            Write-Host '  提权申请：Workflow 文件上传被拒（HTTP 403）' -ForegroundColor Red
+            Write-Host '  该仓库的 fine-grained token 缺少 Workflows 写权限。' -ForegroundColor Yellow
+            Write-Host '  请在打开的页面中把 Workflows 改为 Read and write，保存后重跑本脚本。' -ForegroundColor Yellow
+            Write-Host '  ============================================================' -ForegroundColor Red
+            Write-Host ''
+            # 弹出提权申请：浏览器打开 token 权限编辑页 + 图形弹窗（桌面环境可用时）
+            try {
+                $openUrl = 'https://github.com/settings/personal-access-tokens'
+                Write-Host "[..] 正在打开 GitHub token 权限页: $openUrl" -ForegroundColor Cyan
+                Start-Process $openUrl | Out-Null
+            } catch { }
+            try {
+                Add-Type -AssemblyName System.Windows.Forms | Out-Null
+                [System.Windows.Forms.MessageBox]::Show(
+                    "向 GitHub 上传 Workflow 文件需要更高权限（HTTP 403）。`n`n请在已打开的浏览器页面中：`n1) 选择你的 fine-grained token → Edit`n2) Repository permissions → Workflows → Read and write`n3) Update token，然后重新运行本发布脚本。`n`n（其它源码与 Release 资产不受影响，已上传成功）",
+                    'DSH Desktop 发布 - 提权申请',
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+            } catch { }
         }
     }
 }
