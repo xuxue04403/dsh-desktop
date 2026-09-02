@@ -1,4 +1,4 @@
-# 编译 DSHDesktop.exe —— 使用 Windows 自带 .NET Framework 的 C# 编译器，无需安装任何 SDK
+﻿# 编译 DSHDesktop.exe —— 使用 Windows 自带 .NET Framework 的 C# 编译器，无需安装任何 SDK
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 
