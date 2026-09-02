@@ -1,0 +1,24 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build with system csc (.NET Framework)
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DSHDesktop-win-x64
+          path: DSHDesktop.exe
+          if-no-files-found: error
