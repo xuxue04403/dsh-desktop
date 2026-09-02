@@ -1904,11 +1904,7 @@ namespace DSHDesktop
                         {
                             string tv = v.Trim();
                             if (tv.StartsWith("["))
-                            {
-                                List<string> ml = ParseJsonArrayItems(tv, "");
-                                // ParseJsonArrayItems 需字段名，这里改为基础实现：直接解析顶层数组
-                                row.models = ParseJsonPlainArray(tv);
-                            }
+                                row.models = ParseJsonPlainArray(tv);   // 直接解析顶层数组片段（K2 修正：不再用空字段名匹配）
                             else
                                 row.models = SplitModels(tv);
                         }
@@ -2088,19 +2084,22 @@ namespace DSHDesktop
                     pd["baseURL"] = Convert.ToString(row.Cells[1].Value ?? "");
                     pd["apiKey"] = Convert.ToString(row.Cells[2].Value ?? "");
                     pd["models"] = (Convert.ToString(row.Cells[3].Value ?? "") ?? "").Split(new char[] { ',', '，' }, StringSplitOptions.RemoveEmptyEntries);
-                    int prio; int.TryParse(Convert.ToString(row.Cells[4].Value ?? "1"), out prio);
+                    int prio = 1;
+                    // TryParse 失败时保持默认 1（修复 L1：避免意外写成 0 的高优先级）
+                    if (!int.TryParse(Convert.ToString(row.Cells[4].Value), out prio) || prio < 1) prio = 1;
                     pd["priority"] = prio;
                     string en = Convert.ToString(row.Cells[5].Value);
-                    pd["enabled"] = (en == "True" || en == "true" || en == "1");
+                    // 勾选列防异常：Checked 形态/空值都归一为布尔
+                    bool enVal = false;
+                    if (string.IsNullOrEmpty(en) && row.Cells[5] is DataGridViewCheckBoxCell)
+                        enVal = SafeBool(((DataGridViewCheckBoxCell)row.Cells[5]).Value);
+                    else
+                        bool.TryParse(en, out enVal);
+                    pd["enabled"] = enVal;
                     // 忽略空行（无 id 且无 url）
                     if (string.IsNullOrWhiteSpace(Convert.ToString(pd["id"])) && string.IsNullOrWhiteSpace(Convert.ToString(pd["baseURL"]))) continue;
                     provs.Add(pd);
                 }
-
-                var cfg = new Dictionary<string, object>();
-                cfg["port"] = gwPort;
-                cfg["apiKey"] = gwKey;
-                cfg["providers"] = provs.ToArray();
 
                 if (!Directory.Exists(Path.GetDirectoryName(gwConfigPath))) Directory.CreateDirectory(Path.GetDirectoryName(gwConfigPath));
                 File.WriteAllText(gwConfigPath, BuildGatewayJson(provs), Encoding.UTF8);
@@ -2128,7 +2127,7 @@ namespace DSHDesktop
             {
                 var p = provs[i];
                 string comma = (i < provs.Count - 1) ? "," : "";
-                sb.Append("    { \"id\": \"" + JsonEsc(Convert.ToString(p["id"])) + "\", \"baseURL\": \"" + JsonEsc(Convert.ToString(p["baseURL"])) + "\", \"apiKey\": \"" + JsonEsc(Convert.ToString(p["apiKey"])) + "\", \"priority\": " + Convert.ToString(p["priority"]) + ", \"enabled\": " + (Convert.ToBoolean(p["enabled"]) ? "true" : "false") + ", \"models\": [");
+                sb.Append("    { \"id\": \"" + JsonEsc(Convert.ToString(p["id"])) + "\", \"baseURL\": \"" + JsonEsc(Convert.ToString(p["baseURL"])) + "\", \"apiKey\": \"" + JsonEsc(Convert.ToString(p["apiKey"])) + "\", \"priority\": " + Convert.ToString(p["priority"]) + ", \"enabled\": " + (SafeBool(p["enabled"]) ? "true" : "false") + ", \"models\": [");
                 var models = (object[])p["models"];
                 for (int j = 0; j < models.Length; j++)
                 {
@@ -2146,6 +2145,16 @@ namespace DSHDesktop
         {
             if (s == null) return "";
             return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        // 安全布尔转换（防 FormatException）
+        private static bool SafeBool(object v)
+        {
+            if (v is bool) return (bool)v;
+            string s = Convert.ToString(v);
+            bool r;
+            if (bool.TryParse(s, out r)) return r;
+            return s == "1";
         }
 
         private void GwAddRow()
