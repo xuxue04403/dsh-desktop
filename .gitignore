@@ -6,6 +6,9 @@ DSHDesktop.exe
 logs/
 settings.ini
 crash-*.log
+data/
+gateway/gateway.config.json
+dist/
 
 # IDE / 系统
 .vs/
