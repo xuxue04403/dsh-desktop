@@ -42,6 +42,8 @@ const APP_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), '.dsh')
 const CONFIG_PATH = process.env.DSH_GATEWAY_CONFIG || path.join(APP_DIR, 'gateway.config.json');
 const MODEL_CACHE_TTL_MS = 60_000;
 const UPSTREAM_TIMEOUT_MS = 60_000;
+// R2 防封：catalog 探测失败后的冷却期（30s 内不重试探测，防请求风暴触发风控）
+const CATALOG_FAIL_COOLDOWN_MS = 30_000;
 const LOG_PATH = process.env.DSH_GATEWAY_LOG || path.join(APP_DIR, 'logs', 'gateway.log');
 
 /* ---------------- logging ---------------- */
@@ -102,12 +104,12 @@ const catalogCache = new Map(); // providerId -> { models:Set, ts }
 
 const catalogInflight = new Map(); // providerId -> Promise（并发去重）
 
-async function fetchCatalog(provider, force) {
+async function fetchCatalog(provider, force, clientUA) {
   const cached = catalogCache.get(provider.id);
-  if (!force && cached && Date.now() - cached.ts < MODEL_CACHE_TTL_MS) return cached.models;
+  if (!force && cached && Date.now() - cached.ts < (cached.failed ? CATALOG_FAIL_COOLDOWN_MS : MODEL_CACHE_TTL_MS)) return cached.models;
   // 并发去重：同一 provider 已有在途目录请求时直接复用（修复 G5）
   if (!force && catalogInflight.has(provider.id)) return catalogInflight.get(provider.id);
-  const promise = doFetchCatalog(provider);
+  const promise = doFetchCatalog(provider, clientUA);
   catalogInflight.set(provider.id, promise);
   try {
     return await promise;
@@ -116,24 +118,37 @@ async function fetchCatalog(provider, force) {
   }
 }
 
-async function doFetchCatalog(provider) {
+async function doFetchCatalog(provider, clientUA) {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
-    const res = await fetch(`${trimSlash(provider.baseURL)}/models`, {
-      headers: { authorization: `Bearer ${provider.apiKey}`, accept: 'application/json' },
+    // Q1：catalog 探测同样走上游请求头构造（clientUA 配置时完全仿真 Claude Code，
+    // 否则 new-api 客户端白名单会拦 catalog 导致模型列表为空）
+    const headers = upstreamRequestHeaders({}, provider.apiKey, clientUA);
+    const res = await fetch(`${upstreamBase(provider.baseURL)}/models`, {
+      headers,
       signal: controller.signal,
     });
     clearTimeout(timer);
-    if (!res.ok) throw new Error(`catalog HTTP ${res.status}`);
+    if (!res.ok) {
+      // 记录响应体开头（前 300 字符），方便诊断 401/404 等鉴权与端点问题
+      let detail = '';
+      try { detail = (await res.text()).slice(0, 300); } catch { }
+      log(`catalog ${provider.id} HTTP ${res.status}: ${detail}`);
+      // R10b：HTTP 错误同样写失败冷却缓存（防每次请求都重探测形成风暴）
+      catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+      return null;
+    }
     const body = await res.json();
     const ids = new Set((body.data || []).map((m) => m && m.id).filter(Boolean));
     if (ids.size === 0) throw new Error('empty catalog');
-    catalogCache.set(provider.id, { models: ids, ts: Date.now() });
+    catalogCache.set(provider.id, { models: ids, ts: Date.now(), failed: false });
     log(`catalog ${provider.id}: ${ids.size} models`);
     return ids;
   } catch (e) {
-    catalogCache.delete(provider.id);
+    // 失败冷却（R2 防封加固）：不立即删除缓存，而是缓存 30 秒的"失败态"，
+    // 避免每个客户端请求都触发 catalog 重探测造成上游请求风暴/风控
+    catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
     log(`catalog ${provider.id} FAILED: ${e.message}`);
     return null;
   }
@@ -196,14 +211,31 @@ function providersForModel(cfg, model) {
     .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
 }
 
-/**
- * 防屏蔽透传（K1）：保留 dsh 客户端的原始请求标识（尤其是 User-Agent，
- * dsh 的 attribution 机制强制带 `deepseek-harness/<版本> (+url)`），
- * 仅替换鉴权头与必要的协议头，其余原样转发——让上游看到的就是"dsh 直连"。
+/* ---------------- 上游客户端仿真（Q1 加固） ----------------
+ * 目标：完全仿真 Claude Code / OpenAI SDK 客户端的访问特征，
+ * 规避 new-api/one-api 的“unauthorized client detected”客户端白名单检测，
+ * 且不向任何上游泄露 dsh/网关自身的请求特征（防指纹封禁）。
+ *  - 当 config.clientUA 为空 → 旧行为：透传 dsh 原始标识（K1 防屏蔽）
+ *  - 当 config.clientUA 有值 → 完全仿真：丢弃客户端透传头，仅发固定仿真头集
  */
-function passthroughHeaders(reqHeaders, apiKey) {
+
+// Claude Code 风格请求头（Q1 实测收敛版）：
+// agentrouter(new-api) 客户端白名单按 User-Agent 精确匹配放行；实测通过组合为
+// UA=claude-cli/2.0.0 (external, cli) + Bearer，无其他特殊头。accept-encoding
+// 由 upstreamRequestHeaders 统一设 identity（K7）。
+function claudeClientHeaders() {
+  return {
+    'user-agent': 'claude-cli/2.0.0 (external, cli)',
+    accept: 'application/json, text/event-stream',
+  };
+}
+
+/** 构造发往上游的最终请求头。
+ * clientUA 配置时 → 完全仿真模式（不留任何客户端透传痕迹）
+ * clientUA 为空     → 透传 dsh 客户端标识（K1 防屏蔽）
+ */
+function upstreamRequestHeaders(reqHeaders, apiKey, clientUA) {
   const out = {};
-  // 需要替换或禁止透传的头部（hop-by-hop / 由本网关维护）
   const skip = new Set([
     'authorization', 'host', 'content-length', 'connection',
     'transfer-encoding', 'keep-alive', 'proxy-connection', 'upgrade',
@@ -211,20 +243,36 @@ function passthroughHeaders(reqHeaders, apiKey) {
     'x-api-key', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
     'cookie', 'origin', 'referer',
   ]);
-  for (const [k, v] of Object.entries(reqHeaders || {})) {
-    const lk = k.toLowerCase();
-    if (skip.has(lk)) continue;
-    if (lk.startsWith('sec-') || lk.startsWith('proxy-') || lk.startsWith('cf-')) continue;
-    // 数组值合并为单个字符串
-    out[k] = Array.isArray(v) ? v.join(', ') : String(v);
+
+  if (clientUA) {
+    // 完全仿真模式：与 Claude Code 客户端一致，不透传任何 dsh 头
+    Object.assign(out, claudeClientHeaders());
+    out['user-agent'] = clientUA;   // 允许用户覆盖具体 UA 值
+  } else {
+    // 透传模式：保留 dsh 客户端标识
+    for (const [k, v] of Object.entries(reqHeaders || {})) {
+      const lk = k.toLowerCase();
+      if (skip.has(lk)) continue;
+      if (lk.startsWith('sec-') || lk.startsWith('proxy-') || lk.startsWith('cf-')) continue;
+      out[k] = Array.isArray(v) ? v.join(', ') : String(v);
+    }
   }
+
   out['authorization'] = `Bearer ${apiKey}`;
   out['accept'] = 'application/json, text/event-stream';
   out['content-type'] = 'application/json';
-  // 强制上游不压缩（K7）：undici 对流式 gzip 不自动解压，直接把压缩字节交给网关转发，
-  // 会污染 SSE 输出。OpenAI 兼容上游均尊重 identity。
-  out['accept-encoding'] = 'identity';
+  out['accept-encoding'] = 'identity';  // K7：强制上游不压缩，SSE 不乱码
   return out;
+}
+
+/**
+ * 防屏蔽透传（K1，兼容保留）：保留 dsh 客户端的原始请求标识（尤其是 User-Agent，
+ * dsh 的 attribution 机制强制带 `deepseek-harness/<版本> (+url)`），
+ * 仅替换鉴权头与必要的协议头，其余原样转发——让上游看到的就是"dsh 直连"。
+ * 扩展（P3/Q1）：配置了 clientUA 时完全仿真 Claude Code，不透传任何 dsh 特征。
+ */
+function passthroughHeaders(reqHeaders, apiKey, clientUA) {
+  return upstreamRequestHeaders(reqHeaders, apiKey, clientUA);
 }
 
 /** Forward to one provider; returns true when the response was written. */
@@ -233,9 +281,9 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   let upstream;
   try {
-    // baseURL already ends with /v1 (OpenAI SDK convention); the path here is
-    // relative to it (e.g. /chat/completions, /responses).
-    upstream = await fetch(`${trimSlash(provider.baseURL)}${upstreamPath}`, {
+    // baseURL 允许“带 /v1”或“不带 /v1”两种写法（OpenAI SDK 惯例 / 用户习惯）：
+    // upstreamBase() 统一规范化，upstreamPath 始终是相对 /v1 的路径（如 /chat/completions）
+    upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${provider.apiKey}`,
@@ -248,7 +296,8 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     });
   } catch (e) {
     clearTimeout(timer);
-    catalogCache.delete(provider.id);
+    // R3 防封：失败冷却而非立即删缓存（防每个请求都重试上游形成风暴）
+    catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
     log(`upstream ${provider.id} request error: ${e.message}`);
     return false;
   }
@@ -259,7 +308,8 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     try { detail = (await upstream.text()).slice(0, 500); } catch { }
     log(`upstream ${provider.id} HTTP ${upstream.status}: ${detail}`);
     if (upstream.status === 401 || upstream.status === 403 || upstream.status >= 500) {
-      catalogCache.delete(provider.id); // likely stale/misconfigured key or dead endpoint
+      // likely stale/misconfigured key or dead endpoint —— 冷却缓存，防风暴（R3）
+      catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
     }
     return false;
   }
@@ -323,7 +373,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
   //    并行探测各供应商目录，避免串行等待放大首请求延迟（E3）
   const withCatalog = [];
   const unknown = [];
-  const catalogResults = await Promise.all(candidates.map((p) => fetchCatalog(p, false)));
+  const catalogResults = await Promise.all(candidates.map((p) => fetchCatalog(p, false, cfg.clientUA)));
   candidates.forEach((p, i) => {
     const set = catalogResults[i];
     if (set === null) { unknown.push(p); return; }
@@ -337,7 +387,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
   for (const p of ordered) {
     log(`try ${p.id} for ${model}`);
     // 透传 dsh 原始请求标识（K1 防屏蔽）：clientHeaders = req.headers
-    const ok = await forward(p, upstreamPath.replace(/^\/v1/, ''), passthroughHeaders(req.headers, p.apiKey), body, res);
+    const ok = await forward(p, upstreamPath.replace(/^\/v1/, ''), passthroughHeaders(req.headers, p.apiKey, cfg.clientUA), body, res);
     if (ok) {
       log(`served ${model} via ${p.id}`);
       return;
@@ -350,12 +400,13 @@ async function handleModels(cfg, req, res) {
   const byId = new Map();
   const rows = [];
   const results = await Promise.all(
-    providersForModel(cfg).map((p) => fetchCatalog(p, false)),
+    providersForModel(cfg).map((p) => fetchCatalog(p, false, cfg.clientUA)),
   );
   for (const p of providersForModel(cfg)) {
-    const set = catalogCache.get(p.id);
-    if (!set) continue;
-    for (const id of set.models) {
+    const entry = catalogCache.get(p.id);
+    // 失败冷却期（models=null）或无缓存：跳过（R10：不能对 null models 迭代）
+    if (!entry || !entry.models) continue;
+    for (const id of entry.models) {
       if (!byId.has(id)) {
         byId.set(id, rows.length);
         rows.push({ id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: p.id });
@@ -367,6 +418,21 @@ async function handleModels(cfg, req, res) {
 
 /* ---------------- server ---------------- */
 function trimSlash(u) { return u.replace(/\/+$/, ''); }
+
+/**
+ * 规范化供应商 baseURL（P1 修复）：
+ * - 允许带 /v1（OpenAI SDK 惯例）或不带（用户常直接填域名）
+ * - 不带时自动补 /v1；带其他后缀（如 /v1/chat/completions 误填）则收敛到 /v1
+ * 返回以 /v1 结尾的 base（不含尾斜杠）
+ */
+function upstreamBase(baseURL) {
+  let b = trimSlash(String(baseURL || ''));
+  if (!b) return b;
+  // 若以 /v1 结尾（或已是 /v1/xxx 形式）→ 收敛；否则补 /v1
+  const m = b.match(/\/v1(?:\/.*)?$/i);
+  if (m) return b.slice(0, b.length - m[0].length + 3); // 保留 /v1 前缀
+  return b + '/v1';
+}
 
 function startServer(cfg) {
   const server = http.createServer(async (req, res) => {
