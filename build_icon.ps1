@@ -1,4 +1,4 @@
-# 生成 DSHDesktop.exe 用的图标 app.ico（深蓝色圆角方块 + 白色 "D"）
+﻿# 生成 DSHDesktop.exe 用的图标 app.ico（深蓝色圆角方块 + 白色 "D"）
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
