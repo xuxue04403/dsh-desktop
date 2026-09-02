@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -127,10 +128,10 @@ namespace DSHDesktop
         private CheckBox chkAutoStart;
         private CheckBox chkUpdate;
         private ComboBox cmbInstall;
-        private GroupBox gbGateway;
-        private Button btnGwStart, btnGwStop, btnGwWrite, btnGwEdit;
-        private Label lblGwStatus;
+        private Button btnGwStart, btnGwStop, btnGwWrite, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen;
+        private Label lblGwStatus, lblGwHint;
         private TextBox txtGwPort, txtGwKey;
+        private DataGridView gvProviders;
         private NotifyIcon tray;
         private ContextMenuStrip trayMenu;
         private ToolStripMenuItem miStart, miOpen, miStop, miShow, miLog, miExit;
@@ -269,6 +270,16 @@ namespace DSHDesktop
         {
             SuspendLayout();
 
+            // ============ TabControl：dsh 服务 / 模型网关 ============
+            TabControl tabs = new TabControl();
+            tabs.SetBounds(12, 8, 736, 606);
+            tabs.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            tabs.Font = new Font("Microsoft YaHei UI", 9F);
+
+            // ---------- Tab1: dsh 服务 ----------
+            TabPage tpService = new TabPage("dsh 服务");
+            tpService.Padding = new Padding(0);
+
             btnStart = new Button();
             btnStart.Text = "一键启动";
             btnStart.Width = 110; btnStart.Height = 36; btnStart.Left = 16; btnStart.Top = 16;
@@ -290,27 +301,27 @@ namespace DSHDesktop
 
             Label lblUrl = new Label();
             lblUrl.Text = "访问地址:";
-            lblUrl.SetBounds(512, 22, 70, 22);
+            lblUrl.SetBounds(400, 22, 70, 22);
             TextBox txtUrl = new TextBox();
             txtUrl.Text = "http://127.0.0.1:" + port + "/";
             txtUrl.ReadOnly = true;
-            txtUrl.SetBounds(580, 20, 164, 24);
+            txtUrl.SetBounds(468, 20, 250, 24);
             txtUrl.BorderStyle = BorderStyle.FixedSingle;
 
             GroupBox gb = new GroupBox();
             gb.Text = "设置";
-            gb.SetBounds(16, 62, 728, 128);
+            gb.SetBounds(16, 62, 702, 124);
             gb.BackColor = Color.White;
 
             Label l1 = new Label(); l1.Text = "端口:"; l1.SetBounds(16, 28, 50, 22);
             txtPort = new TextBox(); txtPort.Text = port.ToString(); txtPort.SetBounds(66, 25, 76, 24); txtPort.BorderStyle = BorderStyle.FixedSingle;
             Label l2 = new Label(); l2.Text = "工作目录:"; l2.SetBounds(170, 28, 60, 22);
-            txtWorkDir = new TextBox(); txtWorkDir.Text = workDir; txtWorkDir.SetBounds(235, 25, 400, 24); txtWorkDir.BorderStyle = BorderStyle.FixedSingle;
-            Button btnBrowse = new Button(); btnBrowse.Text = "..."; btnBrowse.SetBounds(642, 24, 44, 26);
+            txtWorkDir = new TextBox(); txtWorkDir.Text = workDir; txtWorkDir.SetBounds(235, 25, 380, 24); txtWorkDir.BorderStyle = BorderStyle.FixedSingle;
+            Button btnBrowse = new Button(); btnBrowse.Text = "..."; btnBrowse.SetBounds(622, 24, 44, 26);
             btnBrowse.Click += delegate { FolderBrowserDialog d = new FolderBrowserDialog(); d.Description = "选择 dsh 工作目录（一般是你的项目文件夹）"; d.SelectedPath = txtWorkDir.Text; if (d.ShowDialog(this) == DialogResult.OK) txtWorkDir.Text = d.SelectedPath; };
 
             chkAutoOpen = new CheckBox(); chkAutoOpen.Text = "服务就绪后自动打开浏览器"; chkAutoOpen.SetBounds(16, 64, 220, 24); chkAutoOpen.Checked = autoOpenBrowser;
-            chkAutoStart = new CheckBox(); chkAutoStart.Text = "开机自动启动（登录时自动运行并启动 dsh）"; chkAutoStart.SetBounds(250, 64, 290, 24); chkAutoStart.Checked = autoStartService;
+            chkAutoStart = new CheckBox(); chkAutoStart.Text = "开机自动启动（登录时自动运行并启动 dsh）"; chkAutoStart.SetBounds(250, 64, 300, 24); chkAutoStart.Checked = autoStartService;
             chkUpdate = new CheckBox(); chkUpdate.Text = "启动前自动检查 dsh 更新"; chkUpdate.SetBounds(16, 94, 200, 24); chkUpdate.Checked = autoUpdate;
 
             Label lInst = new Label(); lInst.Text = "安装方式:"; lInst.SetBounds(230, 96, 62, 20);
@@ -328,7 +339,7 @@ namespace DSHDesktop
 
             gb.Controls.AddRange(new Control[] { l1, txtPort, l2, txtWorkDir, btnBrowse, chkAutoOpen, chkAutoStart, chkUpdate, lInst, cmbInstall });
 
-            Label l3 = new Label(); l3.Text = "运行日志:"; l3.SetBounds(16, 200, 80, 20);
+            Label l3 = new Label(); l3.Text = "运行日志:"; l3.SetBounds(16, 196, 80, 20);
             txtLog = new TextBox();
             txtLog.Multiline = true;
             txtLog.ReadOnly = true;
@@ -336,37 +347,88 @@ namespace DSHDesktop
             txtLog.BackColor = Color.FromArgb(30, 30, 30);
             txtLog.ForeColor = Color.FromArgb(220, 220, 220);
             txtLog.BorderStyle = BorderStyle.FixedSingle;
-            txtLog.SetBounds(16, 224, 728, 280);
-            txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom; // 拉伸时日志区自动伸展，网关面板固定贴底
+            txtLog.SetBounds(16, 220, 702, 360);
+            txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
 
-            // —— 模型网关面板 ——（760px 宽窗口下重新排布：行1 按钮、行2 输入，无截断）
-            gbGateway = new GroupBox();
-            gbGateway.Text = "模型网关（统一多供应商模型代理）";
-            gbGateway.SetBounds(16, 518, 728, 96);   // 底部=614，状态栏顶≈616，无重叠；面板净高 96-16=80
-            gbGateway.BackColor = Color.White;
-            gbGateway.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            tpService.Controls.AddRange(new Control[] { btnStart, btnOpen, btnStop, lblUrl, txtUrl, gb, l3, txtLog });
 
-            btnGwStart = new Button(); btnGwStart.Text = "启动网关"; btnGwStart.SetBounds(14, 22, 110, 28); btnGwStart.FlatStyle = FlatStyle.Flat;
+            // ---------- Tab2: 模型网关 ----------
+            TabPage tpGateway = new TabPage("模型网关");
+            tpGateway.Padding = new Padding(0);
+
+            btnGwStart = new Button(); btnGwStart.Text = "启动网关"; btnGwStart.SetBounds(16, 14, 105, 30); btnGwStart.FlatStyle = FlatStyle.Flat;
             btnGwStart.Click += delegate { StartGateway(); };
-            btnGwStop = new Button(); btnGwStop.Text = "停止网关"; btnGwStop.SetBounds(130, 22, 110, 28); btnGwStop.FlatStyle = FlatStyle.Flat;
+            btnGwStop = new Button(); btnGwStop.Text = "停止网关"; btnGwStop.SetBounds(127, 14, 105, 30); btnGwStop.FlatStyle = FlatStyle.Flat;
             btnGwStop.Click += delegate { StopGateway(); };
-            btnGwWrite = new Button(); btnGwWrite.Text = "写入 dsh 配置"; btnGwWrite.SetBounds(246, 22, 120, 28); btnGwWrite.FlatStyle = FlatStyle.Flat;
+            btnGwWrite = new Button(); btnGwWrite.Text = "写入 dsh 配置"; btnGwWrite.SetBounds(238, 14, 115, 30); btnGwWrite.FlatStyle = FlatStyle.Flat;
             btnGwWrite.Click += delegate { WriteGatewayToDsh(); };
-            btnGwEdit = new Button(); btnGwEdit.Text = "编辑供应商"; btnGwEdit.SetBounds(372, 22, 100, 28); btnGwEdit.FlatStyle = FlatStyle.Flat;
-            btnGwEdit.Click += delegate { EditGatewayConfig(); };
 
             lblGwStatus = new Label();
             lblGwStatus.Text = "● 已停止";
             lblGwStatus.ForeColor = Color.DimGray;
-            lblGwStatus.SetBounds(492, 26, 130, 20);
+            lblGwStatus.SetBounds(364, 18, 110, 20);
 
-            Label lg1 = new Label(); lg1.Text = "端口:"; lg1.SetBounds(14, 58, 40, 20);
-            txtGwPort = new TextBox(); txtGwPort.Text = gwPort.ToString(); txtGwPort.SetBounds(56, 55, 62, 24); txtGwPort.BorderStyle = BorderStyle.FixedSingle;
-            Label lg2 = new Label(); lg2.Text = "统一Key:"; lg2.SetBounds(136, 58, 54, 20);
-            txtGwKey = new TextBox(); txtGwKey.Text = gwKey; txtGwKey.SetBounds(192, 55, 260, 24); txtGwKey.BorderStyle = BorderStyle.FixedSingle; txtGwKey.PasswordChar = '●';
-            Label lg3 = new Label(); lg3.Text = "对外接口: http://127.0.0.1:" + gwPort + "/v1"; lg3.SetBounds(466, 58, 250, 20); lg3.ForeColor = Color.DimGray;
+            Label lg1 = new Label(); lg1.Text = "端口:"; lg1.SetBounds(470, 18, 40, 20);
+            txtGwPort = new TextBox(); txtGwPort.Text = gwPort.ToString(); txtGwPort.SetBounds(508, 15, 62, 24); txtGwPort.BorderStyle = BorderStyle.FixedSingle;
+            Label lg2 = new Label(); lg2.Text = "统一Key:"; lg2.SetBounds(576, 18, 54, 20);
+            txtGwKey = new TextBox(); txtGwKey.Text = gwKey; txtGwKey.SetBounds(630, 15, 80, 24); txtGwKey.BorderStyle = BorderStyle.FixedSingle; txtGwKey.PasswordChar = '●';
 
-            gbGateway.Controls.AddRange(new Control[] { btnGwStart, btnGwStop, btnGwWrite, btnGwEdit, lblGwStatus, lg1, txtGwPort, lg2, txtGwKey, lg3 });
+            // —— 供应商可视化编辑表 ——
+            Label lh = new Label(); lh.Text = "多供应商管理（同一模型多供应商时，网关自动探测可用性并按优先级路由、故障切换）：";
+            lh.SetBounds(16, 56, 690, 20);
+            lh.ForeColor = Color.FromArgb(80, 80, 80);
+
+            gvProviders = new DataGridView();
+            gvProviders.SetBounds(16, 80, 702, 380);
+            gvProviders.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            gvProviders.AllowUserToAddRows = false;
+            gvProviders.AllowUserToDeleteRows = false;
+            gvProviders.RowHeadersVisible = false;
+            gvProviders.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            gvProviders.BackgroundColor = Color.White;
+            gvProviders.BorderStyle = BorderStyle.FixedSingle;
+            gvProviders.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
+            gvProviders.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            gvProviders.MultiSelect = false;
+            // 列定义：ID / 上游地址 / 上游Key / 模型列表 / 优先级 / 启用（勾选列用专用类型，不能改 TextBox 列的 CellTemplate）
+            gvProviders.Columns.Add("cId", "供应商ID");
+            gvProviders.Columns.Add("cUrl", "上游地址 (baseURL)");
+            gvProviders.Columns.Add("cKey", "上游 Key");
+            gvProviders.Columns.Add("cModels", "模型列表 (逗号分隔)");
+            gvProviders.Columns.Add("cPriority", "优先级");
+            DataGridViewCheckBoxColumn colEnabled = new DataGridViewCheckBoxColumn();
+            colEnabled.HeaderText = "启用";
+            colEnabled.Name = "cEnabled";
+            gvProviders.Columns.Add(colEnabled);
+            gvProviders.Columns[0].FillWeight = 70;
+            gvProviders.Columns[1].FillWeight = 110;
+            gvProviders.Columns[2].FillWeight = 90;
+            gvProviders.Columns[3].FillWeight = 120;
+            gvProviders.Columns[4].FillWeight = 45;
+            gvProviders.Columns[5].FillWeight = 35;
+
+            // —— 表格下面操作按钮行 ——
+            btnGwAdd = new Button(); btnGwAdd.Text = "＋ 添加供应商"; btnGwAdd.SetBounds(16, 472, 105, 30); btnGwAdd.FlatStyle = FlatStyle.Flat;
+            btnGwAdd.Click += delegate { GwAddRow(); };
+            btnGwDel = new Button(); btnGwDel.Text = "－ 删除选中"; btnGwDel.SetBounds(127, 472, 105, 30); btnGwDel.FlatStyle = FlatStyle.Flat;
+            btnGwDel.Click += delegate { GwDeleteRow(); };
+            btnGwSave = new Button(); btnGwSave.Text = "💾 保存配置"; btnGwSave.SetBounds(238, 472, 105, 30); btnGwSave.BackColor = Color.FromArgb(0, 120, 212); btnGwSave.ForeColor = Color.White; btnGwSave.FlatStyle = FlatStyle.Flat;
+            btnGwSave.Click += delegate { GwSaveToFile(); };
+            btnGwReload = new Button(); btnGwReload.Text = "↻ 重新加载"; btnGwReload.SetBounds(349, 472, 105, 30); btnGwReload.FlatStyle = FlatStyle.Flat;
+            btnGwReload.Click += delegate { LoadProvidersGrid(); };
+            btnGwOpen = new Button(); btnGwOpen.Text = "打开配置文件"; btnGwOpen.SetBounds(460, 472, 120, 30); btnGwOpen.FlatStyle = FlatStyle.Flat;
+            btnGwOpen.Click += delegate { EditGatewayConfig(); };
+
+            lblGwHint = new Label();
+            lblGwHint.Text = "提示：修改后点「保存配置」写入 gateway.config.json；重启网关生效。也可用「写入 dsh 配置」注册到 dsh。";
+            lblGwHint.ForeColor = Color.FromArgb(120, 120, 120);
+            lblGwHint.SetBounds(16, 510, 700, 20);
+            lblGwHint.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+
+            tpGateway.Controls.AddRange(new Control[] { btnGwStart, btnGwStop, btnGwWrite, lblGwStatus, lg1, txtGwPort, lg2, txtGwKey, lh, gvProviders, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen, lblGwHint });
+
+            tabs.TabPages.Add(tpService);
+            tabs.TabPages.Add(tpGateway);
 
             statusStrip = new StatusStrip();
             lblStatus = new ToolStripStatusLabel();
@@ -377,10 +439,11 @@ namespace DSHDesktop
             statusStrip.Dock = DockStyle.Bottom;
             statusStrip.SizingGrip = false;
 
-            Controls.AddRange(new Control[] { btnStart, btnOpen, btnStop, lblUrl, txtUrl, gb, l3, txtLog, gbGateway, statusStrip });
+            Controls.AddRange(new Control[] { tabs, statusStrip });
 
             ResumeLayout(false);
             PerformLayout();
+            LoadProvidersGrid();
 
             UpdateStatusText("[ 就绪 ] 点击「一键启动」或从托盘启动 dsh", Color.DimGray);
         }
@@ -1786,6 +1849,322 @@ namespace DSHDesktop
                 using (Process p = Process.Start(psi)) { p.WaitForExit(5000); }
             }
             catch { }
+        }
+
+        // —— 供应商可视化编辑：从 gateway.config.json 载入表格 ——
+        // 用自研最小 JSON 解析（结构固定：{port,apiKey,providers:[{id,baseURL,apiKey,models[],priority,enabled}]}），
+        // 避免依赖 System.Web.Extensions（在纯 csc 场景下加载不稳定）
+        private class GwProviderRow
+        {
+            public string id = "";
+            public string baseURL = "";
+            public string apiKey = "";
+            public List<string> models = new List<string>();
+            public int priority = 1;
+            public bool enabled = true;
+        }
+
+        // 极简 JSON 对象解析：返回 Dictionary<string,string>（值已按字符串读）；数组字段由调用方处理
+        private void LoadProvidersGrid()
+        {
+            try
+            {
+                if (gvProviders == null) return;
+                gvProviders.Rows.Clear();
+                if (!File.Exists(gwConfigPath))
+                {
+                    lblGwHint.Text = "尚未创建 gateway.config.json —— 点击「保存配置」将生成默认模板。";
+                    return;
+                }
+                string json = File.ReadAllText(gwConfigPath, Encoding.UTF8);
+                var cfg = ParseJsonObject(json);
+                if (cfg == null) { lblGwHint.Text = "配置文件解析失败（可能是 JSON 格式错误）。"; return; }
+
+                if (cfg.ContainsKey("port")) { int p; if (int.TryParse(cfg["port"], out p) && p > 0) gwPort = p; txtGwPort.Text = gwPort.ToString(); }
+                if (cfg.ContainsKey("apiKey")) { gwKey = cfg["apiKey"]; txtGwKey.Text = gwKey; }
+
+                // 提取 providers 数组
+                List<string> provList = null;
+                if (cfg.ContainsKey("providers")) provList = ParseJsonArrayItems(json, "providers");
+                if (provList != null)
+                {
+                    foreach (string itemJson in provList)
+                    {
+                        var pd = ParseJsonObject(itemJson);
+                        if (pd == null) continue;
+                        GwProviderRow row = new GwProviderRow();
+                        string v;
+                        if (pd.TryGetValue("id", out v)) row.id = v;
+                        if (pd.TryGetValue("baseURL", out v)) row.baseURL = v;
+                        if (pd.TryGetValue("apiKey", out v)) row.apiKey = v;
+                        if (pd.TryGetValue("priority", out v)) int.TryParse(v, out row.priority);
+                        if (pd.TryGetValue("enabled", out v)) bool.TryParse(v, out row.enabled);
+                        // models 是数组片段（如 ["a","b"]）→ 解析为元素列表；也可能用户以逗号串形式编辑 → 兼容
+                        if (pd.TryGetValue("models", out v))
+                        {
+                            string tv = v.Trim();
+                            if (tv.StartsWith("["))
+                            {
+                                List<string> ml = ParseJsonArrayItems(tv, "");
+                                // ParseJsonArrayItems 需字段名，这里改为基础实现：直接解析顶层数组
+                                row.models = ParseJsonPlainArray(tv);
+                            }
+                            else
+                                row.models = SplitModels(tv);
+                        }
+                        gvProviders.Rows.Add(row.id, row.baseURL, row.apiKey, string.Join(",", row.models.ToArray()), row.priority, row.enabled);
+                    }
+                }
+                lblGwHint.Text = "修改后点「保存配置」写入 gateway.config.json；重启网关生效。";
+            }
+            catch (Exception ex)
+            {
+                lblGwHint.Text = "加载配置失败：" + ex.Message;
+            }
+        }
+
+        // 从 JSON 数组片段（形如 ["a","b"]）解析出字符串元素列表
+        private static List<string> ParseJsonPlainArray(string s)
+        {
+            var list = new List<string>();
+            if (string.IsNullOrEmpty(s)) return list;
+            int i = 0;
+            while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+            if (i >= s.Length || s[i] != '[') return list;
+            i++;
+            while (i < s.Length)
+            {
+                while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+                if (i >= s.Length) break;
+                if (s[i] == ']') break;
+                if (s[i] == ',') { i++; continue; }
+                if (s[i] == '"')
+                {
+                    string val = ParseJsonString(s, ref i);
+                    if (val == null) break;
+                    list.Add(val);
+                }
+                else i++;
+            }
+            return list;
+        }
+
+        // 分割模型列表（兼容逗号/中文逗号）
+        private static List<string> SplitModels(string s)
+        {
+            var list = new List<string>();
+            if (string.IsNullOrEmpty(s)) return list;
+            foreach (string part in s.Split(new char[] { ',', '，' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                string t = part.Trim();
+                if (t.Length > 0) list.Add(t);
+            }
+            return list;
+        }
+
+        // 极简 JSON 顶层对象解析 → Dictionary<string,string>（嵌套对象/数组压缩为原始片段）
+        private static Dictionary<string, string> ParseJsonObject(string json)
+        {
+            var result = new Dictionary<string, string>();
+            if (string.IsNullOrEmpty(json)) return null;
+            int i = 0;
+            SkipWs(json, ref i);
+            if (i >= json.Length || json[i] != '{') return null;
+            i++;
+            while (i < json.Length)
+            {
+                SkipWs(json, ref i);
+                if (i >= json.Length) break;
+                if (json[i] == '}') { i++; break; }
+                if (json[i] == ',') { i++; continue; }
+                string key = ParseJsonString(json, ref i);
+                if (key == null) break;
+                SkipWs(json, ref i);
+                if (i < json.Length && json[i] == ':') i++;
+                SkipWs(json, ref i);
+                // 值：字符串 / 数字 / true / false / null / 对象 / 数组
+                string val;
+                if (i < json.Length && json[i] == '"') val = ParseJsonString(json, ref i);
+                else if (i < json.Length && json[i] == '{') { int start = i; int end = SkipBalanced(json, i, '{', '}'); val = json.Substring(start, end - start); i = end; }
+                else if (i < json.Length && json[i] == '[') { int start = i; int end = SkipBalanced(json, i, '[', ']'); val = json.Substring(start, end - start); i = end; }
+                else { int start = i; while (i < json.Length && json[i] != ',' && json[i] != '}' && json[i] != '\r' && json[i] != '\n') i++; val = json.Substring(start, i - start).Trim(); }
+                result[key] = val;
+            }
+            return result;
+        }
+
+        // 从对象 json 中提取指定数组字段的每个元素（原始 JSON 片段列表）
+        private static List<string> ParseJsonArrayItems(string json, string field)
+        {
+            int idx = json.IndexOf("\"" + field + "\"", StringComparison.Ordinal);
+            if (idx < 0) return null;
+            idx += field.Length + 2;
+            // 跳过冒号与空白
+            while (idx < json.Length && (json[idx] == ':' || char.IsWhiteSpace(json[idx]))) idx++;
+            if (idx >= json.Length || json[idx] != '[') return null;
+            idx++;
+            var items = new List<string>();
+            while (idx < json.Length)
+            {
+                while (idx < json.Length && char.IsWhiteSpace(json[idx])) idx++;
+                if (idx >= json.Length) break;
+                if (json[idx] == ']') break;
+                if (json[idx] == ',') { idx++; continue; }
+                int start = idx;
+                if (json[idx] == '{') idx = SkipBalanced(json, idx, '{', '}');
+                else idx = SkipBalanced(json, idx, '[', ']');
+                items.Add(json.Substring(start, idx - start));
+            }
+            return items;
+        }
+
+        private static int SkipBalanced(string s, int i, char open, char close)
+        {
+            int depth = 0;
+            bool inStr = false;
+            while (i < s.Length)
+            {
+                char c = s[i];
+                if (c == '"' && (i == 0 || s[i - 1] != '\\')) inStr = !inStr;
+                if (!inStr)
+                {
+                    if (c == open) depth++;
+                    else if (c == close) { depth--; if (depth == 0) { i++; break; } }
+                }
+                i++;
+            }
+            return i;
+        }
+
+        private static void SkipWs(string s, ref int i)
+        {
+            while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+        }
+
+        private static string ParseJsonString(string s, ref int i)
+        {
+            if (i >= s.Length || s[i] != '"') return null;
+            i++;
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            while (i < s.Length)
+            {
+                char c = s[i];
+                if (c == '\\' && i + 1 < s.Length)
+                {
+                    char n = s[i + 1];
+                    switch (n)
+                    {
+                        case 'n': sb.Append('\n'); break;
+                        case 'r': sb.Append('\r'); break;
+                        case 't': sb.Append('\t'); break;
+                        case '"': sb.Append('"'); break;
+                        case '\\': sb.Append('\\'); break;
+                        default: sb.Append(n); break;
+                    }
+                    i += 2;
+                    continue;
+                }
+                if (c == '"') { i++; return sb.ToString(); }
+                sb.Append(c);
+                i++;
+            }
+            return null;
+        }
+
+        // —— 从表格写回 gateway.config.json ——
+        private void GwSaveToFile()
+        {
+            try
+            {
+                int p; if (int.TryParse(txtGwPort.Text, out p) && p > 0 && p <= 65535) gwPort = p;
+                gwKey = txtGwKey.Text.Trim();
+
+                var provs = new List<Dictionary<string, object>>();
+                foreach (DataGridViewRow row in gvProviders.Rows)
+                {
+                    if (row.IsNewRow) continue;
+                    var pd = new Dictionary<string, object>();
+                    pd["id"] = Convert.ToString(row.Cells[0].Value ?? "");
+                    pd["baseURL"] = Convert.ToString(row.Cells[1].Value ?? "");
+                    pd["apiKey"] = Convert.ToString(row.Cells[2].Value ?? "");
+                    pd["models"] = (Convert.ToString(row.Cells[3].Value ?? "") ?? "").Split(new char[] { ',', '，' }, StringSplitOptions.RemoveEmptyEntries);
+                    int prio; int.TryParse(Convert.ToString(row.Cells[4].Value ?? "1"), out prio);
+                    pd["priority"] = prio;
+                    string en = Convert.ToString(row.Cells[5].Value);
+                    pd["enabled"] = (en == "True" || en == "true" || en == "1");
+                    // 忽略空行（无 id 且无 url）
+                    if (string.IsNullOrWhiteSpace(Convert.ToString(pd["id"])) && string.IsNullOrWhiteSpace(Convert.ToString(pd["baseURL"]))) continue;
+                    provs.Add(pd);
+                }
+
+                var cfg = new Dictionary<string, object>();
+                cfg["port"] = gwPort;
+                cfg["apiKey"] = gwKey;
+                cfg["providers"] = provs.ToArray();
+
+                if (!Directory.Exists(Path.GetDirectoryName(gwConfigPath))) Directory.CreateDirectory(Path.GetDirectoryName(gwConfigPath));
+                File.WriteAllText(gwConfigPath, BuildGatewayJson(provs), Encoding.UTF8);
+
+                lblGwHint.Text = "已保存 " + provs.Count + " 个供应商 → " + gwConfigPath;
+                AppendLog("[网关] 供应商配置已保存（" + provs.Count + " 家）。重启网关生效；可点「写入 dsh 配置」注册到 dsh。");
+                SaveSettings();
+            }
+            catch (Exception ex)
+            {
+                lblGwHint.Text = "保存失败：" + ex.Message;
+                AppendLog("[错误] 保存网关配置失败: " + ex.Message);
+            }
+        }
+
+        // 手写 gateway.config.json 序列化（转义 + 缩进；实例方法直接使用 gwPort/gwKey 字段）
+        private string BuildGatewayJson(List<Dictionary<string, object>> provs)
+        {
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            sb.AppendLine("{");
+            sb.AppendLine("  \"port\": " + gwPort + ",");
+            sb.AppendLine("  \"apiKey\": \"" + JsonEsc(gwKey) + "\",");
+            sb.AppendLine("  \"providers\": [");
+            for (int i = 0; i < provs.Count; i++)
+            {
+                var p = provs[i];
+                string comma = (i < provs.Count - 1) ? "," : "";
+                sb.Append("    { \"id\": \"" + JsonEsc(Convert.ToString(p["id"])) + "\", \"baseURL\": \"" + JsonEsc(Convert.ToString(p["baseURL"])) + "\", \"apiKey\": \"" + JsonEsc(Convert.ToString(p["apiKey"])) + "\", \"priority\": " + Convert.ToString(p["priority"]) + ", \"enabled\": " + (Convert.ToBoolean(p["enabled"]) ? "true" : "false") + ", \"models\": [");
+                var models = (object[])p["models"];
+                for (int j = 0; j < models.Length; j++)
+                {
+                    if (j > 0) sb.Append(", ");
+                    sb.Append("\"" + JsonEsc(Convert.ToString(models[j])) + "\"");
+                }
+                sb.AppendLine("] }" + comma);
+            }
+            sb.AppendLine("  ]");
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        private static string JsonEsc(string s)
+        {
+            if (s == null) return "";
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+        }
+
+        private void GwAddRow()
+        {
+            if (gvProviders == null) return;
+            int idx = gvProviders.Rows.Add("provider-" + (gvProviders.Rows.Count + 1), "https://example.com/v1", "", "deepseek-v4-flash", 1, true);
+            gvProviders.CurrentCell = gvProviders.Rows[idx].Cells[0];
+            gvProviders.BeginEdit(true);
+        }
+
+        private void GwDeleteRow()
+        {
+            if (gvProviders == null || gvProviders.CurrentRow == null) return;
+            int idx = gvProviders.CurrentRow.Index;
+            if (idx >= 0 && idx < gvProviders.Rows.Count)
+            {
+                gvProviders.Rows.RemoveAt(idx);
+                lblGwHint.Text = "已移除一行 —— 记得点「保存配置」生效。";
+            }
         }
 
         private void EditGatewayConfig()
