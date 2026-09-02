@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Publish this folder to GitHub as an open-source project (create repo / upload
   sources / create Release with compiled exe). No git client required.
@@ -103,29 +103,38 @@ Get-ChildItem $root -Recurse -File | ForEach-Object {
 }
 Write-Host "[OK] Uploaded $count file(s)." -ForegroundColor Green
 
-# ---------- 4. release with portable zip asset ----------
+# ---------- 4. release with assets (installer exe + portable zip) ----------
+$assets = @{}   # name -> local path
+
+# 4.1 安装器（主程序已由 build.ps1 产出；若缺失则先 build）
+$setupExe = Join-Path $root 'DSHDesktopSetup.exe'
+if (-not (Test-Path $setupExe)) {
+    Write-Host '[..] Building exe + installer...'
+    & (Join-Path $root 'build.ps1')
+    if ($LASTEXITCODE -ne 0) { Write-Host '[WARN] build.ps1 failed' -ForegroundColor Yellow }
+}
+if (Test-Path $setupExe) { $assets['DSHDesktopSetup.exe'] = $setupExe }
+else { Write-Host '[WARN] installer exe missing' -ForegroundColor Yellow }
+
+# 4.2 便携 zip
 $zipOut = Join-Path $root 'dist'
-$zip = $null
 try {
-    if (-not (Test-Path (Join-Path $root 'DSHDesktop.exe'))) {
-        Write-Host '[..] Building exe first...'
-        & (Join-Path $root 'build.ps1')
-        if ($LASTEXITCODE -ne 0) { throw 'build.ps1 failed' }
-    }
     Write-Host '[..] Building portable zip...'
     & (Join-Path $root '_build-portable.ps1') -OutputDir $zipOut -SkipBuild
-    if ($LASTEXITCODE -ne 0) { throw 'portable build failed' }
     $zip = (Get-ChildItem $zipOut -Filter '*.zip' | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+    if ($zip) { $assets['DSHDesktop-portable.zip'] = $zip }
 } catch {
     Write-Host ('[WARN] portable build failed: ' + $_.Exception.Message) -ForegroundColor Yellow
 }
 
-if ($zip -and (Test-Path $zip)) {
+if ($assets.Count -gt 0) {
     try {
         $rel = $null
         try { $rel = Api 'GET' "$repoUri/releases/tags/$Version" } catch { }
         if (-not $rel) {
-            $bodyText = "DSH Desktop portable release." + [Environment]::NewLine + "- Portable zip: extract anywhere, double-click DSHDesktop.exe" + [Environment]::NewLine + "- One-click start/stop/auto-update tray tool for dsh web + model gateway"
+            $bodyText = "DSH Desktop release." + [Environment]::NewLine +
+                "- Installer (recommended): DSHDesktopSetup.exe - single-file setup, creates shortcuts and uninstall entry" + [Environment]::NewLine +
+                "- Portable: DSHDesktop-portable.zip - extract anywhere, double-click DSHDesktop.exe"
             $rel = Api 'POST' "$repoUri/releases" @{
                 tag_name   = $Version
                 name       = $Version
@@ -135,38 +144,40 @@ if ($zip -and (Test-Path $zip)) {
             }
             Write-Host "[OK] Release $Version created."
         } else {
-            Write-Host "[INFO] Release $Version already exists; attaching asset."
+            Write-Host "[INFO] Release $Version already exists; attaching assets."
         }
 
-        $assetName = 'DSHDesktop-portable.zip'
-        $up = "https://uploads.github.com/repos/$login/$RepoName/releases/" + $rel.id + "/assets?name=$assetName"
-        try {
-            Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType 'application/zip' -InFile $zip | Out-Null
-            Write-Host "[OK] Release asset uploaded: $assetName" -ForegroundColor Green
-        } catch {
-            $status = 0
-            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-            if ($status -eq 422) {
-                # same-name asset exists: GitHub forbids overwrite, so delete old asset first
-                Write-Host '[..] Asset name already exists on this release; replacing...' -ForegroundColor Yellow
-                $assets = Api 'GET' "$repoUri/releases/$($rel.id)/assets"
-                foreach ($a in $assets) {
-                    if ($a.name -eq $assetName) {
-                        Invoke-RestMethod -Method Delete -Uri $a.url -Headers $headers | Out-Null
-                        Write-Host '[OK] Old asset deleted.'
+        foreach ($name in $assets.Keys) {
+            $file = $assets[$name]
+            $ct = if ($name -like '*.zip') { 'application/zip' } else { 'application/octet-stream' }
+            $up = "https://uploads.github.com/repos/$login/$RepoName/releases/" + $rel.id + "/assets?name=$name"
+            try {
+                Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType $ct -InFile $file | Out-Null
+                Write-Host "[OK] Release asset uploaded: $name" -ForegroundColor Green
+            } catch {
+                $status = 0
+                if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+                if ($status -eq 422) {
+                    # 同名资产已存在：GitHub 不允许覆盖，先删旧再重传
+                    Write-Host "[..] Asset $name already exists; replacing..."
+                    $existing = Api 'GET' "$repoUri/releases/$($rel.id)/assets"
+                    foreach ($a in $existing) {
+                        if ($a.name -eq $name) {
+                            Invoke-RestMethod -Method Delete -Uri $a.url -Headers $headers | Out-Null
+                        }
                     }
+                    Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType $ct -InFile $file | Out-Null
+                    Write-Host "[OK] Release asset replaced: $name" -ForegroundColor Green
+                } else {
+                    Write-Host ('[WARN] Release asset upload failed for ' + $name + ' (HTTP ' + $status + '): ' + $_.Exception.Message) -ForegroundColor Yellow
                 }
-                Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType 'application/zip' -InFile $zip | Out-Null
-                Write-Host "[OK] Release asset replaced: $assetName" -ForegroundColor Green
-            } else {
-                Write-Host ('[WARN] Release asset upload failed (HTTP ' + $status + '): ' + $_.Exception.Message) -ForegroundColor Yellow
             }
         }
     } catch {
         Write-Host ('[WARN] Release step failed: ' + $_.Exception.Message) -ForegroundColor Yellow
     }
 } else {
-    Write-Host '[SKIP] Portable zip was not produced (see portable build log above).'
+    Write-Host '[SKIP] No release assets produced.'
 }
 
 Write-Host ''
