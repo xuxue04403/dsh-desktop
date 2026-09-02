@@ -1,4 +1,4 @@
-# 编译 DSHDesktop.exe —— 使用 Windows 自带 .NET Framework 的 C# 编译器，无需安装任何 SDK
+﻿# 编译 DSHDesktop.exe —— 使用 Windows 自带 .NET Framework 的 C# 编译器，无需安装任何 SDK
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 
@@ -23,7 +23,6 @@ $args = @(
     '/r:System.Core.dll',
     '/r:System.Windows.Forms.dll',
     '/r:System.Drawing.dll',
-    '/r:System.Web.Extensions.dll',
     "/out:$root\DSHDesktop.exe",
     "/win32icon:$root\app.ico",
     "$root\DSHDesktop.cs"
@@ -51,3 +50,42 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "编译成功 ✅"
 Write-Host "可执行文件: $root\DSHDesktop.exe"
 Write-Host "双击即可运行（Windows 自带 .NET Framework 4.x，无需额外安装）。"
+
+# —— 编译自包含安装器 DSHDesktopSetup.exe（内嵌主程序 + gateway + README）——
+$setupCs = Join-Path $root 'setup\DSHDesktopSetup.cs'
+if (Test-Path $setupCs) {
+    Write-Host ""
+    Write-Host "正在编译安装器 DSHDesktopSetup.exe…"
+    $setupArgs = @(
+        '/nologo',
+        '/target:winexe',
+        '/platform:anycpu',
+        '/optimize+',
+        '/r:System.dll',
+        '/r:System.Core.dll',
+        '/r:System.Windows.Forms.dll',
+        '/r:System.Drawing.dll',
+        "/resource:$root\DSHDesktop.exe",
+        "/resource:$root\gateway\model-gateway.mjs",
+        "/resource:$root\gateway\gateway.config.example.json",
+        "/resource:$root\README.md",
+        "/win32icon:$root\app.ico",
+        "/out:$root\DSHDesktopSetup.exe",
+        $setupCs
+    )
+    # 若旧安装器被占用（正运行），改名腾位
+    $setupPath = Join-Path $root 'DSHDesktopSetup.exe'
+    if (Test-Path $setupPath) {
+        try { Remove-Item $setupPath -Force -ErrorAction Stop }
+        catch {
+            $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+            Rename-Item $setupPath "DSHDesktopSetup.old-$stamp.exe" -Force
+        }
+    }
+    & $csc @setupArgs
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "安装器: $root\DSHDesktopSetup.exe ✅（单文件自包含）"
+    } else {
+        Write-Host "[错误] 安装器编译失败 (exit $LASTEXITCODE)" -ForegroundColor Red
+    }
+}
