@@ -102,6 +102,9 @@ function loadConfig() {
 /* ---------------- upstream catalog cache ---------------- */
 const catalogCache = new Map(); // providerId -> { models:Set, ts }
 
+// S1 轮询计数器：model -> 下次起始偏移（round-robin 路由模式用）
+const rrCounters = new Map();
+
 const catalogInflight = new Map(); // providerId -> Promise（并发去重）
 
 async function fetchCatalog(provider, force, clientUA) {
@@ -362,6 +365,11 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
 async function handleCompletion(cfg, req, res, body, upstreamPath) {
   const model = body && body.model;
   if (!model) return json(res, 400, { error: { message: 'model is required' } });
+  const reqStart = Date.now();   // 调用计时（T1 调用日志）
+  const client = req.socket?.remoteAddress || 'local';
+  const stream = !!(body && body.stream);
+  const logCall = (via, status) =>
+    log(`[call] ${model} ${via} status=${status} stream=${stream ? 1 : 0} dur=${Date.now() - reqStart}ms from=${client}`);
 
   const candidates = providersForModel(cfg, model);
   if (candidates.length === 0) {
@@ -384,15 +392,29 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
   if (ordered.length === 0) {
     return json(res, 404, { error: { message: `model "${model}" is not offered by any configured provider` } });
   }
-  for (const p of ordered) {
+
+  // 路由模式（S1）：
+  //  - 缺省 / "failover"：主备——固定从列表头开始尝试，失败切下一家（传统行为）
+  //  - "round-robin"：轮询——同一模型每次请求从不同起点开始，流量分摊到各家；
+  //    每家仍按 priority 顺序（candidates 已按 priority 排序），失败同样切下一家
+  let tryOrder = ordered;
+  if (cfg.routing === 'round-robin' && ordered.length > 1) {
+    let n = rrCounters.get(model) || 0;
+    rrCounters.set(model, n + 1);
+    const start = n % ordered.length;
+    if (start > 0) tryOrder = [...ordered.slice(start), ...ordered.slice(0, start)];
+  }
+  for (const p of tryOrder) {
     log(`try ${p.id} for ${model}`);
     // 透传 dsh 原始请求标识（K1 防屏蔽）：clientHeaders = req.headers
     const ok = await forward(p, upstreamPath.replace(/^\/v1/, ''), passthroughHeaders(req.headers, p.apiKey, cfg.clientUA), body, res);
     if (ok) {
       log(`served ${model} via ${p.id}`);
+      logCall(`via=${p.id}`, 'ok');
       return;
     }
   }
+  logCall('all-providers', 'fail');
   json(res, 503, { error: { message: `all providers for model "${model}" are unavailable` } });
 }
 
