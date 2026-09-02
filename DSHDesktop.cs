@@ -211,8 +211,8 @@ namespace DSHDesktop
         public MainForm(bool autoStartFlag)
         {
             Text = "DSH 桌面助手";
-            ClientSize = new Size(580, 560);
-            MinimumSize = new Size(520, 480);
+            ClientSize = new Size(760, 640);
+            MinimumSize = new Size(690, 600);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.White;
             Font = new Font("Microsoft YaHei UI", 9F);
@@ -271,54 +271,54 @@ namespace DSHDesktop
 
             btnStart = new Button();
             btnStart.Text = "一键启动";
-            btnStart.Width = 110; btnStart.Height = 34; btnStart.Left = 16; btnStart.Top = 16;
+            btnStart.Width = 110; btnStart.Height = 36; btnStart.Left = 16; btnStart.Top = 16;
             btnStart.BackColor = Color.FromArgb(0, 120, 212); btnStart.ForeColor = Color.White;
             btnStart.FlatStyle = FlatStyle.Flat;
             btnStart.Click += OnStartClick;
 
             btnOpen = new Button();
             btnOpen.Text = "打开浏览器";
-            btnOpen.Width = 110; btnOpen.Height = 34; btnOpen.Left = 134; btnOpen.Top = 16;
+            btnOpen.Width = 110; btnOpen.Height = 36; btnOpen.Left = 134; btnOpen.Top = 16;
             btnOpen.FlatStyle = FlatStyle.Flat;
             btnOpen.Click += OnOpenClick;
 
             btnStop = new Button();
             btnStop.Text = "停止服务";
-            btnStop.Width = 110; btnStop.Height = 34; btnStop.Left = 252; btnStop.Top = 16;
+            btnStop.Width = 110; btnStop.Height = 36; btnStop.Left = 252; btnStop.Top = 16;
             btnStop.FlatStyle = FlatStyle.Flat;
             btnStop.Click += OnStopClick;
 
             Label lblUrl = new Label();
             lblUrl.Text = "访问地址:";
-            lblUrl.SetBounds(400, 22, 70, 22);
+            lblUrl.SetBounds(512, 22, 70, 22);
             TextBox txtUrl = new TextBox();
             txtUrl.Text = "http://127.0.0.1:" + port + "/";
             txtUrl.ReadOnly = true;
-            txtUrl.SetBounds(468, 20, 96, 24);
+            txtUrl.SetBounds(580, 20, 164, 24);
             txtUrl.BorderStyle = BorderStyle.FixedSingle;
 
             GroupBox gb = new GroupBox();
             gb.Text = "设置";
-            gb.SetBounds(16, 62, 548, 124);
+            gb.SetBounds(16, 62, 728, 128);
             gb.BackColor = Color.White;
 
-            Label l1 = new Label(); l1.Text = "端口:"; l1.SetBounds(14, 28, 50, 22);
-            txtPort = new TextBox(); txtPort.Text = port.ToString(); txtPort.SetBounds(64, 25, 70, 24); txtPort.BorderStyle = BorderStyle.FixedSingle;
-            Label l2 = new Label(); l2.Text = "工作目录:"; l2.SetBounds(150, 28, 60, 22);
-            txtWorkDir = new TextBox(); txtWorkDir.Text = workDir; txtWorkDir.SetBounds(215, 25, 250, 24); txtWorkDir.BorderStyle = BorderStyle.FixedSingle;
-            Button btnBrowse = new Button(); btnBrowse.Text = "..."; btnBrowse.SetBounds(472, 24, 44, 26);
+            Label l1 = new Label(); l1.Text = "端口:"; l1.SetBounds(16, 28, 50, 22);
+            txtPort = new TextBox(); txtPort.Text = port.ToString(); txtPort.SetBounds(66, 25, 76, 24); txtPort.BorderStyle = BorderStyle.FixedSingle;
+            Label l2 = new Label(); l2.Text = "工作目录:"; l2.SetBounds(170, 28, 60, 22);
+            txtWorkDir = new TextBox(); txtWorkDir.Text = workDir; txtWorkDir.SetBounds(235, 25, 400, 24); txtWorkDir.BorderStyle = BorderStyle.FixedSingle;
+            Button btnBrowse = new Button(); btnBrowse.Text = "..."; btnBrowse.SetBounds(642, 24, 44, 26);
             btnBrowse.Click += delegate { FolderBrowserDialog d = new FolderBrowserDialog(); d.Description = "选择 dsh 工作目录（一般是你的项目文件夹）"; d.SelectedPath = txtWorkDir.Text; if (d.ShowDialog(this) == DialogResult.OK) txtWorkDir.Text = d.SelectedPath; };
 
-            chkAutoOpen = new CheckBox(); chkAutoOpen.Text = "服务就绪后自动打开浏览器"; chkAutoOpen.SetBounds(14, 62, 220, 24); chkAutoOpen.Checked = autoOpenBrowser;
-            chkAutoStart = new CheckBox(); chkAutoStart.Text = "开机自动启动（登录时自动运行并启动 dsh）"; chkAutoStart.SetBounds(250, 62, 280, 24); chkAutoStart.Checked = autoStartService;
-            chkUpdate = new CheckBox(); chkUpdate.Text = "启动前自动检查 dsh 更新"; chkUpdate.SetBounds(14, 90, 200, 24); chkUpdate.Checked = autoUpdate;
+            chkAutoOpen = new CheckBox(); chkAutoOpen.Text = "服务就绪后自动打开浏览器"; chkAutoOpen.SetBounds(16, 64, 220, 24); chkAutoOpen.Checked = autoOpenBrowser;
+            chkAutoStart = new CheckBox(); chkAutoStart.Text = "开机自动启动（登录时自动运行并启动 dsh）"; chkAutoStart.SetBounds(250, 64, 290, 24); chkAutoStart.Checked = autoStartService;
+            chkUpdate = new CheckBox(); chkUpdate.Text = "启动前自动检查 dsh 更新"; chkUpdate.SetBounds(16, 94, 200, 24); chkUpdate.Checked = autoUpdate;
 
-            Label lInst = new Label(); lInst.Text = "安装方式:"; lInst.SetBounds(226, 92, 60, 20);
+            Label lInst = new Label(); lInst.Text = "安装方式:"; lInst.SetBounds(230, 96, 62, 20);
             cmbInstall = new ComboBox();
             cmbInstall.DropDownStyle = ComboBoxStyle.DropDownList;
             cmbInstall.Items.AddRange(new object[] { "自动择优", "全局安装(npm -g)", "缓存安装(npx)" });
             cmbInstall.SelectedIndex = (installMode == "global") ? 1 : (installMode == "cache") ? 2 : 0;
-            cmbInstall.SetBounds(288, 88, 130, 24);
+            cmbInstall.SetBounds(294, 92, 170, 24);
             cmbInstall.SelectedIndexChanged += delegate { ApplyUiSettings(); };
 
             // 勾选即保存（修复：以前只有点"一键启动"才会写设置和注册表）
@@ -328,7 +328,7 @@ namespace DSHDesktop
 
             gb.Controls.AddRange(new Control[] { l1, txtPort, l2, txtWorkDir, btnBrowse, chkAutoOpen, chkAutoStart, chkUpdate, lInst, cmbInstall });
 
-            Label l3 = new Label(); l3.Text = "运行日志:"; l3.SetBounds(16, 196, 80, 20);
+            Label l3 = new Label(); l3.Text = "运行日志:"; l3.SetBounds(16, 200, 80, 20);
             txtLog = new TextBox();
             txtLog.Multiline = true;
             txtLog.ReadOnly = true;
@@ -336,35 +336,35 @@ namespace DSHDesktop
             txtLog.BackColor = Color.FromArgb(30, 30, 30);
             txtLog.ForeColor = Color.FromArgb(220, 220, 220);
             txtLog.BorderStyle = BorderStyle.FixedSingle;
-            txtLog.SetBounds(16, 220, 548, 216);
-            txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right; // 不锚底部：底部空间由网关面板占据
+            txtLog.SetBounds(16, 224, 728, 280);
+            txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom; // 拉伸时日志区自动伸展，网关面板固定贴底
 
-            // —— 模型网关面板 ——（面板净高需容纳两行控件：行1 y=24、行2 y=52；修复 I1/I2 重叠与溢出）
+            // —— 模型网关面板 ——（760px 宽窗口下重新排布：行1 按钮、行2 输入，无截断）
             gbGateway = new GroupBox();
             gbGateway.Text = "模型网关（统一多供应商模型代理）";
-            gbGateway.SetBounds(16, 444, 548, 90);   // 底部=534，状态栏约 538 起，无重叠
+            gbGateway.SetBounds(16, 518, 728, 96);   // 底部=614，状态栏顶≈616，无重叠；面板净高 96-16=80
             gbGateway.BackColor = Color.White;
             gbGateway.Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
 
-            btnGwStart = new Button(); btnGwStart.Text = "启动网关"; btnGwStart.SetBounds(10, 24, 84, 26); btnGwStart.FlatStyle = FlatStyle.Flat;
+            btnGwStart = new Button(); btnGwStart.Text = "启动网关"; btnGwStart.SetBounds(14, 22, 110, 28); btnGwStart.FlatStyle = FlatStyle.Flat;
             btnGwStart.Click += delegate { StartGateway(); };
-            btnGwStop = new Button(); btnGwStop.Text = "停止网关"; btnGwStop.SetBounds(100, 24, 84, 26); btnGwStop.FlatStyle = FlatStyle.Flat;
+            btnGwStop = new Button(); btnGwStop.Text = "停止网关"; btnGwStop.SetBounds(130, 22, 110, 28); btnGwStop.FlatStyle = FlatStyle.Flat;
             btnGwStop.Click += delegate { StopGateway(); };
-            btnGwWrite = new Button(); btnGwWrite.Text = "写入 dsh 配置"; btnGwWrite.SetBounds(190, 24, 100, 26); btnGwWrite.FlatStyle = FlatStyle.Flat;
+            btnGwWrite = new Button(); btnGwWrite.Text = "写入 dsh 配置"; btnGwWrite.SetBounds(246, 22, 120, 28); btnGwWrite.FlatStyle = FlatStyle.Flat;
             btnGwWrite.Click += delegate { WriteGatewayToDsh(); };
-            btnGwEdit = new Button(); btnGwEdit.Text = "编辑供应商"; btnGwEdit.SetBounds(296, 24, 84, 26); btnGwEdit.FlatStyle = FlatStyle.Flat;
+            btnGwEdit = new Button(); btnGwEdit.Text = "编辑供应商"; btnGwEdit.SetBounds(372, 22, 100, 28); btnGwEdit.FlatStyle = FlatStyle.Flat;
             btnGwEdit.Click += delegate { EditGatewayConfig(); };
 
             lblGwStatus = new Label();
             lblGwStatus.Text = "● 已停止";
             lblGwStatus.ForeColor = Color.DimGray;
-            lblGwStatus.SetBounds(392, 28, 150, 20);
+            lblGwStatus.SetBounds(492, 26, 130, 20);
 
-            Label lg1 = new Label(); lg1.Text = "端口:"; lg1.SetBounds(10, 54, 40, 20);
-            txtGwPort = new TextBox(); txtGwPort.Text = gwPort.ToString(); txtGwPort.SetBounds(48, 51, 52, 24); txtGwPort.BorderStyle = BorderStyle.FixedSingle;
-            Label lg2 = new Label(); lg2.Text = "统一Key:"; lg2.SetBounds(112, 54, 54, 20);
-            txtGwKey = new TextBox(); txtGwKey.Text = gwKey; txtGwKey.SetBounds(164, 51, 200, 24); txtGwKey.BorderStyle = BorderStyle.FixedSingle; txtGwKey.PasswordChar = '●';
-            Label lg3 = new Label(); lg3.Text = "对外接口: http://127.0.0.1:" + gwPort + "/v1"; lg3.SetBounds(372, 54, 174, 20); lg3.ForeColor = Color.DimGray;
+            Label lg1 = new Label(); lg1.Text = "端口:"; lg1.SetBounds(14, 58, 40, 20);
+            txtGwPort = new TextBox(); txtGwPort.Text = gwPort.ToString(); txtGwPort.SetBounds(56, 55, 62, 24); txtGwPort.BorderStyle = BorderStyle.FixedSingle;
+            Label lg2 = new Label(); lg2.Text = "统一Key:"; lg2.SetBounds(136, 58, 54, 20);
+            txtGwKey = new TextBox(); txtGwKey.Text = gwKey; txtGwKey.SetBounds(192, 55, 260, 24); txtGwKey.BorderStyle = BorderStyle.FixedSingle; txtGwKey.PasswordChar = '●';
+            Label lg3 = new Label(); lg3.Text = "对外接口: http://127.0.0.1:" + gwPort + "/v1"; lg3.SetBounds(466, 58, 250, 20); lg3.ForeColor = Color.DimGray;
 
             gbGateway.Controls.AddRange(new Control[] { btnGwStart, btnGwStop, btnGwWrite, btnGwEdit, lblGwStatus, lg1, txtGwPort, lg2, txtGwKey, lg3 });
 
