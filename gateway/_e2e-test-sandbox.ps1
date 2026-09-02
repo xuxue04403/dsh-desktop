@@ -85,6 +85,36 @@ try {
   $r = Call '/v1/chat/completions' 'POST' @{ model='no-such'; messages=@() }
   Check 'unknown model 404' ($r.Status -eq 404) "got $($r.Status)"
 
+  # S1 回归：round-robin 轮询——同一模型两次请求应分配到不同供应商（A:3190 / C:3192 都有 glm-5.2）
+  $rrTmp = Join-Path $env:TEMP 'gw-e2e-rr'
+  New-Item $rrTmp -ItemType Directory -Force | Out-Null
+  @'
+{"port":3206,"apiKey":"k","routing":"round-robin","providers":[
+ {"id":"A","baseURL":"http://127.0.0.1:3190/v1","apiKey":"k-a","models":["glm-5.2"],"priority":1,"enabled":true},
+ {"id":"C","baseURL":"http://127.0.0.1:3192/v1","apiKey":"k-c","models":["glm-5.2"],"priority":1,"enabled":true}]}
+'@ | Set-Content "$rrTmp\cfg.json" -Encoding ascii
+  $rrGw = "@echo off`nset DSH_GATEWAY_CONFIG=$rrTmp\cfg.json`nset DSH_GATEWAY_LOG=$rrTmp\gw.log`nset DSH_GATEWAY_VERBOSE=0`nstart `"`" /b node `"$gatewayDir\model-gateway.mjs`" > `"$rrTmp\gw.out`" 2>&1"
+  Set-Content "$rrTmp\gw.cmd" $rrGw -Encoding ascii
+  cmd /c "$rrTmp\gw.cmd"
+  Start-Sleep -Seconds 2
+  $rrH = @{ Authorization = 'Bearer k' }
+  $rrB = '{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"stream":false}'
+  $rrFirst = $null; $rrSecond = $null
+  try {
+    Invoke-WebRequest 'http://127.0.0.1:3206/v1/chat/completions' -Method Post -Headers $rrH -ContentType 'application/json' -Body $rrB -UseBasicParsing -TimeoutSec 15 | Out-Null
+    Start-Sleep -Milliseconds 200
+    Invoke-WebRequest 'http://127.0.0.1:3206/v1/chat/completions' -Method Post -Headers $rrH -ContentType 'application/json' -Body $rrB -UseBasicParsing -TimeoutSec 15 | Out-Null
+    Start-Sleep -Milliseconds 300
+    $rrServed = Get-Content "$rrTmp\gw.log" | Select-String 'served glm-5.2 via (\w+)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+    $rrFirst = if ($rrServed.Count -ge 1) { $rrServed[0] } else { 'none' }
+    $rrSecond = if ($rrServed.Count -ge 2) { $rrServed[1] } else { 'none' }
+  } catch { }
+  Check 'round-robin 两次请求分配到不同供应商' ($rrFirst -ne $rrSecond -and $rrFirst -ne 'none') "got $rrFirst,$rrSecond"
+  Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*3206*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Remove-Item $rrTmp -Recurse -Force -ErrorAction SilentlyContinue
+
   # K7 回归：客户端请求 gzip 时，网关必须强制 identity（SSE 明文透传，不出现乱码）
   $gzTmp = Join-Path $env:TEMP 'gw-e2e-gzip'
   New-Item $gzTmp -ItemType Directory -Force | Out-Null
