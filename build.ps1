@@ -1,4 +1,4 @@
-﻿# 编译 DSHDesktop.exe —— 使用 Windows 自带 .NET Framework 的 C# 编译器，无需安装任何 SDK
+# 编译 DSHDesktop.exe —— 使用 Windows 自带 .NET Framework 的 C# 编译器，无需安装任何 SDK
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 
@@ -23,6 +23,7 @@ $args = @(
     '/r:System.Core.dll',
     '/r:System.Windows.Forms.dll',
     '/r:System.Drawing.dll',
+    '/r:System.Web.Extensions.dll',
     "/out:$root\DSHDesktop.exe",
     "/win32icon:$root\app.ico",
     "$root\DSHDesktop.cs"
