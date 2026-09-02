@@ -41,8 +41,13 @@ for (const s of servers) {
         res.write(`data: ${JSON.stringify({ id: 'mock1', object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: { content: `Hi from ${s.name} ` }, finish_reason: null }] })}\n\n`);
         res.end(`data: ${JSON.stringify({ id: 'mock2', object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
       } else {
+        // 回显收到的 user-agent，供透传断言（K1）
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ id: 'mock', object: 'chat.completion', model, choices: [{ index: 0, message: { role: 'assistant', content: `Hi from ${s.name}` }, finish_reason: 'stop' }] }));
+        res.end(JSON.stringify({
+          id: 'mock', object: 'chat.completion', model,
+          choices: [{ index: 0, message: { role: 'assistant', content: `Hi from ${s.name}` }, finish_reason: 'stop' }],
+          echo_ua: req.headers['user-agent'] || null,
+        }));
       }
       return;
     }
