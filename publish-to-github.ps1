@@ -103,14 +103,29 @@ Get-ChildItem $root -Recurse -File | ForEach-Object {
 }
 Write-Host "[OK] Uploaded $count file(s)." -ForegroundColor Green
 
-# ---------- 4. release with compiled exe ----------
-$exe = Join-Path $root 'DSHDesktop.exe'
-if (Test-Path $exe) {
+# ---------- 4. release with portable zip asset ----------
+$zipOut = Join-Path $root 'dist'
+$zip = $null
+try {
+    if (-not (Test-Path (Join-Path $root 'DSHDesktop.exe'))) {
+        Write-Host '[..] Building exe first...'
+        & (Join-Path $root 'build.ps1')
+        if ($LASTEXITCODE -ne 0) { throw 'build.ps1 failed' }
+    }
+    Write-Host '[..] Building portable zip...'
+    & (Join-Path $root '_build-portable.ps1') -OutputDir $zipOut -SkipBuild
+    if ($LASTEXITCODE -ne 0) { throw 'portable build failed' }
+    $zip = (Get-ChildItem $zipOut -Filter '*.zip' | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+} catch {
+    Write-Host ('[WARN] portable build failed: ' + $_.Exception.Message) -ForegroundColor Yellow
+}
+
+if ($zip -and (Test-Path $zip)) {
     try {
         $rel = $null
         try { $rel = Api 'GET' "$repoUri/releases/tags/$Version" } catch { }
         if (-not $rel) {
-            $bodyText = "First open-source release." + [Environment]::NewLine + "- One-click start/stop/auto-update tray tool for dsh web."
+            $bodyText = "DSH Desktop portable release." + [Environment]::NewLine + "- Portable zip: extract anywhere, double-click DSHDesktop.exe" + [Environment]::NewLine + "- One-click start/stop/auto-update tray tool for dsh web + model gateway"
             $rel = Api 'POST' "$repoUri/releases" @{
                 tag_name   = $Version
                 name       = $Version
@@ -123,10 +138,11 @@ if (Test-Path $exe) {
             Write-Host "[INFO] Release $Version already exists; attaching asset."
         }
 
-        $up = "https://uploads.github.com/repos/$login/$RepoName/releases/" + $rel.id + "/assets?name=DSHDesktop.exe"
+        $assetName = 'DSHDesktop-portable.zip'
+        $up = "https://uploads.github.com/repos/$login/$RepoName/releases/" + $rel.id + "/assets?name=$assetName"
         try {
-            Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType 'application/octet-stream' -InFile $exe | Out-Null
-            Write-Host '[OK] Release asset uploaded: DSHDesktop.exe' -ForegroundColor Green
+            Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType 'application/zip' -InFile $zip | Out-Null
+            Write-Host "[OK] Release asset uploaded: $assetName" -ForegroundColor Green
         } catch {
             $status = 0
             if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
@@ -135,13 +151,13 @@ if (Test-Path $exe) {
                 Write-Host '[..] Asset name already exists on this release; replacing...' -ForegroundColor Yellow
                 $assets = Api 'GET' "$repoUri/releases/$($rel.id)/assets"
                 foreach ($a in $assets) {
-                    if ($a.name -eq 'DSHDesktop.exe') {
+                    if ($a.name -eq $assetName) {
                         Invoke-RestMethod -Method Delete -Uri $a.url -Headers $headers | Out-Null
                         Write-Host '[OK] Old asset deleted.'
                     }
                 }
-                Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType 'application/octet-stream' -InFile $exe | Out-Null
-                Write-Host '[OK] Release asset replaced: DSHDesktop.exe' -ForegroundColor Green
+                Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType 'application/zip' -InFile $zip | Out-Null
+                Write-Host "[OK] Release asset replaced: $assetName" -ForegroundColor Green
             } else {
                 Write-Host ('[WARN] Release asset upload failed (HTTP ' + $status + '): ' + $_.Exception.Message) -ForegroundColor Yellow
             }
@@ -150,7 +166,7 @@ if (Test-Path $exe) {
         Write-Host ('[WARN] Release step failed: ' + $_.Exception.Message) -ForegroundColor Yellow
     }
 } else {
-    Write-Host '[SKIP] DSHDesktop.exe not found next to script; build first if you want a Release asset.'
+    Write-Host '[SKIP] Portable zip was not produced (see portable build log above).'
 }
 
 Write-Host ''
