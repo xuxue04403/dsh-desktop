@@ -107,6 +107,59 @@ const rrCounters = new Map();
 
 const catalogInflight = new Map(); // providerId -> Promise（并发去重）
 
+/* ---------------- V1/V2 防封：连续失败分级熔断 ----------------
+ * 同一 provider 连续 N 次转发失败 → 熔断（期间路由跳过，不发任何上游请求）。
+ * 分级（V2）：
+ *  - 鉴权/业务拒绝（401/403）：长熔断 30 分钟——"Deposit required"类业务性
+ *    拒绝非临时状态，重试无意义且徒增风控画像，等用户处理（充值/换key）后自然恢复
+ *  - 网络错误/5xx：短熔断 5 分钟——可能是瞬时故障，较快半开试探
+ * 冷却结束后半开（下一个请求允许试探一次），成功即清零计数。
+ * 目的：上游临时风控/限流时，避免持续打点加剧封禁，保护账号。
+ */
+const BREAKER_THRESHOLD = 3;                    // 连续失败次数阈值
+const BREAKER_SHORT_MS = 5 * 60_000;            // 短熔断 5 分钟（网络错/5xx）
+const BREAKER_LONG_MS = 30 * 60_000;            // 长熔断 30 分钟（401/403 业务拒绝）
+const breaker = new Map();                      // providerId -> { fails, openUntil }
+
+function breakerIsOpen(providerId) {
+  const b = breaker.get(providerId);
+  if (!b) return false;
+  // 先判熔断窗口（立即熔断时 fails 可能未达阈值——V2b 修复）
+  if (b.openUntil > 0) {
+    if (Date.now() < b.openUntil) return true;
+    // 半开：冷却到点，允许试探（计数保留 1 以便失败快速回升熔断）
+    b.fails = BREAKER_THRESHOLD - 1;
+    b.openUntil = 0;
+    breaker.set(providerId, b);
+    return false;
+  }
+  return b.fails >= BREAKER_THRESHOLD;
+}
+function breakerRecordFail(providerId, httpStatus) {
+  const b = breaker.get(providerId) || { fails: 0, openUntil: 0 };
+  b.fails += 1;
+  // V2b：401/403 业务性拒绝（鉴权失败/需充值/禁用）不会自愈——首次出现即长熔断 30 分钟，
+  // 不必等连续 3 次（避免固定失败模式被风控画像）；网络错/5xx 仍按 3 次阈值短熔断
+  const immediate = (httpStatus === 401 || httpStatus === 403);
+  if (b.fails >= BREAKER_THRESHOLD || immediate) {
+    const long = immediate;
+    b.openUntil = Date.now() + (long ? BREAKER_LONG_MS : BREAKER_SHORT_MS);
+    const mins = Math.round((long ? BREAKER_LONG_MS : BREAKER_SHORT_MS) / 60_000);
+    log(`breaker OPEN: ${providerId} 失败（${httpStatus || 'network'}），熔断 ${mins} 分钟（保护上游账号）`);
+  }
+  breaker.set(providerId, b);
+}
+function breakerRecordSuccess(providerId) {
+  if (breaker.has(providerId)) breaker.delete(providerId);
+}
+
+// V1 防封：日志脱敏——catalog/上游错误体可能回显 key，统一打码 sk-xxxx 片段
+function maskSecrets(text) {
+  return String(text || '')
+    .replace(/sk-[A-Za-z0-9_\-]{8,}/g, (m) => `sk-***${m.slice(-4)}`)
+    .replace(/(x-api-key["':\s=]+)([^\s"',}]+)/gi, '$1***');
+}
+
 async function fetchCatalog(provider, force, clientUA) {
   const cached = catalogCache.get(provider.id);
   if (!force && cached && Date.now() - cached.ts < (cached.failed ? CATALOG_FAIL_COOLDOWN_MS : MODEL_CACHE_TTL_MS)) return cached.models;
@@ -134,10 +187,10 @@ async function doFetchCatalog(provider, clientUA) {
     });
     clearTimeout(timer);
     if (!res.ok) {
-      // 记录响应体开头（前 300 字符），方便诊断 401/404 等鉴权与端点问题
+      // 记录响应体开头（前 300 字符，脱敏），方便诊断 401/404 等鉴权与端点问题
       let detail = '';
       try { detail = (await res.text()).slice(0, 300); } catch { }
-      log(`catalog ${provider.id} HTTP ${res.status}: ${detail}`);
+      log(`catalog ${provider.id} HTTP ${res.status}: ${maskSecrets(detail)}`);
       // R10b：HTTP 错误同样写失败冷却缓存（防每次请求都重探测形成风暴）
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
       return null;
@@ -236,8 +289,9 @@ function claudeClientHeaders() {
 /** 构造发往上游的最终请求头。
  * clientUA 配置时 → 完全仿真模式（不留任何客户端透传痕迹）
  * clientUA 为空     → 透传 dsh 客户端标识（K1 防屏蔽）
+ * anthropic=true    → Anthropic 协议模式（T5）：x-api-key 替代 Bearer + anthropic-version
  */
-function upstreamRequestHeaders(reqHeaders, apiKey, clientUA) {
+function upstreamRequestHeaders(reqHeaders, apiKey, clientUA, anthropic) {
   const out = {};
   const skip = new Set([
     'authorization', 'host', 'content-length', 'connection',
@@ -261,7 +315,14 @@ function upstreamRequestHeaders(reqHeaders, apiKey, clientUA) {
     }
   }
 
-  out['authorization'] = `Bearer ${apiKey}`;
+  if (anthropic) {
+    // T5：Anthropic 协议（Claude Code 等）—— x-api-key + anthropic-version
+    out['x-api-key'] = apiKey;
+    out['anthropic-version'] = '2023-06-01';
+    delete out['authorization'];
+  } else {
+    out['authorization'] = `Bearer ${apiKey}`;
+  }
   out['accept'] = 'application/json, text/event-stream';
   out['content-type'] = 'application/json';
   out['accept-encoding'] = 'identity';  // K7：强制上游不压缩，SSE 不乱码
@@ -285,15 +346,12 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
   let upstream;
   try {
     // baseURL 允许“带 /v1”或“不带 /v1”两种写法（OpenAI SDK 惯例 / 用户习惯）：
-    // upstreamBase() 统一规范化，upstreamPath 始终是相对 /v1 的路径（如 /chat/completions）
+    // upstreamBase() 统一规范化，upstreamPath 始终是相对 /v1 的路径（如 /chat/completions、/messages）
+    // 注：Anthropic 协议（T5）下 upstreamHeaders 由 upstreamRequestHeaders(..., anthropic=true) 构造，
+    // 含 x-api-key + anthropic-version、无 authorization Bearer；展开覆盖时不会被注入 Bearer。
     upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
       method: 'POST',
-      headers: {
-        authorization: `Bearer ${provider.apiKey}`,
-        accept: 'application/json, text/event-stream',
-        'content-type': 'application/json',
-        ...upstreamHeaders,
-      },
+      headers: upstreamHeaders,
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -301,6 +359,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     clearTimeout(timer);
     // R3 防封：失败冷却而非立即删缓存（防每个请求都重试上游形成风暴）
     catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+    breakerRecordFail(provider.id, 0);   // V2：网络错误 → 短熔断 5 分钟
     log(`upstream ${provider.id} request error: ${e.message}`);
     return false;
   }
@@ -309,13 +368,15 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     // surface upstream error body if small
     let detail = '';
     try { detail = (await upstream.text()).slice(0, 500); } catch { }
-    log(`upstream ${provider.id} HTTP ${upstream.status}: ${detail}`);
+    log(`upstream ${provider.id} HTTP ${upstream.status}: ${maskSecrets(detail)}`);   // V1：日志脱敏
     if (upstream.status === 401 || upstream.status === 403 || upstream.status >= 500) {
       // likely stale/misconfigured key or dead endpoint —— 冷却缓存，防风暴（R3）
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+      breakerRecordFail(provider.id, upstream.status);   // V2：按状态码分级熔断（401/403 → 30 分钟）
     }
     return false;
   }
+  breakerRecordSuccess(provider.id);   // V1：成功清零熔断计数
   // success: stream through
   try {
     res.writeHead(upstream.status, {
@@ -388,7 +449,9 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
     if (set.has(model)) withCatalog.push(p);
   });
 
-  const ordered = [...withCatalog, ...unknown];
+  // V1 防封：跳过熔断中的 provider（连续失败保护期，不发起上游请求）
+  const breakerOpen = (p) => { if (breakerIsOpen(p.id)) { log(`skip ${p.id} (breaker open)`); return true; } return false; };
+  const ordered = [...withCatalog, ...unknown].filter((p) => !breakerOpen(p));
   if (ordered.length === 0) {
     return json(res, 404, { error: { message: `model "${model}" is not offered by any configured provider` } });
   }
@@ -418,6 +481,73 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
   json(res, 503, { error: { message: `all providers for model "${model}" are unavailable` } });
 }
 
+/**
+ * T5：Anthropic Messages 协议（Claude Code 等客户端）。
+ * - 端点 POST /v1/messages，鉴权 x-api-key（authorized() 已支持）
+ * - 转发到上游 {upstreamBase}/messages（agentrouter 等的 Anthropic 端点与 OpenAI 同享 /v1 前缀）
+ * - 响应（JSON/SSE）原样透传——上游本身输出 Anthropic 格式
+ * - 模型名清洗：Claude Code 选择器会显示 "glm-5.3[1m]" 这类带 [标记] 的名字，
+ *   匹配与转发时剥离 [xxx] 后缀（T5 宽容匹配）
+ */
+async function handleMessages(cfg, req, res, body) {
+  const rawModel = body && body.model;
+  if (!rawModel) return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'model is required' } });
+  const model = String(rawModel).replace(/\[[^\]]*\]\s*$/, '').trim() || String(rawModel);
+  if (model !== String(rawModel)) log(`model name cleaned: "${rawModel}" -> "${model}"`);
+
+  const reqStart = Date.now();
+  const client = req.socket?.remoteAddress || 'local';
+  const stream = !!(body && body.stream);
+  const logCall = (via, status) =>
+    log(`[call] ${model} ${via} status=${status} stream=${stream ? 1 : 0} dur=${Date.now() - reqStart}ms from=${client} proto=anthropic`);
+
+  // body.model 替换为清洗后的名字（上游按真实模型 ID 路由）
+  const outBody = { ...body, model };
+
+  const candidates = providersForModel(cfg, model);
+  if (candidates.length === 0) {
+    logCall('no-provider', 'fail');
+    return json(res, 404, { type: 'error', error: { type: 'invalid_request_error', message: `model "${model}" is not configured on this gateway` } });
+  }
+
+  const withCatalog = [];
+  const unknown = [];
+  const catalogResults = await Promise.all(candidates.map((p) => fetchCatalog(p, false, cfg.clientUA)));
+  candidates.forEach((p, i) => {
+    const set = catalogResults[i];
+    if (set === null) { unknown.push(p); return; }
+    if (set.has(model)) withCatalog.push(p);
+  });
+
+  // V1 防封：跳过熔断中的 provider（连续失败保护期，不发起上游请求）
+  const breakerOpen = (p) => { if (breakerIsOpen(p.id)) { log(`skip ${p.id} (breaker open)`); return true; } return false; };
+  const ordered = [...withCatalog, ...unknown].filter((p) => !breakerOpen(p));
+  if (ordered.length === 0) {
+    logCall('no-provider', 'fail');
+    return json(res, 404, { type: 'error', error: { type: 'invalid_request_error', message: `model "${model}" is not offered by any configured provider` } });
+  }
+
+  let tryOrder = ordered;
+  if (cfg.routing === 'round-robin' && ordered.length > 1) {
+    let n = rrCounters.get(model) || 0;
+    rrCounters.set(model, n + 1);
+    const start = n % ordered.length;
+    if (start > 0) tryOrder = [...ordered.slice(start), ...ordered.slice(0, start)];
+  }
+
+  for (const p of tryOrder) {
+    log(`try ${p.id} for ${model} (anthropic)`);
+    const ok = await forward(p, '/messages', upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, true), outBody, res);
+    if (ok) {
+      log(`served ${model} via ${p.id} (anthropic)`);
+      logCall(`via=${p.id}`, 'ok');
+      return;
+    }
+  }
+  logCall('all-providers', 'fail');
+  json(res, 503, { type: 'error', error: { type: 'api_error', message: `all providers for model "${model}" are unavailable` } });
+}
+
 async function handleModels(cfg, req, res) {
   const byId = new Map();
   const rows = [];
@@ -431,7 +561,9 @@ async function handleModels(cfg, req, res) {
     for (const id of entry.models) {
       if (!byId.has(id)) {
         byId.set(id, rows.length);
-        rows.push({ id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: p.id });
+        // T5：同时携带 Anthropic 模型发现字段（display_name/type）——Claude Code 等
+        // Anthropic 客户端可读；OpenAI 客户端忽略多余字段，互不影响
+        rows.push({ id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: p.id, type: 'model', display_name: id, created_at: new Date().toISOString() });
       }
     }
   }
@@ -464,10 +596,22 @@ function startServer(cfg) {
     if (p === '/health') { json(res, 200, { ok: true }); return; }
 
     if (p.startsWith('/v1/')) {
+      const anthropicRoute = (p === '/v1/messages');
       if (!authorized(req, cfg)) {
-        return json(res, 401, { error: { message: 'invalid or missing API key' } });
+        return anthropicRoute
+          ? json(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } })
+          : json(res, 401, { error: { message: 'invalid or missing API key' } });
       }
       if (req.method === 'GET' && p === '/v1/models') return handleModels(cfg, req, res);
+      if (req.method === 'POST' && p === '/v1/messages') {
+        // T5：Anthropic Messages 协议（Claude Code 等）
+        try {
+          const body = await bodyOf(req);
+          return handleMessages(cfg, req, res, body);
+        } catch (e) {
+          return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: `invalid JSON body: ${e.message}` } });
+        }
+      }
       if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/v1/responses')) {
         try {
           const body = await bodyOf(req);
