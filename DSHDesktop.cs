@@ -136,6 +136,7 @@ namespace DSHDesktop
         private CheckBox chkUpdate;
         private ComboBox cmbInstall;
         private Button btnGwStart, btnGwStop, btnGwWrite, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen;
+        private Button btnGwKeyCopy;
         private Label lblGwStatus, lblGwHint;
         private TextBox txtGwPort, txtGwKey, txtGwUA;
         private ComboBox cmbGwRouting;
@@ -222,8 +223,10 @@ namespace DSHDesktop
         public MainForm(bool autoStartFlag)
         {
             Text = "DSH 桌面助手";
-            ClientSize = new Size(760, 640);
-            MinimumSize = new Size(690, 600);
+            ClientSize = new Size(880, 640);
+            // W1：固定窗口（禁止拉伸）——布局像素精确，避免拉大后控件跟不上出现大片留白
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            MaximizeBox = false;
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.White;
             Font = new Font("Microsoft YaHei UI", 9F);
@@ -300,7 +303,7 @@ namespace DSHDesktop
 
             // ============ TabControl：dsh 服务 / 模型网关 ============
             TabControl tabs = new TabControl();
-            tabs.SetBounds(12, 8, 736, 606);
+            tabs.SetBounds(12, 8, 856, 606);
             tabs.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
             tabs.Font = new Font("Microsoft YaHei UI", 9F);
 
@@ -328,27 +331,27 @@ namespace DSHDesktop
 
             Label lblUrl = new Label();
             lblUrl.Text = "访问地址:";
-            lblUrl.SetBounds(400, 22, 70, 22);
+            lblUrl.SetBounds(470, 22, 70, 22);
             TextBox txtUrl = new TextBox();
             txtUrl.Text = "http://127.0.0.1:" + port + "/";
             txtUrl.ReadOnly = true;
-            txtUrl.SetBounds(468, 20, 250, 24);
+            txtUrl.SetBounds(540, 20, 320, 24);
             txtUrl.BorderStyle = BorderStyle.FixedSingle;
 
             GroupBox gb = new GroupBox();
             gb.Text = "设置";
-            gb.SetBounds(16, 62, 702, 124);
+            gb.SetBounds(16, 62, 832, 124);
             gb.BackColor = Color.White;
 
             Label l1 = new Label(); l1.Text = "端口:"; l1.SetBounds(16, 28, 50, 22);
             txtPort = new TextBox(); txtPort.Text = port.ToString(); txtPort.SetBounds(66, 25, 76, 24); txtPort.BorderStyle = BorderStyle.FixedSingle;
             Label l2 = new Label(); l2.Text = "工作目录:"; l2.SetBounds(170, 28, 60, 22);
-            txtWorkDir = new TextBox(); txtWorkDir.Text = workDir; txtWorkDir.SetBounds(235, 25, 380, 24); txtWorkDir.BorderStyle = BorderStyle.FixedSingle;
-            Button btnBrowse = new Button(); btnBrowse.Text = "..."; btnBrowse.SetBounds(622, 24, 44, 26);
+            txtWorkDir = new TextBox(); txtWorkDir.Text = workDir; txtWorkDir.SetBounds(235, 25, 500, 24); txtWorkDir.BorderStyle = BorderStyle.FixedSingle;
+            Button btnBrowse = new Button(); btnBrowse.Text = "..."; btnBrowse.SetBounds(742, 24, 44, 26);
             btnBrowse.Click += delegate { FolderBrowserDialog d = new FolderBrowserDialog(); d.Description = "选择 dsh 工作目录（一般是你的项目文件夹）"; d.SelectedPath = txtWorkDir.Text; if (d.ShowDialog(this) == DialogResult.OK) txtWorkDir.Text = d.SelectedPath; };
 
             chkAutoOpen = new CheckBox(); chkAutoOpen.Text = "服务就绪后自动打开浏览器"; chkAutoOpen.SetBounds(16, 64, 220, 24); chkAutoOpen.Checked = autoOpenBrowser;
-            chkAutoStart = new CheckBox(); chkAutoStart.Text = "开机自动启动（登录时自动运行并启动 dsh）"; chkAutoStart.SetBounds(250, 64, 300, 24); chkAutoStart.Checked = autoStartService;
+            chkAutoStart = new CheckBox(); chkAutoStart.Text = "开机自动启动（登录时自动运行并启动 dsh）"; chkAutoStart.SetBounds(250, 64, 320, 24); chkAutoStart.Checked = autoStartService;
             chkUpdate = new CheckBox(); chkUpdate.Text = "启动前自动检查 dsh 更新"; chkUpdate.SetBounds(16, 94, 200, 24); chkUpdate.Checked = autoUpdate;
 
             Label lInst = new Label(); lInst.Text = "安装方式:"; lInst.SetBounds(230, 96, 62, 20);
@@ -377,8 +380,8 @@ namespace DSHDesktop
             txtLog.ForeColor = Color.FromArgb(200, 200, 200);
             txtLog.BorderStyle = BorderStyle.FixedSingle;
             txtLog.Font = new Font("Consolas", 9F);
-            txtLog.SetBounds(16, 220, 702, 360);
-            txtLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
+            txtLog.SetBounds(16, 220, 822, 360);
+            // V2：TabPage 内不使用 Right/Bottom anchor（创建期父容器尺寸未定，anchor 会扭曲控件）
 
             tpService.Controls.AddRange(new Control[] { btnStart, btnOpen, btnStop, lblUrl, txtUrl, gb, l3, txtLog });
 
@@ -400,35 +403,39 @@ namespace DSHDesktop
             lblGwStatus = new Label();
             lblGwStatus.Text = "● 已停止";
             lblGwStatus.ForeColor = Color.DimGray;
-            lblGwStatus.SetBounds(364, 18, 110, 20);
+            lblGwStatus.SetBounds(362, 18, 110, 20);        // 收窄，给端口/Key/复制腾位
 
-            Label lg1 = new Label(); lg1.Text = "端口:"; lg1.SetBounds(470, 18, 40, 20);
-            txtGwPort = new TextBox(); txtGwPort.Text = gwPort.ToString(); txtGwPort.SetBounds(508, 15, 62, 24); txtGwPort.BorderStyle = BorderStyle.FixedSingle;
-            Label lg2 = new Label(); lg2.Text = "统一Key:"; lg2.SetBounds(576, 18, 54, 20);
-            txtGwKey = new TextBox(); txtGwKey.Text = gwKey; txtGwKey.SetBounds(630, 15, 80, 24); txtGwKey.BorderStyle = BorderStyle.FixedSingle; txtGwKey.PasswordChar = '●';
+            Label lg1 = new Label(); lg1.Text = "端口:"; lg1.SetBounds(486, 18, 40, 20);
+            txtGwPort = new TextBox(); txtGwPort.Text = gwPort.ToString(); txtGwPort.SetBounds(524, 15, 62, 24); txtGwPort.BorderStyle = BorderStyle.FixedSingle;
+            Label lg2 = new Label(); lg2.Text = "Key:"; lg2.SetBounds(600, 18, 36, 20);
+            txtGwKey = new TextBox(); txtGwKey.Text = gwKey; txtGwKey.SetBounds(636, 15, 140, 24); txtGwKey.BorderStyle = BorderStyle.FixedSingle; txtGwKey.PasswordChar = '●';
+            // T4：一键复制 Key（密码掩码框 Text 属性仍为明文值，可安全复制）
+            btnGwKeyCopy = new Button(); btnGwKeyCopy.Text = "📋 复制"; btnGwKeyCopy.SetBounds(776, 14, 72, 26);
+            UiBtnStyle(btnGwKeyCopy, Color.FromArgb(90, 100, 130), Color.FromArgb(115, 128, 165));
+            btnGwKeyCopy.Click += delegate { GwCopyKey(); };
 
             // —— 供应商可视化编辑表 ——
             // 第 2 行（y=56）：请求UA（P3 客户端白名单绕过）+ 路由模式（S1：主备/轮询）
             Label lg3 = new Label(); lg3.Text = "请求UA(可选):"; lg3.SetBounds(16, 58, 90, 20);
-            txtGwUA = new TextBox(); txtGwUA.Text = gwClientUA; txtGwUA.SetBounds(108, 55, 280, 24); txtGwUA.BorderStyle = BorderStyle.FixedSingle;
-            Label lg5 = new Label(); lg5.Text = "路由:"; lg5.SetBounds(402, 58, 40, 20);
+            txtGwUA = new TextBox(); txtGwUA.Text = gwClientUA; txtGwUA.SetBounds(108, 55, 380, 24); txtGwUA.BorderStyle = BorderStyle.FixedSingle;
+            Label lg5 = new Label(); lg5.Text = "路由:"; lg5.SetBounds(502, 58, 40, 20);
             cmbGwRouting = new ComboBox();
             cmbGwRouting.DropDownStyle = ComboBoxStyle.DropDownList;
             cmbGwRouting.Items.AddRange(new object[] { "主备(优先级)", "轮询(流量分摊)" });
             cmbGwRouting.SelectedIndex = (gwRouting == "round-robin") ? 1 : 0;
-            cmbGwRouting.SetBounds(444, 55, 130, 24);
-            Label lg4 = new Label(); lg4.Text = "UA留空=透传dsh标识；填 claude-cli/2.0.0 等可过白名单检测";
-            lg4.SetBounds(584, 58, 140, 20);
+            cmbGwRouting.SetBounds(544, 55, 150, 24);
+            Label lg4 = new Label(); lg4.Text = "UA 留空=透传；填 claude-cli/2.0.0 过白名单";
+            lg4.SetBounds(704, 58, 144, 20);
             lg4.ForeColor = Color.FromArgb(120, 120, 120);
 
             Label lh = new Label(); lh.Text = "多供应商管理（同一模型多供应商时：主备=固定优先失败切换；轮询=轮流分摊+失败切换）：";
-            lh.SetBounds(16, 82, 700, 16);
+            lh.SetBounds(16, 82, 820, 16);
             lh.ForeColor = Color.FromArgb(80, 80, 80);
 
             gvProviders = new DataGridView();
-            gvProviders.SetBounds(16, 98, 702, 216);   // T1 布局：表格压缩，底部让位给网关日志区
+            gvProviders.SetBounds(16, 98, 822, 216);   // T1 布局：表格压缩，底部让位给网关日志区
             // 修复 N3：高度固定（去 Bottom anchor），否则 TabPage 布局重算时 gv 溢出并遮挡下方按钮
-            gvProviders.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            // V2：同上，不使用 Right anchor
             gvProviders.AllowUserToAddRows = false;
             gvProviders.AllowUserToDeleteRows = false;
             gvProviders.RowHeadersVisible = false;
@@ -450,13 +457,18 @@ namespace DSHDesktop
             colEnabled.HeaderText = "启用";
             colEnabled.Name = "cEnabled";
             gvProviders.Columns.Add(colEnabled);
-            // 显式列宽（合计 ≈ 680 ≤ 702，无滚动条）：ID 窄 / baseURL 最宽 / Key 适中 / 模型列表次宽 / 优先级窄 / 启用最窄
-            gvProviders.Columns[0].Width = 60;    // 供应商ID
-            gvProviders.Columns[1].Width = 220;   // 上游地址（最宽）
-            gvProviders.Columns[2].Width = 150;   // 上游 Key
-            gvProviders.Columns[3].Width = 180;   // 模型列表
-            gvProviders.Columns[4].Width = 40;    // 优先级
-            gvProviders.Columns[5].Width = 30;    // 启用（勾选框）
+            // 显式列宽（合计 810 ≤ 822）：W2 重调——ID 够显示名称 / 地址宽 / Key 宽（sk- 前缀完整）/
+            // 模型列表最宽（防折行）/ 优先级窄 / 启用勾选框
+            gvProviders.Columns[0].Width = 105;   // 供应商ID
+            gvProviders.Columns[1].Width = 185;   // 上游地址
+            gvProviders.Columns[2].Width = 185;   // 上游 Key
+            gvProviders.Columns[3].Width = 245;   // 模型列表（最宽，减少折行）
+            gvProviders.Columns[4].Width = 50;    // 优先级
+            gvProviders.Columns[5].Width = 40;    // 启用（勾选框）
+            // 模型列关闭自动折行（内容超长以省略号截断，避免行高被撑大破坏紧凑感）
+            gvProviders.Columns[3].DefaultCellStyle.WrapMode = DataGridViewTriState.False;
+            // 固定行高，视觉紧凑
+            gvProviders.RowTemplate.Height = 26;
 
             // —— 表格下面操作按钮行 ——
             btnGwAdd = new Button(); btnGwAdd.Text = "＋ 添加供应商"; btnGwAdd.SetBounds(16, 320, 105, 28);
@@ -471,15 +483,15 @@ namespace DSHDesktop
             btnGwReload = new Button(); btnGwReload.Text = "↻ 重新加载"; btnGwReload.SetBounds(349, 320, 105, 28);
             UiBtnStyle(btnGwReload, Color.FromArgb(110, 105, 90), Color.FromArgb(150, 142, 120));
             btnGwReload.Click += delegate { LoadProvidersGrid(); };
-            btnGwOpen = new Button(); btnGwOpen.Text = "打开配置文件"; btnGwOpen.SetBounds(460, 320, 120, 28);
+            btnGwOpen = new Button(); btnGwOpen.Text = "打开配置文件"; btnGwOpen.SetBounds(486, 320, 130, 28);
             UiBtnStyle(btnGwOpen, Color.FromArgb(110, 105, 90), Color.FromArgb(150, 142, 120));
             btnGwOpen.Click += delegate { EditGatewayConfig(); };
 
             // —— 网关日志独立展示（T1：与 dsh 日志分开，含调用记录）——
             Label lgLog = new Label(); lgLog.Text = "网关日志（运行 + 调用记录，文件 logs/gateway.log）：";
-            lgLog.SetBounds(16, 354, 420, 18);
+            lgLog.SetBounds(16, 354, 460, 18);
             lgLog.ForeColor = Color.FromArgb(80, 80, 80);
-            Button btnGwLogClear = new Button(); btnGwLogClear.Text = "清屏"; btnGwLogClear.SetBounds(648, 350, 56, 24);
+            Button btnGwLogClear = new Button(); btnGwLogClear.Text = "清屏"; btnGwLogClear.SetBounds(782, 350, 56, 24);
             UiBtnStyle(btnGwLogClear, Color.FromArgb(110, 105, 90), Color.FromArgb(150, 142, 120));
             btnGwLogClear.Click += delegate
             {
@@ -503,20 +515,20 @@ namespace DSHDesktop
             txtGwLog.ForeColor = Color.FromArgb(200, 200, 200);
             txtGwLog.BorderStyle = BorderStyle.FixedSingle;
             txtGwLog.Font = new Font("Consolas", 9F);
-            txtGwLog.SetBounds(16, 376, 688, 156);
-            txtGwLog.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+            txtGwLog.SetBounds(16, 376, 822, 156);
+            // V2：同上，不使用 Right anchor
 
             lblGwHint = new Label();
             lblGwHint.Text = "提示：修改后点「保存配置」写入 gateway.config.json；重启网关生效。也可用「写入 dsh 配置」注册到 dsh。";
             lblGwHint.ForeColor = Color.FromArgb(120, 120, 120);
-            lblGwHint.SetBounds(16, 540, 700, 18);
+            lblGwHint.SetBounds(16, 540, 820, 18);
             // 修复 N3：不设 anchor（默认 None），TabPage 页面固定 576 高，避免布局重算时尺寸被扭曲（曾出现 1228px 宽、y=748）
 
             gwLogPath = Path.Combine(logDir, "gateway.log");
             // 初始偏移 0：首次进入网关 Tab 时从文件头加载全部已有日志（T1 修正：用户应能立刻看到历史）
             gwLogTailOffset = 0;
 
-            tpGateway.Controls.AddRange(new Control[] { btnGwStart, btnGwStop, btnGwWrite, lblGwStatus, lg1, txtGwPort, lg2, txtGwKey, lg3, txtGwUA, lg5, cmbGwRouting, lg4, lh, gvProviders, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen, lgLog, btnGwLogClear, txtGwLog, lblGwHint });
+            tpGateway.Controls.AddRange(new Control[] { btnGwStart, btnGwStop, btnGwWrite, lblGwStatus, lg1, txtGwPort, lg2, txtGwKey, btnGwKeyCopy, lg3, txtGwUA, lg5, cmbGwRouting, lg4, lh, gvProviders, btnGwAdd, btnGwDel, btnGwSave, btnGwReload, btnGwOpen, lgLog, btnGwLogClear, txtGwLog, lblGwHint });
 
             tabs.TabPages.Add(tpService);
             tabs.TabPages.Add(tpGateway);
@@ -1888,7 +1900,7 @@ namespace DSHDesktop
                 gwProc.EnableRaisingEvents = true;
                 gwProc.Exited += delegate(object s, EventArgs e) { OnUiThread(delegate { SetGwStatus(false); }); };
                 gwProc.Start();
-                AppendLog("[网关] 启动中 (PID " + gwProc.Id + ")，端口 " + gwPort + "，统一Key=" + (gwKey.Length > 4 ? gwKey.Substring(0, 4) + "***" : "(未设置)"));
+                AppendLog("[网关] 启动中 (PID " + gwProc.Id + ")，端口 " + gwPort + "，Key=" + (gwKey.Length > 4 ? gwKey.Substring(0, 4) + "***" : "(未设置)"));
                 // 等待就绪：放到后台线程，避免阻塞 UI（修复 A1）
                 System.Threading.ThreadPool.QueueUserWorkItem(delegate(object st)
                 {
@@ -1906,7 +1918,7 @@ namespace DSHDesktop
                     {
                         SetGwStatus(ready);
                         AppendLog(ready
-                            ? ("[网关] 就绪——统一接口 http://127.0.0.1:" + gwPort + "/v1（Authorization: Bearer <统一Key>）")
+                            ? ("[网关] 就绪——统一接口 http://127.0.0.1:" + gwPort + "/v1（Authorization: Bearer <Key>）")
                             : "[网关] 未在预期时间内就绪，请查看日志 logs/gateway.log");
                     });
                 });
@@ -1982,7 +1994,7 @@ namespace DSHDesktop
                     string replacement = "\"apiKey\": \"" + escaped + "\"";
                     json = json.Substring(0, fm.Index) + replacement + json.Substring(fm.Index + fm.Length);
                     cfgKey = gwKey;
-                    AppendLog("[网关] 已将界面统一 Key 同步到 gateway.config.json。");
+                    AppendLog("[网关] 已将界面 Key 同步到 gateway.config.json。");
                 }
 
                 // port 或 key 有变动才写盘（无 BOM——修复 N1：带 BOM 的 JSON 无法被 Node 解析）
@@ -1990,7 +2002,7 @@ namespace DSHDesktop
 
                 if (cfgKey.Length == 0 || cfgKey == "change-me" || cfgKey == "dsh-gateway-change-me")
                 {
-                    AppendLog("[网关] 统一 Key 未设置或仍为模板默认值，拒绝启动。请在界面填写统一 Key 或编辑 gateway.config.json。");
+                    AppendLog("[网关] Key 未设置或仍为模板默认值，拒绝启动。请在界面填写 Key 或编辑 gateway.config.json。");
                     return false;
                 }
                 // providers 非空校验：匹配字段片段 "providers":[...]（单个 [ 到首个匹配的 ] 为数组体）
@@ -2386,6 +2398,42 @@ namespace DSHDesktop
             int idx = gvProviders.Rows.Add("provider-" + (gvProviders.Rows.Count + 1), "https://example.com/v1", "", "deepseek-v4-flash", 1, true);
             gvProviders.CurrentCell = gvProviders.Rows[idx].Cells[0];
             gvProviders.BeginEdit(true);
+        }
+
+        // T4：一键复制统一 Key 到剪贴板（密码框 Text 属性持有明文，PasswordChar 仅影响显示）
+        private void GwCopyKey()
+        {
+            try
+            {
+                string key = (txtGwKey != null) ? txtGwKey.Text.Trim() : gwKey;
+                if (string.IsNullOrEmpty(key))
+                {
+                    lblGwHint.Text = "Key 为空，请先填写。";
+                    return;
+                }
+                // 剪贴板可能被其他程序短暂占用：重试 3 次 + 泵消息，保证复制成功
+                bool done = false;
+                Exception lastErr = null;
+                for (int i = 0; i < 3 && !done; i++)
+                {
+                    try
+                    {
+                        System.Windows.Forms.Clipboard.SetText(key);
+                        done = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        lastErr = ex;
+                        System.Threading.Thread.Sleep(80);
+                        System.Windows.Forms.Application.DoEvents();
+                    }
+                }
+                if (done)
+                    lblGwHint.Text = "✓ Key 已复制到剪贴板（末4位 " + (key.Length > 4 ? key.Substring(key.Length - 4) : key) + "）";
+                else
+                    lblGwHint.Text = "复制失败（剪贴板被占用）：" + (lastErr == null ? "" : lastErr.Message);
+            }
+            catch (Exception ex) { lblGwHint.Text = "复制失败：" + ex.Message; }
         }
 
         private void GwDeleteRow()
