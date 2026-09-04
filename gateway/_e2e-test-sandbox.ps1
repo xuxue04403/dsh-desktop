@@ -140,6 +140,43 @@ try {
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   Remove-Item $gzTmp -Recurse -Force -ErrorAction SilentlyContinue
 
+  # T5 回归：Anthropic Messages 协议（Claude Code）——x-api-key 鉴权 + /v1/messages + 模型名 [1m] 清洗 + SSE
+  $anTmp = Join-Path $env:TEMP 'gw-e2e-anthropic'
+  New-Item $anTmp -ItemType Directory -Force | Out-Null
+  @'
+{"port":3207,"apiKey":"k","providers":[{"id":"anthA","baseURL":"http://127.0.0.1:3195","apiKey":"k-a","models":["glm-5.3"],"priority":1,"enabled":true}]}
+'@ | Set-Content "$anTmp\cfg.json" -Encoding ascii
+  $anMock = "@echo off`nset MOCK_PORT=3195`nstart `"`" /b node `"$gatewayDir\_mock-anthropic.mjs`" > `"$anTmp\mock.out`" 2>&1"
+  Set-Content "$anTmp\mock.cmd" $anMock -Encoding ascii
+  $anGw = "@echo off`nset DSH_GATEWAY_CONFIG=$anTmp\cfg.json`nset DSH_GATEWAY_LOG=$anTmp\gw.log`nset DSH_GATEWAY_VERBOSE=0`nstart `"`" /b node `"$gatewayDir\model-gateway.mjs`" > `"$anTmp\gw.out`" 2>&1"
+  Set-Content "$anTmp\gw.cmd" $anGw -Encoding ascii
+  cmd /c "$anTmp\mock.cmd"; cmd /c "$anTmp\gw.cmd"
+  Start-Sleep -Seconds 2
+  try {
+    # ① JSON 请求 + [1m] 模型名清洗
+    $anResp = Invoke-WebRequest 'http://127.0.0.1:3207/v1/messages' -Method Post -Headers @{ 'x-api-key'='k'; 'anthropic-version'='2023-06-01' } -ContentType 'application/json' -Body '{"model":"glm-5.3[1m]","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}' -UseBasicParsing -TimeoutSec 15
+    $anParsed = $anResp.Content | ConvertFrom-Json
+    Check 'anthropic JSON（[1m] 清洗 + type=message）' ($anParsed.type -eq 'message' -and $anParsed.content[0].text -match 'Hi from glm-5.3') "got $($anResp.Content.Substring(0,[Math]::Min(120,$anResp.Content.Length)))"
+    # ② SSE 流式
+    $anResp2 = Invoke-WebRequest 'http://127.0.0.1:3207/v1/messages' -Method Post -Headers @{ 'x-api-key'='k'; 'anthropic-version'='2023-06-01' } -ContentType 'application/json' -Body '{"model":"glm-5.3","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}' -UseBasicParsing -TimeoutSec 15
+    $anSse = [string]$anResp2.Content
+    Check 'anthropic SSE（message_start/delta/stop）' ($anSse -match 'message_start' -and $anSse -match 'content_block_delta' -and $anSse -match 'message_stop') "bad anthropic sse"
+    # ③ 错误 key 401
+    try {
+      Invoke-WebRequest 'http://127.0.0.1:3207/v1/messages' -Method Post -Headers @{ 'x-api-key'='wrong' } -ContentType 'application/json' -Body '{"model":"glm-5.3","messages":[]}' -UseBasicParsing -TimeoutSec 10 | Out-Null
+      Check 'anthropic 错误 key 401' $false 'unexpected 200'
+    } catch {
+      $an401 = [int]$_.Exception.Response.StatusCode
+      Check 'anthropic 错误 key 401' ($an401 -eq 401) "got $an401"
+    }
+  } catch {
+    Check 'anthropic JSON（[1m] 清洗 + type=message）' $false $_.Exception.Message
+  }
+  Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*mock-anthropic*' -or $_.CommandLine -like '*gateway*3207*' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  Remove-Item $anTmp -Recurse -Force -ErrorAction SilentlyContinue
+
   $r = Call '/v1/whatever' 'GET'
   Check 'unsupported route 404' ($r.Status -eq 404) "got $($r.Status)"
 
