@@ -1,0 +1,206 @@
+﻿<#
+.SYNOPSIS
+  Build and publish DSH App v1.5.0 to github.com/xuxue04403/dsh-desktop
+  (source upload + installer/portable release assets). No git client required.
+
+.USAGE
+  powershell -ExecutionPolicy Bypass -File .\release-v1.5.0.ps1 -Token <YOUR_TOKEN>
+  powershell -ExecutionPolicy Bypass -File .\release-v1.5.0.ps1 -Token <TOKEN> -CleanOld
+
+.NOTES
+  - Classic token scope: repo. Fine-grained: Contents(RW), Metadata(R), Workflows(RW).
+  - -CleanOld removes v1.x C# launcher files (DSHDesktop.cs, gateway/, setup/, etc.)
+    from the repo before uploading the new DSH App sources.
+  - Local build chain: portable dir -> exe icon -> NSIS installer (+ single-file portable).
+    NSIS build downloads tools via npmmirror (see scripts/dist.mirror.mjs).
+#>
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$Token,
+    [string]$RepoName = 'dsh-desktop',
+    [string]$Version = 'v1.5.0',
+    [switch]$CleanOld
+)
+
+$ErrorActionPreference = 'Stop'
+# 脚本位于项目根/scripts/ 下：$PSScriptRoot = scripts/，项目根 = 其父目录
+$root = Split-Path -Parent $PSScriptRoot
+
+$headers = @{
+    'Authorization'        = "Bearer $Token"
+    'Accept'               = 'application/vnd.github+json'
+    'X-GitHub-Api-Version' = '2022-11-28'
+    'User-Agent'           = 'dsh-app-publisher'
+}
+
+function Api([string]$Method, [string]$Uri, $BodyObj) {
+    $json = if ($null -ne $BodyObj) { $BodyObj | ConvertTo-Json -Depth 8 } else { $null }
+    Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -ContentType 'application/json' -Body $json
+}
+
+# ---------- 0. build chain ----------
+Write-Host '[..] 1/4 portable dir (green edition)...'
+$buildOut = (& node (Join-Path $root 'scripts\build-portable.mjs') 2>&1 | Out-String)
+if ($LASTEXITCODE -ne 0) { Write-Host '[FAIL] build-portable.mjs'; Write-Host $buildOut; exit 1 }
+$outDirLine = ($buildOut -split "`r?`n") | Where-Object { $_ -like 'OUTDIR=*' } | Select-Object -First 1
+$greenDir = if ($outDirLine) { $outDirLine.Substring(7).Trim() } else { Join-Path $root 'out\DSH-App' }
+Write-Host "[..] green dir: $greenDir"
+
+Write-Host '[..] 2/4 exe icon (rcedit)...'
+# 对刚构建的绿色目录 exe 设置图标（老目录可能被运行中的实例占用，无法写入）
+$env:DSH_APP_EXE = Join-Path $greenDir 'DSH-App.exe'
+try { node (Join-Path $root 'scripts\set-exe-icon.cjs') } catch {
+    Write-Host '[WARN] set-exe-icon failed, continuing' -ForegroundColor Yellow
+}
+Remove-Item Env:DSH_APP_EXE -ErrorAction SilentlyContinue
+
+Write-Host '[..] 3/4 NSIS installer + single-file portable (mirror)...'
+node (Join-Path $root 'scripts\dist.mirror.mjs')
+if ($LASTEXITCODE -ne 0) { Write-Host '[FAIL] dist.mirror.mjs (NSIS build)'; exit 1 }
+
+# portable zip for release asset（从 build 输出的实际绿色目录打包；文件名用 ASCII，避免 PS5.1 编码问题）
+$zipOut = Join-Path $root 'dist'
+$zipPath = Join-Path $zipOut 'DSHApp-1.5.0-Portable.zip'
+if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+if (-not (Test-Path (Join-Path $greenDir 'DSH-App.exe'))) {
+    Write-Host "[FAIL] green dir missing exe: $greenDir"
+    exit 1
+}
+Compress-Archive -Path (Join-Path $greenDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
+
+# ---------- 1. verify identity ----------
+Write-Host '[..] 4/4 publish...'
+try { $me = Api 'GET' 'https://api.github.com/user' } catch {
+    Write-Host '[FAIL] Token invalid or network unreachable:' $_.Exception.Message
+    exit 1
+}
+$login = $me.login
+if ($login -ne 'xuxue04403') { Write-Host "[WARN] authenticated as $login (expect xuxue04403)" -ForegroundColor Yellow }
+Write-Host "[OK] Authenticated as: $login" -ForegroundColor Green
+
+$repoUri = "https://api.github.com/repos/$login/$RepoName"
+try { Api 'GET' $repoUri | Out-Null } catch {
+    Write-Host "[FAIL] repo not found: $repoUri"
+    exit 1
+}
+
+# ---------- 2. optional: remove v1.x C# launcher leftovers ----------
+if ($CleanOld) {
+    Write-Host '[..] -CleanOld: removing v1.x C# launcher files...'
+    $old = @(
+        'DSHDesktop.cs', 'build.ps1', 'build_icon.ps1', 'install_shortcut.ps1',
+        'run-all-tests.ps1', '_build-portable.ps1', 'portable-readme.txt',
+        'publish-to-github.ps1', 'DSHDesktopSetup.cs',
+        'setup', 'gateway', 'dist', '.github\workflows\build.yml'
+    )
+    foreach ($rel0 in $old) {
+        $rel = $rel0.Replace('\', '/')
+        try {
+            $info = Api 'GET' "$repoUri/contents/$rel"
+            if ($info) {
+                if ($info -is [array]) {
+                    foreach ($item in $info) {
+                        Api 'DELETE' "$repoUri/contents/$($item.path)" @{ message = "chore: remove v1.x $($item.path)"; sha = $item.sha } | Out-Null
+                        Write-Host "  del $($item.path)"
+                    }
+                } else {
+                    Api 'DELETE' "$repoUri/contents/$rel" @{ message = "chore: remove v1.x $rel"; sha = $info.sha } | Out-Null
+                    Write-Host "  del $rel"
+                }
+            }
+        } catch { Write-Host "  skip $rel (not present or no permission)" -ForegroundColor DarkGray }
+    }
+}
+
+# ---------- 3. upload source files ----------
+Write-Host '[..] Uploading sources...'
+$count = 0
+Get-ChildItem $root -Recurse -File | ForEach-Object {
+    $rel = $_.FullName.Substring($root.Length + 1).Replace('\', '/')
+    if ($rel -like 'node_modules/*') { return }
+    if ($rel -like 'out/*') { return }
+    if ($rel -like 'dist/*') { return }
+    if ($rel -like '.git/*') { return }
+    if ($rel -like 'tests/*.tmp*') { return }
+
+    $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName))
+    $uri = "https://api.github.com/repos/$login/$RepoName/contents/$rel"
+    $sha = $null
+    try { $sha = (Api 'GET' $uri).sha } catch { }
+
+    $msg = if ($sha) { "chore: update $rel" } else { "feat: add $rel" }
+    try {
+        Api 'PUT' $uri @{ message = $msg; content = $b64; sha = $sha } | Out-Null
+        Write-Host "  up $rel"
+        $count++
+    } catch {
+        Write-Host "  !! $rel failed" -ForegroundColor Yellow
+    }
+}
+Write-Host "[OK] Uploaded $count file(s)." -ForegroundColor Green
+
+# ---------- 4. release + assets ----------
+$assets = @{}
+$setupExe = Join-Path $root 'dist\DSHApp-1.5.0-x64.exe'
+if (Test-Path $setupExe) { $assets['DSHApp-Setup-1.5.0-x64.exe'] = $setupExe } else { Write-Host '[WARN] NSIS setup missing' -ForegroundColor Yellow }
+
+$portableExe = Get-ChildItem (Join-Path $root 'dist') -Filter 'DSHApp-1.5.0-便携版.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($portableExe) { $assets['DSHApp-Portable-1.5.0-x64.exe'] = $portableExe.FullName } else { Write-Host '[WARN] portable exe missing' -ForegroundColor Yellow }
+
+if (Test-Path $zipPath) { $assets['DSHApp-Portable-1.5.0.zip'] = $zipPath }
+
+if ($assets.Count -gt 0) {
+    $rel = $null
+    try { $rel = Api 'GET' "$repoUri/releases/tags/$Version" } catch { }
+    if (-not $rel) {
+        $bodyText = "DSH App v1.5.0 (Electron desktop shell for DeepSeek Harness)" + [Environment]::NewLine + [Environment]::NewLine +
+            "Features:" + [Environment]::NewLine +
+            "- Embedded Harness UI (WebView2-free Electron shell, loopback + token contract)" + [Environment]::NewLine +
+            "- Safe mode: plugin crash auto-quarantine (patch disable + fallback minimal profile)" + [Environment]::NewLine +
+            "- Model gateway: visual provider config, priority routing, failover, SSE, anthropic protocol" + [Environment]::NewLine +
+            "- Tray with state color, input history (up/down keys), float settings entry" + [Environment]::NewLine +
+            "- Zero native deps: no VS toolchain required" + [Environment]::NewLine + [Environment]::NewLine +
+            "Assets:" + [Environment]::NewLine +
+            "- DSHApp-Setup-1.5.0-x64.exe : NSIS installer (recommended)" + [Environment]::NewLine +
+            "- DSHApp-Portable-1.5.0-x64.exe : single-file portable" + [Environment]::NewLine +
+            "- DSHApp-Portable-1.5.0.zip : green edition folder"
+        $rel = Api 'POST' "$repoUri/releases" @{
+            tag_name   = $Version
+            name       = $Version
+            body       = $bodyText
+            draft      = $false
+            prerelease = $false
+        }
+        Write-Host "[OK] Release $Version created."
+    } else {
+        Write-Host "[INFO] Release $Version exists; attaching assets."
+    }
+
+    foreach ($name in $assets.Keys) {
+        $file = $assets[$name]
+        $ct = if ($name -like '*.zip') { 'application/zip' } else { 'application/octet-stream' }
+        $up = "https://uploads.github.com/repos/$login/$RepoName/releases/$($rel.id)/assets?name=$name"
+        try {
+            Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType $ct -InFile $file | Out-Null
+            Write-Host "[OK] asset: $name" -ForegroundColor Green
+        } catch {
+            $status = 0
+            if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
+            if ($status -eq 422) {
+                Write-Host "[..] replacing existing asset $name ..."
+                $existing = Api 'GET' "$repoUri/releases/$($rel.id)/assets"
+                foreach ($a in $existing) { if ($a.name -eq $name) { Invoke-RestMethod -Method Delete -Uri $a.url -Headers $headers | Out-Null } }
+                Invoke-RestMethod -Method Post -Uri $up -Headers $headers -ContentType $ct -InFile $file | Out-Null
+                Write-Host "[OK] asset replaced: $name" -ForegroundColor Green
+            } else {
+                Write-Host ("[WARN] asset failed $name (HTTP $status)") -ForegroundColor Yellow
+            }
+        }
+    }
+} else {
+    Write-Host '[SKIP] no release assets produced.'
+}
+
+Write-Host ''
+Write-Host ("DONE! https://github.com/" + $login + "/" + $RepoName + "/releases/tag/" + $Version) -ForegroundColor Green
+Write-Host 'SECURITY: revoke the token now.'
