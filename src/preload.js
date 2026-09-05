@@ -12,6 +12,10 @@ contextBridge.exposeInMainWorld('dshApp', {
   // 触发壳动作（启动/停止/打开日志/浏览器/设置/退出安全模式/复制升级命令/选择目录）
   action: (name) => ipcRenderer.invoke('dsh:action', name),
 
+  // 模型网关：状态 / 动作（start|stop|save-config|write-dsh|load-example|get-config|clear-log）
+  gwState: () => ipcRenderer.invoke('gw:state'),
+  gwAction: (name, payload) => ipcRenderer.invoke('gw:action', name, payload),
+
   // 保存设置（patch 为扁平对象）
   saveSettings: (patch) => ipcRenderer.invoke('dsh:save-settings', patch),
 
