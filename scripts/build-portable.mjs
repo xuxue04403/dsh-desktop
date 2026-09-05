@@ -11,7 +11,6 @@ import { createPackage } from '@electron/asar';
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { iconPngBuffer, iconIcoBuffer, COLORS } from '../src/icon.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = path.join(root, 'out');
@@ -78,12 +77,13 @@ if (existsSync(exeOld)) renameSync(exeOld, exeNew);
 const defaultAsar = path.join(appDir, 'resources', 'default_app.asar');
 if (existsSync(defaultAsar)) rmSync(defaultAsar, { force: true });
 
-// —— 5) 生成品牌图标（源码树 assets/ + 绿色目录根，供快捷方式/分发使用）——
+// —— 5) 品牌图标（与 DSH-App.exe 内嵌图标完全一致：src/assets/electron-icon.*
+//       是从 electron.exe 资源原样提取的官方图标，见 scripts/extract-exe-icon.mjs）——
 mkdirSync(path.join(root, 'assets'), { recursive: true });
-writeFileSync(path.join(root, 'assets', 'icon.png'), iconPngBuffer(256, COLORS.brand));
-writeFileSync(path.join(appDir, 'icon.png'), iconPngBuffer(256, COLORS.brand));
-writeFileSync(path.join(root, 'assets', 'icon.ico'), iconIcoBuffer(COLORS.brand));
-writeFileSync(path.join(appDir, 'icon.ico'), iconIcoBuffer(COLORS.brand));
+cpSync(path.join(root, 'src', 'assets', 'electron-icon.png'), path.join(root, 'assets', 'icon.png'));
+cpSync(path.join(root, 'src', 'assets', 'electron-icon.ico'), path.join(root, 'assets', 'icon.ico'));
+cpSync(path.join(root, 'src', 'assets', 'electron-icon.png'), path.join(appDir, 'icon.png'));
+cpSync(path.join(root, 'src', 'assets', 'electron-icon.ico'), path.join(appDir, 'icon.ico'));
 
 // —— 6) 说明文件 ————————————————————————————————————
 writeFileSync(path.join(appDir, '使用说明.txt'),
@@ -92,7 +92,8 @@ writeFileSync(path.join(appDir, '使用说明.txt'),
   + '双击 DSH-App.exe 即可运行（无需安装，不写注册表）。\r\n'
   + '首次启动建议：点击「启动 dsh 服务」；服务就绪后窗口内嵌 Harness 界面。\r\n'
   + '\r\n'
-  + '运行数据（设置/日志/安全模式状态）保存在 %APPDATA%\\DSH-App\\，删除即重置。\r\n'
+  + '运行数据（设置/日志/网关配置/安全模式）保存在本目录旁的 data\\ 文件夹，\r\n'
+  + '随程序目录走（复制整个目录即随身携带）；目录不可写时才回退 %APPDATA%\\DSH-App\\。\r\n'
   + '本机需已安装 Node.js 与 dsh（未安装 dsh 时应用会通过 npx 自动获取）。\r\n'
   + '\r\n'
   + '加载超时/插件故障时应用会自动进入安全模式（见应用内提示与日志）。\r\n',
