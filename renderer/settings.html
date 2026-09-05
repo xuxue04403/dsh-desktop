@@ -1,8 +1,8 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>DSH App · 设置</title>
+<title>DSH · 设置</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -42,26 +42,26 @@
   #toast { position: fixed; right: 24px; bottom: 20px; background: #1f2a1d; border: 1px solid #3a5a35;
     color: #9fe08a; border-radius: 6px; padding: 8px 16px; font-size: 12px; opacity: 0;
     transition: opacity .25s; pointer-events: none; }
-  /* —— 模型网关：供应商可视化表格 —— */
+  /* —— 模型网关：供应商卡片列表（仿 dsh 模型配置页风格）—— */
   .gw-tbl { border: 1px solid #2c3546; border-radius: 8px; overflow: hidden; margin-bottom: 10px; }
-  .gw-th, .gw-row {
-    display: grid; grid-template-columns: 46px 1.1fr 1.6fr 1.4fr 62px 64px;
-    align-items: center; gap: 8px; padding: 7px 10px; font-size: 12px;
+  .gw-row {
+    display: grid; grid-template-columns: 40px 130px minmax(0,1fr) 56px 44px 92px;
+    align-items: center; gap: 8px; padding: 9px 10px; font-size: 12px;
+    border-bottom: 1px solid #232b39; cursor: pointer; color: #cdd6e4;
   }
-  .gw-th { background: #1b212c; color: #7d8aa0; font-weight: 600; border-bottom: 1px solid #2c3546; }
-  .gw-row { border-bottom: 1px solid #232b39; cursor: pointer; color: #cdd6e4; }
   .gw-row:last-child { border-bottom: none; }
   .gw-row:hover { background: #202a3a; }
   .gw-row.sel { background: #22304a; box-shadow: inset 2px 0 0 #4f8cff; }
   .gw-row .mono { font-family: Consolas, monospace; font-size: 11px; color: #9fb2cc; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
-  .gw-row .cnt { color: #8b93a3; }
+  .gw-row .id { font-weight: 600; color: #e8ecf2; }
+  .gw-row .cnt { color: #8b93a3; text-align: center; white-space: nowrap; }
   .gw-row input[type=checkbox] { width: 14px; height: 14px; accent-color: #2b5bd7; cursor: pointer; }
-  .gw-row button, .gw-ed button {
+  .gw-row button {
     border: 1px solid rgba(110,130,160,.35); background: rgba(40,48,62,.9); color: #cdd6e4;
-    border-radius: 6px; padding: 3px 10px; font-size: 11px; cursor: pointer;
+    border-radius: 6px; padding: 3px 8px; font-size: 11px; cursor: pointer; white-space: nowrap;
   }
-  .gw-row button:hover, .gw-ed button:hover { background: rgba(56,67,86,.95); }
+  .gw-row button:hover { background: rgba(56,67,86,.95); }
   .gw-addrow {
     border: 1px dashed rgba(110,130,160,.4); background: transparent; color: #9aa7bc;
     border-radius: 7px; padding: 6px 12px; font-size: 12px; cursor: pointer; width: 100%;
@@ -80,6 +80,15 @@
     border: 1px solid #2c3546; border-radius: 6px; padding: 8px; font-family: Consolas, monospace;
     font-size: 11px; resize: vertical;
   }
+  /* —— 两栏布局（仿 dsh 模型配置页：左列表 + 右编辑面板）—— */
+  .gw-wrap { display: flex; gap: 12px; align-items: flex-start; }
+  .gw-left { flex: 1.15; min-width: 0; }
+  .gw-right { flex: 1; min-width: 0; }
+  .gw-ed { border: 1px solid #2c3546; border-radius: 8px; padding: 12px 14px 4px;
+    background: rgba(24,30,40,.55); }
+  .gw-ed .hint-empty { color: #5f6b7d; font-size: 12px; padding: 14px 4px 18px; }
+  .gw-ed .fields { display: block; }
+  .gw-ed .fields.hidden { display: none; }
 </style>
 </head>
 <body>
@@ -115,29 +124,63 @@
     </div>
     <div class="row">
       <label>端口</label><input type="text" id="gwPort" style="width:90px;" />
-      <span style="color:#5f6b7d;font-size:11px;">统一接口 http://127.0.0.1:端口/v1（OpenAI 兼容）+ /v1/messages（Anthropic）</span>
+      <span style="color:#5f6b7d;font-size:11px;">改端口后点「保存并重启网关」生效</span>
     </div>
-
-    <!-- 供应商可视化表格（仿 dsh 模型配置页：列表 + 编辑面板） -->
-    <div class="gw-tbl">
-      <div class="gw-th"><span>启用</span><span>供应商 ID</span><span>上游地址</span><span>模型</span><span>优先</span><span>操作</span></div>
-      <div id="gwRows"></div>
+    <div class="row">
+      <label>对外地址</label>
+      <span id="gwBaseUrl" style="font-family:Consolas;font-size:12px;color:#9fe08a;">http://127.0.0.1:3090/v1</span>
     </div>
-    <button class="gw-addrow" id="btnGwAddRow">＋ 添加供应商</button>
+    <div class="row">
+      <label>统一 Key</label>
+      <input type="password" id="gwApiKey" placeholder="网关对外统一 Key（任意客户端使用）" style="flex:1;" />
+    </div>
+    <div class="row">
+      <label>调用策略</label>
+      <select id="gwRouting" style="background:#1b212c;color:#e8ecf2;border:1px solid #2c3546;border-radius:6px;padding:6px 10px;">
+        <option value="failover">主备（按优先级，故障切换）</option>
+        <option value="round-robin">负载均衡（轮询分摊流量）</option>
+      </select>
+      <span style="color:#5f6b7d;font-size:11px;">多供应商同模型时生效</span>
+    </div>
+    <div class="row">
+      <label>客户端仿真</label>
+      <select id="gwProfile" style="background:#1b212c;color:#e8ecf2;border:1px solid #2c3546;border-radius:6px;padding:6px 10px;">
+        <option value="">关闭（透传 dsh 标识）</option>
+        <option value="claude">Claude Code（claude-cli/2.0.0）</option>
+        <option value="codex">Codex（codex/0.49.0）</option>
+        <option value="custom">自定义 UA…</option>
+      </select>
+      <input type="text" id="gwClientUA" placeholder="自定义 User-Agent（选择「自定义」时生效）"
+        style="flex:1;display:none;" />
+    </div>
+    <div class="hint">防屏蔽：仿真模式不透传任何 dsh 特征头；熔断（401/403 即断 30 分钟、网络/5xx 连续 3 次断 5 分钟）、catalog 探测 30s 冷却防风暴、上游错误日志自动脱敏。</div>
 
-    <div class="gw-ed hidden" id="gwEditor">
-      <h3>编辑供应商：<b id="gwEditId"></b></h3>
-      <div class="row"><label>ID</label><input type="text" id="eId" /></div>
-      <div class="row"><label>Base URL</label><input type="text" id="eUrl" placeholder="https://api.example.com/v1" /></div>
-      <div class="row"><label>API Key</label><input type="password" id="eKey" placeholder="sk-…" /></div>
-      <div class="row"><label>模型列表</label><input type="text" id="eModels" placeholder="deepseek-v4-flash, glm-5.2（逗号分隔）" /></div>
-      <div class="row"><label>优先级</label><input type="number" id="ePriority" min="1" value="1" style="width:90px;" /></div>
-      <div class="row"><label>启用</label><input type="checkbox" id="eEnabled" /></div>
-      <div class="row">
-        <label style="width:auto;"></label>
-        <button id="btnEApply" class="primary" style="background:#2b5bd7;color:#fff;">应用修改</button>
-        <button id="btnEDel">删除供应商</button>
-        <button id="btnECancel">取消</button>
+    <!-- 供应商可视化配置（仿 dsh 模型配置页：左列表 + 右编辑面板） -->
+    <div class="gw-wrap">
+      <div class="gw-left">
+        <div class="gw-tbl">
+          <div id="gwRows"></div>
+        </div>
+        <button class="gw-addrow" id="btnGwAddRow">＋ 添加供应商</button>
+      </div>
+      <div class="gw-right">
+        <div class="gw-ed">
+          <h3>供应商配置：<b id="gwEditId">（未选择）</b></h3>
+          <div class="hint-empty" id="gwEditorEmpty">点击左侧供应商进行编辑；或点击「＋ 添加供应商」新增。</div>
+          <div class="fields hidden" id="gwEditorFields">
+            <div class="row"><label>ID</label><input type="text" id="eId" /></div>
+            <div class="row"><label>Base URL</label><input type="text" id="eUrl" placeholder="https://api.example.com/v1" /></div>
+            <div class="row"><label>API Key</label><input type="password" id="eKey" placeholder="sk-…" /></div>
+            <div class="row"><label>模型列表</label><input type="text" id="eModels" placeholder="deepseek-v4-flash, glm-5.2（逗号分隔）" /></div>
+            <div class="row"><label>优先级</label><input type="number" id="ePriority" min="1" value="1" style="width:90px;" /></div>
+            <div class="row"><label>启用</label><input type="checkbox" id="eEnabled" /></div>
+            <div class="row">
+              <label style="width:auto;"></label>
+              <button id="btnEApply" class="primary" style="background:#2b5bd7;color:#fff;">应用修改</button>
+              <button id="btnEDel">删除供应商</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -159,7 +202,7 @@
         style="flex:1;background:#161a21;color:#9aa7bc;border:1px solid #2c3546;border-radius:6px;padding:8px;font-family:Consolas;font-size:11px;resize:vertical;"></textarea>
       <button id="btnGwLogClear" style="align-self:flex-end;">清屏</button>
     </div>
-    <div class="hint" style="margin-top:10px;">多供应商统一代理：同模型多个上游按优先级路由 + 故障自动切换 + SSE 透传 + 分级熔断。“写入 dsh 配置”会把网关注册为 dsh 的 gateway 提供商（重启 dsh web 生效）。供应商 Key 明文保存在 %APPDATA%\DSH-App\gateway.config.json。</div>
+    <div class="hint" style="margin-top:10px;">同模型多上游按优先级路由 + 故障切换 + SSE + 熔断；「写入 dsh 配置」把网关注册为 dsh 的 gateway 提供商（重启 dsh web 生效）。</div>
   </div>
 
   <div class="card">
@@ -259,10 +302,10 @@
         const models = (p.models || []).join(', ');
         row.innerHTML =
           '<span><input type="checkbox" ' + (p.enabled === false ? '' : 'checked') + ' title="启用"></span>' +
-          '<span class="mono" title="' + esc(p.id || '') + '">' + esc(p.id || '（未命名）') + '</span>' +
+          '<span class="mono id" title="' + esc(p.id || '') + '">' + esc(p.id || '（未命名）') + '</span>' +
           '<span class="mono" title="' + esc(p.baseURL || '') + '">' + esc(p.baseURL || '—') + '</span>' +
-          '<span class="cnt" title="' + esc(models) + '">' + esc((p.models || []).length + ' 个') + '</span>' +
-          '<span class="cnt">' + esc(String(p.priority || 1)) + '</span>' +
+          '<span class="cnt" title="' + esc(models) + '">' + (p.models || []).length + ' 模型</span>' +
+          '<span class="cnt">P' + esc(String(p.priority || 1)) + '</span>' +
           '<span><button data-i="' + i + '" data-act="edit">编辑</button> <button data-i="' + i + '" data-act="del">删除</button></span>';
         row.querySelector('input[type=checkbox]').onchange = (e) => {
           p.enabled = e.target.checked;
@@ -299,7 +342,6 @@
     function gwOpenEditor(i) {
       const p = gwCfg.providers[i];
       if (!p) return;
-      $('gwEditor').classList.remove('hidden');
       $('gwEditId').textContent = p.id || '';
       $('eId').value = p.id || '';
       $('eUrl').value = p.baseURL || '';
@@ -307,10 +349,14 @@
       $('eModels').value = (p.models || []).join(', ');
       $('ePriority').value = p.priority || 1;
       $('eEnabled').checked = p.enabled !== false;
+      $('gwEditorEmpty').style.display = 'none';
+      $('gwEditorFields').classList.remove('hidden');
     }
 
     function gwHideEditor() {
-      $('gwEditor').classList.add('hidden');
+      $('gwEditId').textContent = '（未选择）';
+      $('gwEditorEmpty').style.display = '';
+      $('gwEditorFields').classList.add('hidden');
     }
 
     // 编辑器 → gwCfg
@@ -332,19 +378,50 @@
       return true;
     }
 
+    // 填充网关总览字段（对外地址 / 统一 Key / 策略 / 客户端仿真）并联动端口显示
+    function gwFillOverview() {
+      if (!gwCfg) return;
+      $('gwApiKey').value = gwCfg.apiKey || '';
+      $('gwRouting').value = (gwCfg.routing === 'round-robin') ? 'round-robin' : 'failover';
+      // 客户端仿真回填：优先 clientProfile；旧配置仅有 clientUA 时按 claude/custom 兼容识别
+      const prof = gwCfg.clientProfile || '';
+      let sel = prof;
+      if (!prof && gwCfg.clientUA) {
+        sel = String(gwCfg.clientUA).indexOf('claude') >= 0 ? 'claude' : 'custom';
+      }
+      $('gwProfile').value = sel;
+      $('gwClientUA').value = (sel === 'custom') ? (gwCfg.clientUA || '') : '';
+      $('gwClientUA').style.display = (sel === 'custom') ? '' : 'none';
+      const portVal = parseInt(gwCfg.port, 10) || 3090;
+      if (!$('gwPort').value || parseInt($('gwPort').value, 10) !== portVal) $('gwPort').value = portVal;
+      $('gwBaseUrl').textContent = 'http://127.0.0.1:' + portVal + '/v1';
+    }
+
+    // 「自定义 UA」选项与输入框联动
+    $('gwProfile').addEventListener('change', () => {
+      $('gwClientUA').style.display = ($('gwProfile').value === 'custom') ? '' : 'none';
+    });
+
+    // 端口输入实时联动对外地址显示
+    $('gwPort').addEventListener('input', () => {
+      const p = parseInt($('gwPort').value, 10);
+      if (p >= 1 && p <= 65535) $('gwBaseUrl').textContent = 'http://127.0.0.1:' + p + '/v1';
+    });
+
     async function gwLoad() {
-      const gs = await window.dshApp.action('gw:state');
-      $('gwPort').value = gs.port;
+      const gs = await window.dshApp.gwState();
+      // 端口兜底：后端未返回时用 3090（网关默认端口），避免显示 undefined
+      $('gwPort').value = (gs && gs.port > 0) ? gs.port : 3090;
       gwRender(gs);
-      const c = await window.dshApp.action('gw:get-config');
+      const c = await window.dshApp.gwAction('get-config');
       if (c && c.text) {
         $('gwConfig').value = c.text;
-        if (gwParse()) gwRenderRows();
+        if (gwParse()) { gwRenderRows(); gwFillOverview(); }
       }
       // 轮询日志与状态（设置窗口打开期间）
       clearInterval(window.__gwTimer);
       window.__gwTimer = setInterval(async () => {
-        const s = await window.dshApp.action('gw:state');
+        const s = await window.dshApp.gwState();
         gwRender(s);
       }, 2000);
     }
@@ -355,8 +432,8 @@
       if (gwParse()) { gwSel = -1; gwRenderRows(); }
     });
 
-    $('btnGwStart').onclick = async () => { await window.dshApp.action('gw:start'); await gwLoad(); };
-    $('btnGwStop').onclick = async () => { await window.dshApp.action('gw:stop'); await gwLoad(); };
+    $('btnGwStart').onclick = async () => { await window.dshApp.gwAction('start'); await gwLoad(); };
+    $('btnGwStop').onclick = async () => { await window.dshApp.gwAction('stop'); await gwLoad(); };
     $('btnGwAddRow').onclick = () => {
       if (!gwCfg) gwCfg = { port: 3090, apiKey: '', providers: [] };
       const n = gwCfg.providers.length + 1;
@@ -367,7 +444,7 @@
       gwOpenEditor(gwSel);
     };
     $('btnGwExample').onclick = async () => {
-      const r = await window.dshApp.action('gw:load-example');
+      const r = await window.dshApp.gwAction('load-example');
       if (r && r.text) {
         $('gwConfig').value = r.text;
         gwSel = -1;
@@ -375,7 +452,7 @@
       }
     };
     $('btnGwReload').onclick = async () => {
-      const r = await window.dshApp.action('gw:get-config');
+      const r = await window.dshApp.gwAction('get-config');
       if (r && r.text) {
         $('gwConfig').value = r.text;
         gwSel = -1;
@@ -384,28 +461,41 @@
       }
     };
     $('btnGwSave').onclick = async () => {
-      // 端口输入框合并进配置 JSON（网关运行端口以配置文件的 port 为准）
+      // 合并总览字段（端口 / 统一 Key / 调用策略 / 客户端仿真）进配置 JSON
       let text = $('gwConfig').value;
-      const portVal = parseInt($('gwPort').value, 10);
-      if (portVal >= 1 && portVal <= 65535) {
-        try {
-          const cfg = JSON.parse(text);
-          cfg.port = portVal;
-          text = JSON.stringify(cfg, null, 2);
-        } catch (_) { /* 配置本身非法时交给后端校验报错 */ }
-      }
-      const r = await window.dshApp.action('gw:save-config', text);
+      try {
+        const cfg = JSON.parse(text);
+        const portVal = parseInt($('gwPort').value, 10);
+        if (portVal >= 1 && portVal <= 65535) cfg.port = portVal;
+        cfg.apiKey = $('gwApiKey').value.trim();
+        cfg.routing = $('gwRouting').value === 'round-robin' ? 'round-robin' : 'failover';
+        const prof = $('gwProfile').value;
+        if (prof === 'claude') {
+          cfg.clientProfile = 'claude';
+          cfg.clientUA = 'claude-cli/2.0.0 (external, cli)';
+        } else if (prof === 'codex') {
+          cfg.clientProfile = 'codex';
+          cfg.clientUA = 'codex/0.49.0 (Windows NT 10.0; Win64; x64)';
+        } else if (prof === 'custom') {
+          cfg.clientProfile = '';
+          cfg.clientUA = $('gwClientUA').value.trim();
+        } else {
+          delete cfg.clientProfile;
+          delete cfg.clientUA;
+        }
+        text = JSON.stringify(cfg, null, 2);
+      } catch (_) { /* 配置本身非法时交给后端校验报错 */ }
+      const r = await window.dshApp.gwAction('save-config', text);
       toast(r && r.ok ? '配置已保存，网关已重启' : ('配置无效：' + (r && r.error ? r.error : '未知错误')));
       await gwLoad();
     };
     $('btnGwWriteDsh').onclick = async () => {
-      const r = await window.dshApp.action('gw:write-dsh');
+      const r = await window.dshApp.gwAction('write-dsh');
       toast(r && r.ok ? '已写入 dsh 配置，重启 dsh web 后生效' : '写入失败，请查看网关日志');
       await gwLoad();
     };
-    $('btnGwLogClear').onclick = async () => { await window.dshApp.action('gw:clear-log'); await gwLoad(); };
+    $('btnGwLogClear').onclick = async () => { await window.dshApp.gwAction('clear-log'); await gwLoad(); };
     $('btnEApply').onclick = () => { if (gwSel >= 0) gwApplyEditor(); };
-    $('btnECancel').onclick = () => { gwSel = -1; gwHideEditor(); gwRenderRows(); };
     $('btnEDel').onclick = () => {
       if (gwSel < 0) return;
       if (confirm('确定删除供应商「' + (gwCfg.providers[gwSel].id || gwSel) + '」？')) {
