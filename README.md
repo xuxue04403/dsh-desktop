@@ -35,7 +35,7 @@ dsh-app/
 │   ├── preload.js      # 渲染进程安全桥（contextIsolation）
 │   ├── launcher.js     # dsh 发现/启动/停止/健康/就绪行解析（稳定契约）
 │   ├── watchdog.js     # 看门狗 + 安全模式（Level 1 / Level 2 / 一键恢复）
-│   ├── settings.js     # 设置持久化（userData/settings.json）
+│   ├── settings.js     # 设置持久化（数据目录 settings.json）
 │   ├── logger.js       # 日志落盘（app.log + web.log）
 │   ├── state.js        # 壳级状态机 + 广播
 │   ├── tray.js         # 系统托盘
@@ -72,7 +72,7 @@ dsh-app/
 - **分级熔断**：401/403 业务拒绝立即熔断 30 分钟；网络错误/5xx 连续 3 次熔断 5 分钟；日志自动脱敏；
 - 可选 `clientUA` 仿真、`/health` 健康检查；
 - **「写入 dsh 配置」**：自动把网关注册为 dsh 的 `gateway` 提供商并写入统一 Key，重启 dsh web 后在模型选择器直接选用；
-- 配置（供应商列表/优先级/Key）保存在 `%APPDATA%\DSH-App\gateway.config.json`（与桌面助手 `data\gateway.config.json` 同构，可直接迁移）。
+- 配置（供应商列表/优先级/Key）保存在**程序目录旁 `data\gateway.config.json`**（绿色便携，随程序目录走；不可写时才回退 `%APPDATA%\DSH-App\`；与桌面助手配置同构，可直接沿用）。
 
 ## 打包分发（免安装版）
 
@@ -84,7 +84,7 @@ node scripts/portable.mirror.mjs       # 单文件便携 exe（electron-builder 
 npm run dist                           # 完整安装包（NSIS）
 ```
 
-- 绿色版无需安装、不写注册表；运行数据在 `%APPDATA%\DSH-App\`，删除即重置；
+- 绿色版无需安装、不写注册表；**运行数据（设置/日志/网关配置）保存在程序目录旁 `data\`**——复制/移动整个目录即随身携带，删除即重置；不可写时才回退 `%APPDATA%\DSH-App\`（旧数据会自动迁移一次）；
 - 两种打包均**不需要 Visual Studio C++ 工具链**；
 - 若 GitHub 下载慢，打包工具已走 npmmirror 镜像（`portable.mirror.mjs` 内置），也可用环境变量 `ELECTRON_MIRROR` / `ELECTRON_BUILDER_BINARIES_MIRROR` 覆盖。
 
