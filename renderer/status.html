@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>DSH App</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(155deg, #10141b 0%, #141b26 55%, #1a1726 100%);
+    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    color: #e8ecf2; user-select: none;
+  }
+  .card {
+    width: 520px; max-width: 90vw;
+    padding: 44px 46px 36px; border-radius: 18px; text-align: center;
+    background: rgba(28, 34, 46, .72);
+    border: 1px solid rgba(72, 84, 108, .35);
+    box-shadow: 0 24px 70px rgba(0, 0, 0, .45);
+  }
+  .dot-wrap { height: 74px; display: flex; align-items: center; justify-content: center; }
+  .dot {
+    width: 58px; height: 58px; border-radius: 50%;
+    border: 3px solid rgba(122, 140, 170, .18);
+    position: relative;
+  }
+  .dot.spin { border-top-color: #4f8cff; animation: spin 1.1s linear infinite; }
+  .dot.ok { border-color: #3ecf8e; background: rgba(62, 207, 142, .12); }
+  .dot.bad { border-color: #e8554d; background: rgba(232, 84, 77, .12); }
+  .dot.stop { border-color: #8a93a3; background: rgba(138, 147, 163, .12); }
+  .dot.safe { border-color: #f09b3c; background: rgba(240, 155, 60, .12); }
+  .dot:after {
+    content: ""; position: absolute; left: 50%; top: 50%;
+    width: 14px; height: 14px; margin: -7px 0 0 -7px; border-radius: 50%;
+    background: currentColor; color: inherit;
+  }
+  .dot.spin:after { background: #4f8cff; }
+  .dot.ok:after { background: #3ecf8e; }
+  .dot.bad:after { background: #e8554d; }
+  .dot.stop:after { background: #8a93a3; }
+  .dot.safe:after { background: #f09b3c; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  h1 { font-size: 22px; font-weight: 600; color: #edf1f7; letter-spacing: .4px; margin-bottom: 10px; }
+  .phase { font-size: 14px; color: #9aa7bc; line-height: 1.8; min-height: 24px; }
+  .badge {
+    display: inline-block; margin: 14px 0 0; padding: 7px 16px; border-radius: 8px;
+    background: #241d0e; color: #ffcf6e; font-size: 13px;
+  }
+  .badge.hidden { display: none; }
+  .actions { margin-top: 28px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  button {
+    border: 1px solid rgba(110, 130, 160, .35); background: rgba(40, 48, 62, .9);
+    color: #cdd6e4; border-radius: 8px; padding: 9px 20px; font-size: 13px;
+    cursor: pointer; transition: background .15s;
+    font-family: inherit;
+  }
+  button:hover { background: rgba(56, 67, 86, .95); }
+  button.primary {
+    background: #2b5bd7; border-color: #2b5bd7; color: #fff; font-weight: 600;
+  }
+  button.primary:hover { background: #3a6cf5; }
+  .meta { margin-top: 26px; font-size: 11px; color: #5f6b7d; }
+  .meta b { color: #8b93a3; font-weight: 600; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="dot-wrap"><div class="dot stop" id="dot"></div></div>
+    <h1>DeepSeek Harness</h1>
+    <div class="phase" id="phase">服务未运行</div>
+    <div class="badge hidden" id="badge">🛡 安全模式</div>
+    <div class="actions">
+      <button class="primary" id="btnStart">启动 dsh 服务</button>
+      <button id="btnLogs">打开日志</button>
+      <button id="btnBrowser">系统浏览器</button>
+      <button id="btnSettings">设置</button>
+    </div>
+    <div class="meta" id="meta"></div>
+  </div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const dot = $('dot'), phase = $('phase'), badge = $('badge'), meta = $('meta');
+
+    function render(s) {
+      const cls = {
+        stopped: 'stop', starting: 'spin', ready: 'ok',
+        failed: 'bad', safe: 'safe',
+      }[s.service] || 'stop';
+      dot.className = 'dot ' + cls;
+      phase.textContent = s.phase || '…';
+      badge.classList.toggle('hidden', !s.safeMode);
+      if (s.safeMode) {
+        badge.textContent = '🛡 安全模式：已禁用故障插件（' + (s.safePlugins || '') + '）';
+      }
+      const cmd = s.service === 'starting' ? '启动中…' : s.phase;
+      meta.innerHTML = 'dsh <b>' + (s.dshVersion || '未检测') + '</b> · 端口 <b>' + s.port + '</b>';
+      $('btnStart').textContent =
+        (s.service === 'starting') ? '启动中…' :
+        (s.service === 'ready' || s.service === 'safe') ? '重新启动' : '启动 dsh 服务';
+      // 系统浏览器按钮：仅服务就绪（有真实地址）时可点，避免弹 401 明文页
+      const canOpen = s.service === 'ready' || s.service === 'safe';
+      $('btnBrowser').disabled = !canOpen;
+      $('btnBrowser').style.opacity = canOpen ? 1 : 0.45;
+      $('btnBrowser').title = canOpen ? '在系统浏览器中打开 Harness 界面' : '服务就绪后可用';
+    }
+
+    window.dshApp.onState(render);
+    window.dshApp.getState().then(render);
+
+    $('btnStart').onclick = () => window.dshApp.action('start');
+    $('btnLogs').onclick = () => window.dshApp.action('open-logs');
+    $('btnBrowser').onclick = () => window.dshApp.action('open-browser');
+    $('btnSettings').onclick = () => window.dshApp.action('open-settings');
+  </script>
+</body>
+</html>
