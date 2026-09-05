@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Build and publish DSH App v1.5.0 to github.com/xuxue04403/dsh-desktop
   (source upload + installer/portable release assets). No git client required.
@@ -46,13 +46,10 @@ $outDirLine = ($buildOut -split "`r?`n") | Where-Object { $_ -like 'OUTDIR=*' } 
 $greenDir = if ($outDirLine) { $outDirLine.Substring(7).Trim() } else { Join-Path $root 'out\DSH-App' }
 Write-Host "[..] green dir: $greenDir"
 
-Write-Host '[..] 2/4 exe icon (rcedit)...'
-# 对刚构建的绿色目录 exe 设置图标（老目录可能被运行中的实例占用，无法写入）
-$env:DSH_APP_EXE = Join-Path $greenDir 'DSH-App.exe'
-try { node (Join-Path $root 'scripts\set-exe-icon.cjs') } catch {
-    Write-Host '[WARN] set-exe-icon failed, continuing' -ForegroundColor Yellow
-}
-Remove-Item Env:DSH_APP_EXE -ErrorAction SilentlyContinue
+Write-Host '[..] 2/4 icon policy: keep Electron official icon for exe/installer...'
+# 图标策略（与产品一致）：exe / 安装版 / 单文件便携版全部沿用 Electron 官方深蓝原子图标
+# （绿色版 exe 即 electron 原样；electron-builder 未配置 win.icon 时使用官方默认图标）。
+# 托盘/窗口图标由运行时以同风格绘制（底色随服务状态变色），不再使用 rcedit 改写 exe 资源。
 
 Write-Host '[..] 3/4 NSIS installer + single-file portable (mirror)...'
 node (Join-Path $root 'scripts\dist.mirror.mjs')
