@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>DSH App · 设置</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #10141b; color: #e8ecf2;
+    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    padding: 26px 30px 30px;
+  }
+  h1 { font-size: 17px; font-weight: 600; margin-bottom: 18px; color: #edf1f7; }
+  .row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; font-size: 13px; }
+  .row label { width: 130px; color: #9aa7bc; flex: none; }
+  .row input[type=text] {
+    flex: 1; background: #1b212c; border: 1px solid #2c3546; color: #e8ecf2;
+    border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none;
+    font-family: inherit;
+  }
+  .row input[type=checkbox] { width: 16px; height: 16px; accent-color: #2b5bd7; }
+  button {
+    border: 1px solid rgba(110, 130, 160, .35); background: rgba(40, 48, 62, .9);
+    color: #cdd6e4; border-radius: 6px; padding: 6px 14px; font-size: 12px;
+    cursor: pointer; font-family: inherit;
+  }
+  button:hover { background: rgba(56, 67, 86, .95); }
+  button.primary { background: #2b5bd7; border-color: #2b5bd7; color: #fff; }
+  button.primary:hover { background: #3a6cf5; }
+  .card {
+    background: rgba(28, 34, 46, .6); border: 1px solid rgba(72, 84, 108, .35);
+    border-radius: 10px; padding: 16px 18px; margin-bottom: 16px;
+  }
+  .card h2 { font-size: 13px; color: #9aa7bc; font-weight: 600; margin-bottom: 12px; }
+  .hint { font-size: 11px; color: #5f6b7d; margin-top: 4px; line-height: 1.6; }
+  .warn {
+    background: #241d0e; border: 1px solid #5a4718; color: #ffcf6e;
+    border-radius: 8px; padding: 10px 14px; font-size: 12px; line-height: 1.7; margin-bottom: 16px;
+  }
+  .warn.hidden { display: none; }
+  .foot { margin-top: 8px; display: flex; justify-content: flex-end; gap: 10px; }
+  #toast { position: fixed; right: 24px; bottom: 20px; background: #1f2a1d; border: 1px solid #3a5a35;
+    color: #9fe08a; border-radius: 6px; padding: 8px 16px; font-size: 12px; opacity: 0;
+    transition: opacity .25s; pointer-events: none; }
+  /* —— 模型网关：供应商可视化表格 —— */
+  .gw-tbl { border: 1px solid #2c3546; border-radius: 8px; overflow: hidden; margin-bottom: 10px; }
+  .gw-th, .gw-row {
+    display: grid; grid-template-columns: 46px 1.1fr 1.6fr 1.4fr 62px 64px;
+    align-items: center; gap: 8px; padding: 7px 10px; font-size: 12px;
+  }
+  .gw-th { background: #1b212c; color: #7d8aa0; font-weight: 600; border-bottom: 1px solid #2c3546; }
+  .gw-row { border-bottom: 1px solid #232b39; cursor: pointer; color: #cdd6e4; }
+  .gw-row:last-child { border-bottom: none; }
+  .gw-row:hover { background: #202a3a; }
+  .gw-row.sel { background: #22304a; box-shadow: inset 2px 0 0 #4f8cff; }
+  .gw-row .mono { font-family: Consolas, monospace; font-size: 11px; color: #9fb2cc; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .gw-row .cnt { color: #8b93a3; }
+  .gw-row input[type=checkbox] { width: 14px; height: 14px; accent-color: #2b5bd7; cursor: pointer; }
+  .gw-row button, .gw-ed button {
+    border: 1px solid rgba(110,130,160,.35); background: rgba(40,48,62,.9); color: #cdd6e4;
+    border-radius: 6px; padding: 3px 10px; font-size: 11px; cursor: pointer;
+  }
+  .gw-row button:hover, .gw-ed button:hover { background: rgba(56,67,86,.95); }
+  .gw-addrow {
+    border: 1px dashed rgba(110,130,160,.4); background: transparent; color: #9aa7bc;
+    border-radius: 7px; padding: 6px 12px; font-size: 12px; cursor: pointer; width: 100%;
+    margin-bottom: 10px;
+  }
+  .gw-addrow:hover { background: #1d2635; color: #cdd6e4; }
+  .gw-ed { border: 1px solid #2c3546; border-radius: 8px; padding: 12px 14px 4px; margin-bottom: 10px;
+    background: rgba(24,30,40,.55); }
+  .gw-ed.hidden { display: none; }
+  .gw-ed h3 { font-size: 12px; color: #9aa7bc; font-weight: 600; margin: 0 0 10px; }
+  .gw-ed h3 b { color: #e8ecf2; }
+  .gw-json { margin: 8px 0 12px; }
+  .gw-json summary { font-size: 12px; color: #7d8aa0; cursor: pointer; margin-bottom: 6px; }
+  .gw-json textarea {
+    width: 100%; box-sizing: border-box; background: #161a21; color: #9fe08a;
+    border: 1px solid #2c3546; border-radius: 6px; padding: 8px; font-family: Consolas, monospace;
+    font-size: 11px; resize: vertical;
+  }
+</style>
+</head>
+<body>
+  <h1>DSH App · 设置</h1>
+
+  <div class="warn hidden" id="safeWarn">
+    🛡 <b>当前处于安全模式</b>（已禁用故障插件，dsh 已能以最小配置启动）。<br>
+    排查并修复插件问题后，点击下方「退出安全模式并重启」恢复正常状态。
+  </div>
+
+  <div class="card">
+    <h2>服务</h2>
+    <div class="row"><label>端口</label><input type="text" id="port" /></div>
+    <div class="row"><label>工作目录</label><input type="text" id="workdir" /><button id="btnBrowse">浏览…</button></div>
+    <div class="row"><label>启动应用时自动启动服务</label><input type="checkbox" id="autoStartService" /></div>
+    <div class="row"><label>开机自启</label><input type="checkbox" id="autoStart" /></div>
+    <div class="hint">端口对应 `dsh web --port`（默认 3080）；工作目录为 dsh 的启动目录（默认为用户主目录）。</div>
+  </div>
+
+  <div class="card">
+    <h2>窗口</h2>
+    <div class="row"><label>关闭窗口最小化到托盘</label><input type="checkbox" id="minimizeToTray" /></div>
+    <div class="row"><label>就绪后自动打开系统浏览器</label><input type="checkbox" id="autoOpenBrowser" /></div>
+    <div class="hint">浏览器选项只影响"是否额外用系统浏览器打开"，不影响窗口内嵌的 Harness 界面。</div>
+  </div>
+
+  <div class="card" id="card-gateway" title="模型网关">
+    <h2>模型网关</h2>
+    <div class="row">
+      <label>状态</label><span id="gwStatus">已停止</span>
+      <button id="btnGwStart">启动网关</button>
+      <button id="btnGwStop">停止网关</button>
+    </div>
+    <div class="row">
+      <label>端口</label><input type="text" id="gwPort" style="width:90px;" />
+      <span style="color:#5f6b7d;font-size:11px;">统一接口 http://127.0.0.1:端口/v1（OpenAI 兼容）+ /v1/messages（Anthropic）</span>
+    </div>
+
+    <!-- 供应商可视化表格（仿 dsh 模型配置页：列表 + 编辑面板） -->
+    <div class="gw-tbl">
+      <div class="gw-th"><span>启用</span><span>供应商 ID</span><span>上游地址</span><span>模型</span><span>优先</span><span>操作</span></div>
+      <div id="gwRows"></div>
+    </div>
+    <button class="gw-addrow" id="btnGwAddRow">＋ 添加供应商</button>
+
+    <div class="gw-ed hidden" id="gwEditor">
+      <h3>编辑供应商：<b id="gwEditId"></b></h3>
+      <div class="row"><label>ID</label><input type="text" id="eId" /></div>
+      <div class="row"><label>Base URL</label><input type="text" id="eUrl" placeholder="https://api.example.com/v1" /></div>
+      <div class="row"><label>API Key</label><input type="password" id="eKey" placeholder="sk-…" /></div>
+      <div class="row"><label>模型列表</label><input type="text" id="eModels" placeholder="deepseek-v4-flash, glm-5.2（逗号分隔）" /></div>
+      <div class="row"><label>优先级</label><input type="number" id="ePriority" min="1" value="1" style="width:90px;" /></div>
+      <div class="row"><label>启用</label><input type="checkbox" id="eEnabled" /></div>
+      <div class="row">
+        <label style="width:auto;"></label>
+        <button id="btnEApply" class="primary" style="background:#2b5bd7;color:#fff;">应用修改</button>
+        <button id="btnEDel">删除供应商</button>
+        <button id="btnECancel">取消</button>
+      </div>
+    </div>
+
+    <details class="gw-json">
+      <summary>高级：直接编辑配置 JSON（改动后「保存并重启网关」生效）</summary>
+      <textarea id="gwConfig" rows="7" spellcheck="false"></textarea>
+    </details>
+
+    <div class="row">
+      <label style="width:auto;">操作</label>
+      <button id="btnGwSave" class="primary">保存并重启网关</button>
+      <button id="btnGwWriteDsh">写入 dsh 配置</button>
+      <button id="btnGwReload">重新读取</button>
+      <button id="btnGwExample">载入示例</button>
+    </div>
+    <div class="row" style="align-items:flex-start;">
+      <label>网关日志</label>
+      <textarea id="gwLog" rows="5" readonly spellcheck="false"
+        style="flex:1;background:#161a21;color:#9aa7bc;border:1px solid #2c3546;border-radius:6px;padding:8px;font-family:Consolas;font-size:11px;resize:vertical;"></textarea>
+      <button id="btnGwLogClear" style="align-self:flex-end;">清屏</button>
+    </div>
+    <div class="hint" style="margin-top:10px;">多供应商统一代理：同模型多个上游按优先级路由 + 故障自动切换 + SSE 透传 + 分级熔断。“写入 dsh 配置”会把网关注册为 dsh 的 gateway 提供商（重启 dsh web 生效）。供应商 Key 明文保存在 %APPDATA%\DSH-App\gateway.config.json。</div>
+  </div>
+
+  <div class="card">
+    <h2>更新与诊断</h2>
+    <div class="row"><label>dsh 版本</label><span id="versions">检测中…</span></div>
+    <div class="row" id="upgradeRow" style="display:none;">
+      <label>升级命令</label><span id="upgradeCmd" style="font-family:Consolas;font-size:12px;color:#9fe08a;"></span>
+      <button id="btnCopy">复制</button>
+    </div>
+    <div class="row"><label>启动时检查更新</label><input type="checkbox" id="checkUpdates" /></div>
+    <div class="row"><label>安全模式</label>
+      <button id="btnExitSafe">退出安全模式并重启</button>
+    </div>
+    <div class="hint">升级命令需在终端中执行（全局安装 dsh）；壳本身不代装，避免权限与来源混杂。</div>
+  </div>
+
+  <div class="foot">
+    <button id="btnSave" class="primary">保存设置</button>
+  </div>
+  <div id="toast"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let current = null;
+
+    function toast(msg) {
+      const t = $('toast');
+      t.textContent = msg;
+      t.style.opacity = 1;
+      setTimeout(() => { t.style.opacity = 0; }, 1800);
+    }
+
+    async function load() {
+      const s = await window.dshApp.getSettings();
+      current = s;
+      $('port').value = s.port;
+      $('workdir').value = s.workDir || '';
+      $('autoStartService').checked = !!s.autoStartService;
+      $('autoStart').checked = !!s.autoStart;
+      $('minimizeToTray').checked = !!s.minimizeToTray;
+      $('autoOpenBrowser').checked = !!s.autoOpenBrowser;
+      $('checkUpdates').checked = !!s.checkUpdates;
+      $('safeWarn').classList.toggle('hidden', !s.safeMode);
+      $('btnExitSafe').style.display = s.safeMode ? '' : 'none';
+
+      const v = await window.dshApp.getVersions();
+      $('versions').textContent = v.local ? ('v' + v.local) : '未检测到本机 dsh';
+      if (v.update) {
+        $('upgradeRow').style.display = '';
+        $('upgradeCmd').textContent = v.update.command;
+      }
+      gwLoad();
+    }
+
+    // —— 模型网关 ——
+    // 状态（真/假状态）+ 配置数据（表格与 JSON 双向）
+    let gwCfg = null;         // 当前配置对象（表格编辑的权威数据）
+    let gwSel = -1;           // 选中供应商下标
+    let gwUpdating = false;   // 表格→JSON 同步防回环
+
+    function gwRender(gs) {
+      $('gwStatus').textContent = gs.running ? '● 运行中（:' + gs.port + '）' : '● 已停止';
+      $('gwStatus').style.color = gs.running ? '#3ecf8e' : '#8a93a3';
+      $('gwLog').value = gs.log || '';
+      $('gwLog').scrollTop = $('gwLog').scrollHeight;
+      $('btnGwStart').disabled = !!gs.running;
+      $('btnGwStop').disabled = !gs.running;
+    }
+
+    // 解析配置文本 → gwCfg；失败返回 false
+    function gwParse() {
+      try {
+        gwCfg = JSON.parse($('gwConfig').value);
+        if (!gwCfg || typeof gwCfg !== 'object' || Array.isArray(gwCfg)) throw new Error('根必须是对象');
+        if (!Array.isArray(gwCfg.providers)) gwCfg.providers = [];
+        return true;
+      } catch (err) {
+        toast('配置 JSON 解析失败：' + err.message);
+        return false;
+      }
+    }
+
+    // 把 gwCfg 同步回 JSON 文本区（保留 2 空格缩进）
+    function gwSyncText() {
+      if (gwUpdating) return;
+      gwUpdating = true;
+      try { $('gwConfig').value = JSON.stringify(gwCfg, null, 2); } finally { gwUpdating = false; }
+    }
+
+    // 渲染供应商表格
+    function gwRenderRows() {
+      const box = $('gwRows');
+      box.innerHTML = '';
+      (gwCfg ? gwCfg.providers : []).forEach((p, i) => {
+        const row = document.createElement('div');
+        row.className = 'gw-row' + (i === gwSel ? ' sel' : '');
+        const models = (p.models || []).join(', ');
+        row.innerHTML =
+          '<span><input type="checkbox" ' + (p.enabled === false ? '' : 'checked') + ' title="启用"></span>' +
+          '<span class="mono" title="' + esc(p.id || '') + '">' + esc(p.id || '（未命名）') + '</span>' +
+          '<span class="mono" title="' + esc(p.baseURL || '') + '">' + esc(p.baseURL || '—') + '</span>' +
+          '<span class="cnt" title="' + esc(models) + '">' + esc((p.models || []).length + ' 个') + '</span>' +
+          '<span class="cnt">' + esc(String(p.priority || 1)) + '</span>' +
+          '<span><button data-i="' + i + '" data-act="edit">编辑</button> <button data-i="' + i + '" data-act="del">删除</button></span>';
+        row.querySelector('input[type=checkbox]').onchange = (e) => {
+          p.enabled = e.target.checked;
+          gwSyncText();
+        };
+        row.onclick = () => { gwSel = i; gwRenderRows(); gwOpenEditor(i); };
+        box.appendChild(row);
+      });
+      // 按钮事件（edit=打开编辑面板；del=删除）
+      box.querySelectorAll('button[data-act]').forEach((b) => {
+        b.onclick = (e) => {
+          e.stopPropagation();
+          const i = parseInt(b.dataset.i, 10);
+          if (b.dataset.act === 'edit') { gwSel = i; gwRenderRows(); gwOpenEditor(i); }
+          else {
+            if (confirm('确定删除供应商「' + (gwCfg.providers[i].id || i) + '」？')) {
+              gwCfg.providers.splice(i, 1);
+              if (gwSel > i) gwSel--;
+              gwSel = -1;
+              gwHideEditor();
+              gwSyncText();
+              gwRenderRows();
+            }
+          }
+        };
+      });
+    }
+
+    function esc(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function gwOpenEditor(i) {
+      const p = gwCfg.providers[i];
+      if (!p) return;
+      $('gwEditor').classList.remove('hidden');
+      $('gwEditId').textContent = p.id || '';
+      $('eId').value = p.id || '';
+      $('eUrl').value = p.baseURL || '';
+      $('eKey').value = p.apiKey || '';
+      $('eModels').value = (p.models || []).join(', ');
+      $('ePriority').value = p.priority || 1;
+      $('eEnabled').checked = p.enabled !== false;
+    }
+
+    function gwHideEditor() {
+      $('gwEditor').classList.add('hidden');
+    }
+
+    // 编辑器 → gwCfg
+    function gwApplyEditor() {
+      const id = $('eId').value.trim();
+      const url = $('eUrl').value.trim();
+      if (!id) { toast('请填写供应商 ID'); return false; }
+      if (!url) { toast('请填写上游地址 baseURL'); return false; }
+      const p = gwCfg.providers[gwSel] || (gwCfg.providers[gwSel] = {});
+      p.id = id;
+      p.baseURL = url;
+      p.apiKey = $('eKey').value.trim();
+      p.models = $('eModels').value.split(',').map((s) => s.trim()).filter(Boolean);
+      p.priority = parseInt($('ePriority').value, 10) || 1;
+      p.enabled = $('eEnabled').checked;
+      gwSyncText();
+      gwRenderRows();
+      toast('已应用到配置（点击「保存并重启网关」生效）');
+      return true;
+    }
+
+    async function gwLoad() {
+      const gs = await window.dshApp.action('gw:state');
+      $('gwPort').value = gs.port;
+      gwRender(gs);
+      const c = await window.dshApp.action('gw:get-config');
+      if (c && c.text) {
+        $('gwConfig').value = c.text;
+        if (gwParse()) gwRenderRows();
+      }
+      // 轮询日志与状态（设置窗口打开期间）
+      clearInterval(window.__gwTimer);
+      window.__gwTimer = setInterval(async () => {
+        const s = await window.dshApp.action('gw:state');
+        gwRender(s);
+      }, 2000);
+    }
+
+    // 高级 JSON 区手工编辑 → 同步表格（防回环）
+    $('gwConfig').addEventListener('input', () => {
+      if (gwUpdating) return;
+      if (gwParse()) { gwSel = -1; gwRenderRows(); }
+    });
+
+    $('btnGwStart').onclick = async () => { await window.dshApp.action('gw:start'); await gwLoad(); };
+    $('btnGwStop').onclick = async () => { await window.dshApp.action('gw:stop'); await gwLoad(); };
+    $('btnGwAddRow').onclick = () => {
+      if (!gwCfg) gwCfg = { port: 3090, apiKey: '', providers: [] };
+      const n = gwCfg.providers.length + 1;
+      gwCfg.providers.push({ id: 'provider-' + n, baseURL: '', apiKey: '', models: [], priority: n, enabled: true });
+      gwSel = gwCfg.providers.length - 1;
+      gwSyncText();
+      gwRenderRows();
+      gwOpenEditor(gwSel);
+    };
+    $('btnGwExample').onclick = async () => {
+      const r = await window.dshApp.action('gw:load-example');
+      if (r && r.text) {
+        $('gwConfig').value = r.text;
+        gwSel = -1;
+        if (gwParse()) gwRenderRows();
+      }
+    };
+    $('btnGwReload').onclick = async () => {
+      const r = await window.dshApp.action('gw:get-config');
+      if (r && r.text) {
+        $('gwConfig').value = r.text;
+        gwSel = -1;
+        gwHideEditor();
+        if (gwParse()) gwRenderRows();
+      }
+    };
+    $('btnGwSave').onclick = async () => {
+      // 端口输入框合并进配置 JSON（网关运行端口以配置文件的 port 为准）
+      let text = $('gwConfig').value;
+      const portVal = parseInt($('gwPort').value, 10);
+      if (portVal >= 1 && portVal <= 65535) {
+        try {
+          const cfg = JSON.parse(text);
+          cfg.port = portVal;
+          text = JSON.stringify(cfg, null, 2);
+        } catch (_) { /* 配置本身非法时交给后端校验报错 */ }
+      }
+      const r = await window.dshApp.action('gw:save-config', text);
+      toast(r && r.ok ? '配置已保存，网关已重启' : ('配置无效：' + (r && r.error ? r.error : '未知错误')));
+      await gwLoad();
+    };
+    $('btnGwWriteDsh').onclick = async () => {
+      const r = await window.dshApp.action('gw:write-dsh');
+      toast(r && r.ok ? '已写入 dsh 配置，重启 dsh web 后生效' : '写入失败，请查看网关日志');
+      await gwLoad();
+    };
+    $('btnGwLogClear').onclick = async () => { await window.dshApp.action('gw:clear-log'); await gwLoad(); };
+    $('btnEApply').onclick = () => { if (gwSel >= 0) gwApplyEditor(); };
+    $('btnECancel').onclick = () => { gwSel = -1; gwHideEditor(); gwRenderRows(); };
+    $('btnEDel').onclick = () => {
+      if (gwSel < 0) return;
+      if (confirm('确定删除供应商「' + (gwCfg.providers[gwSel].id || gwSel) + '」？')) {
+        gwCfg.providers.splice(gwSel, 1);
+        gwSel = -1;
+        gwHideEditor();
+        gwSyncText();
+        gwRenderRows();
+      }
+    };
+
+    // —— 定位到指定卡片（来自悬浮入口/托盘"模型网关"）——
+    window.dshApp.onFocusSection((section) => {
+      const el = document.getElementById('card-' + section);
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      const old = el.style.boxShadow;
+      el.style.boxShadow = '0 0 0 2px #4f8cff inset, 0 12px 40px rgba(0,0,0,.35)';
+      setTimeout(() => { el.style.boxShadow = old; }, 1600);
+    });
+
+    $('btnSave').onclick = async () => {
+      const patch = {
+        port: parseInt($('port').value, 10) || 3080,
+        workDir: $('workdir').value.trim(),
+        autoStartService: $('autoStartService').checked,
+        autoStart: $('autoStart').checked,
+        minimizeToTray: $('minimizeToTray').checked,
+        autoOpenBrowser: $('autoOpenBrowser').checked,
+        checkUpdates: $('checkUpdates').checked,
+      };
+      await window.dshApp.saveSettings(patch);
+      toast('设置已保存');
+    };
+
+    $('btnBrowse').onclick = async () => {
+      const p = await window.dshApp.action('browse-workdir');
+      if (p) $('workdir').value = p;
+    };
+    $('btnCopy').onclick = () => {
+      window.dshApp.action('copy-upgrade-command');
+      toast('升级命令已复制');
+    };
+    $('btnExitSafe').onclick = () => window.dshApp.action('exit-safe');
+
+    load();
+  </script>
+</body>
+</html>
