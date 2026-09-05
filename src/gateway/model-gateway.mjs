@@ -160,12 +160,12 @@ function maskSecrets(text) {
     .replace(/(x-api-key["':\s=]+)([^\s"',}]+)/gi, '$1***');
 }
 
-async function fetchCatalog(provider, force, clientUA) {
+async function fetchCatalog(provider, force, clientUA, clientProfile) {
   const cached = catalogCache.get(provider.id);
   if (!force && cached && Date.now() - cached.ts < (cached.failed ? CATALOG_FAIL_COOLDOWN_MS : MODEL_CACHE_TTL_MS)) return cached.models;
   // 并发去重：同一 provider 已有在途目录请求时直接复用（修复 G5）
   if (!force && catalogInflight.has(provider.id)) return catalogInflight.get(provider.id);
-  const promise = doFetchCatalog(provider, clientUA);
+  const promise = doFetchCatalog(provider, clientUA, clientProfile);
   catalogInflight.set(provider.id, promise);
   try {
     return await promise;
@@ -174,13 +174,13 @@ async function fetchCatalog(provider, force, clientUA) {
   }
 }
 
-async function doFetchCatalog(provider, clientUA) {
+async function doFetchCatalog(provider, clientUA, clientProfile) {
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10_000);
-    // Q1：catalog 探测同样走上游请求头构造（clientUA 配置时完全仿真 Claude Code，
+    // Q1：catalog 探测同样走上游请求头构造（clientUA/clientProfile 配置时完全仿真，
     // 否则 new-api 客户端白名单会拦 catalog 导致模型列表为空）
-    const headers = upstreamRequestHeaders({}, provider.apiKey, clientUA);
+    const headers = upstreamRequestHeaders({}, provider.apiKey, clientUA, false, clientProfile);
     const res = await fetch(`${upstreamBase(provider.baseURL)}/models`, {
       headers,
       signal: controller.signal,
@@ -286,12 +286,21 @@ function claudeClientHeaders() {
   };
 }
 
+// V2 防屏蔽：Codex 客户端完全仿真（OpenAI 系特征，供 new-api/one-api 白名单识别为 Codex）
+function codexClientHeaders() {
+  return {
+    'user-agent': 'codex/0.49.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    accept: 'application/json, text/event-stream',
+  };
+}
+
 /** 构造发往上游的最终请求头。
- * clientUA 配置时 → 完全仿真模式（不留任何客户端透传痕迹）
- * clientUA 为空     → 透传 dsh 客户端标识（K1 防屏蔽）
+ * clientProfile='codex' → Codex 完全仿真（不留任何客户端透传痕迹）
+ * clientProfile='claude' 或仅 clientUA → Claude Code 完全仿真（UA 可被 clientUA 覆盖）
+ * 两者皆空             → 透传 dsh 客户端标识（K1 防屏蔽）
  * anthropic=true    → Anthropic 协议模式（T5）：x-api-key 替代 Bearer + anthropic-version
  */
-function upstreamRequestHeaders(reqHeaders, apiKey, clientUA, anthropic) {
+function upstreamRequestHeaders(reqHeaders, apiKey, clientUA, anthropic, clientProfile) {
   const out = {};
   const skip = new Set([
     'authorization', 'host', 'content-length', 'connection',
@@ -301,10 +310,14 @@ function upstreamRequestHeaders(reqHeaders, apiKey, clientUA, anthropic) {
     'cookie', 'origin', 'referer',
   ]);
 
-  if (clientUA) {
-    // 完全仿真模式：与 Claude Code 客户端一致，不透传任何 dsh 头
+  if (clientProfile === 'codex') {
+    // Codex 完全仿真（V2）：不透传任何 dsh 头
+    Object.assign(out, codexClientHeaders());
+    if (clientUA) out['user-agent'] = clientUA;   // 允许用户覆盖具体 UA 值
+  } else if (clientProfile === 'claude' || (!clientProfile && clientUA)) {
+    // Claude Code 完全仿真（兼容旧配置：仅 clientUA 时按 Claude 仿真）
     Object.assign(out, claudeClientHeaders());
-    out['user-agent'] = clientUA;   // 允许用户覆盖具体 UA 值
+    if (clientUA) out['user-agent'] = clientUA;   // 允许用户覆盖具体 UA 值
   } else {
     // 透传模式：保留 dsh 客户端标识
     for (const [k, v] of Object.entries(reqHeaders || {})) {
@@ -335,8 +348,8 @@ function upstreamRequestHeaders(reqHeaders, apiKey, clientUA, anthropic) {
  * 仅替换鉴权头与必要的协议头，其余原样转发——让上游看到的就是"dsh 直连"。
  * 扩展（P3/Q1）：配置了 clientUA 时完全仿真 Claude Code，不透传任何 dsh 特征。
  */
-function passthroughHeaders(reqHeaders, apiKey, clientUA) {
-  return upstreamRequestHeaders(reqHeaders, apiKey, clientUA);
+function passthroughHeaders(reqHeaders, apiKey, clientUA, clientProfile) {
+  return upstreamRequestHeaders(reqHeaders, apiKey, clientUA, false, clientProfile);
 }
 
 /** Forward to one provider; returns true when the response was written. */
@@ -442,7 +455,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
   //    并行探测各供应商目录，避免串行等待放大首请求延迟（E3）
   const withCatalog = [];
   const unknown = [];
-  const catalogResults = await Promise.all(candidates.map((p) => fetchCatalog(p, false, cfg.clientUA)));
+  const catalogResults = await Promise.all(candidates.map((p) => fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)));
   candidates.forEach((p, i) => {
     const set = catalogResults[i];
     if (set === null) { unknown.push(p); return; }
@@ -469,8 +482,8 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
   }
   for (const p of tryOrder) {
     log(`try ${p.id} for ${model}`);
-    // 透传 dsh 原始请求标识（K1 防屏蔽）：clientHeaders = req.headers
-    const ok = await forward(p, upstreamPath.replace(/^\/v1/, ''), passthroughHeaders(req.headers, p.apiKey, cfg.clientUA), body, res);
+    // 透传 dsh 原始请求标识（K1 防屏蔽）/ 仿真模式（V2: clientProfile）：clientHeaders = req.headers
+    const ok = await forward(p, upstreamPath.replace(/^\/v1/, ''), passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, cfg.clientProfile), body, res);
     if (ok) {
       log(`served ${model} via ${p.id}`);
       logCall(`via=${p.id}`, 'ok');
@@ -512,7 +525,7 @@ async function handleMessages(cfg, req, res, body) {
 
   const withCatalog = [];
   const unknown = [];
-  const catalogResults = await Promise.all(candidates.map((p) => fetchCatalog(p, false, cfg.clientUA)));
+  const catalogResults = await Promise.all(candidates.map((p) => fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)));
   candidates.forEach((p, i) => {
     const set = catalogResults[i];
     if (set === null) { unknown.push(p); return; }
@@ -537,7 +550,7 @@ async function handleMessages(cfg, req, res, body) {
 
   for (const p of tryOrder) {
     log(`try ${p.id} for ${model} (anthropic)`);
-    const ok = await forward(p, '/messages', upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, true), outBody, res);
+    const ok = await forward(p, '/messages', upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, true, cfg.clientProfile), outBody, res);
     if (ok) {
       log(`served ${model} via ${p.id} (anthropic)`);
       logCall(`via=${p.id}`, 'ok');
@@ -552,7 +565,7 @@ async function handleModels(cfg, req, res) {
   const byId = new Map();
   const rows = [];
   const results = await Promise.all(
-    providersForModel(cfg).map((p) => fetchCatalog(p, false, cfg.clientUA)),
+    providersForModel(cfg).map((p) => fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)),
   );
   for (const p of providersForModel(cfg)) {
     const entry = catalogCache.get(p.id);
