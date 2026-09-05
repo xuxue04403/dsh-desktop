@@ -1,24 +1,19 @@
-// tray.js — 系统托盘：图标由 src/icon.js 程序化生成（品牌蓝 + 状态变色），无外部资源依赖
+// tray.js — 系统托盘：图标与 DSH-App.exe 内嵌图标完全一致（官方 electron-icon.ico，
+// 从 electron.exe 资源提取，见 scripts/extract-exe-icon.mjs）。服务状态通过 tooltip 与菜单体现。
 'use strict';
 
+const path = require('path');
 const { Tray, Menu, nativeImage } = require('electron');
-const { iconDataURL, COLORS } = require('./icon');
 
-// 按状态取主色；未识别状态用品牌蓝
-function colorFor(service) {
-  switch (service) {
-    case 'starting': return COLORS.starting;
-    case 'ready': return COLORS.ready;
-    case 'failed': return COLORS.failed;
-    case 'safe': return COLORS.safe;
-    default: return COLORS.stopped;
-  }
-}
-
-function trayImage(size, service) {
+function trayImage() {
   try {
-    const c = colorFor(service);
-    return nativeImage.createFromDataURL(iconDataURL(size, c));
+    const ico = path.join(__dirname, 'assets', 'electron-icon.ico');
+    const img = nativeImage.createFromPath(ico);
+    if (!img.isEmpty()) return img;
+    // 兜底：parser 未能提取时降级到进程自身图标不可行（exe 图标在文件资源中），
+    // 用 256 PNG 缩放为托盘常驻尺寸
+    const png = nativeImage.createFromPath(path.join(__dirname, 'assets', 'electron-icon.png'));
+    return png.isEmpty() ? nativeImage.createEmpty() : png.resize({ width: 16, height: 16 });
   } catch (_) {
     return nativeImage.createEmpty();
   }
@@ -37,7 +32,7 @@ class TrayController {
   }
 
   create() {
-    this.tray = new Tray(trayImage(16, 'stopped'));
+    this.tray = new Tray(trayImage());
     this.tray.setToolTip('DSH App');
 
     const menu = Menu.buildFromTemplate([
@@ -65,13 +60,9 @@ class TrayController {
     } catch (_) { /* 部分平台不支持气泡 */ }
   }
 
-  // 状态变更时刷新 tooltip 与图标颜色（灰=停止 黄=启动中 绿=就绪 红=失败 橙=安全）
+  // 状态变更时刷新 tooltip（图标恒为官方 electron 图标，与主程序 exe 一致）
   refresh(state) {
     if (!this.tray) return;
-    const svc = (state && state.service) || 'stopped';
-    try {
-      this.tray.setImage(trayImage(16, svc));
-    } catch (_) { /* 忽略 */ }
     this.tray.setToolTip(
       'DSH App · ' + labelOf(state) + (state.safeMode ? '（安全模式）' : '')
     );
