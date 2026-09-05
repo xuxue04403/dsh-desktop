@@ -1,0 +1,54 @@
+{
+  "name": "dsh-app",
+  "productName": "DSH App",
+  "version": "1.5.0",
+  "description": "自研 DSH 桌面壳：参考 anywhere-labs/dsh-desktop 架构的轻量 Electron 实现（进程外启动 dsh web，窗口/托盘/看门狗/安全模式）",
+  "main": "src/main.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "test": "node tests/unit.js && node tests/integration.js",
+    "check": "node --check src/main.js && node --check src/launcher.js && node --check src/watchdog.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis portable",
+    "dist:mirror": "node scripts/dist.mirror.mjs",
+    "portable": "electron-builder --win portable",
+    "portable:mirror": "node scripts/portable.mirror.mjs",
+    "portable:manual": "node scripts/build-portable.mjs",
+    "seticon": "node scripts/set-exe-icon.cjs"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8",
+    "rcedit": "^5.0.1"
+  },
+  "build": {
+    "appId": "local.dshapp",
+    "productName": "DSH App",
+    "files": [
+      "src/**/*",
+      "renderer/**/*",
+      "assets/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "assets/icon.ico",
+      "artifactName": "DSHApp-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "DSHApp-${version}-便携版.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "directories": {
+      "output": "dist"
+    }
+  }
+}
