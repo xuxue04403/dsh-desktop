@@ -17,13 +17,15 @@ const { Watchdog } = require('./watchdog');
 const { TrayController } = require('./tray');
 const updater = require('./updater');
 const { GatewayManager } = require('./gateway-manager');
-const { iconDataURL, COLORS } = require('./icon');
+const { resolveDataDir } = require('./datadir');
 
-// 窗口/任务栏图标（程序化生成，见 icon.js）
+// 窗口/任务栏图标：与 DSH-App.exe 内嵌图标一致（从 electron.exe 官方资源提取的
+// electron-icon.png，详见 scripts/extract-exe-icon.mjs；createFromPath 支持 asar 内读取）
 const WINDOW_ICON = (() => {
   try {
     const { nativeImage } = require('electron');
-    return nativeImage.createFromDataURL(iconDataURL(32, COLORS.brand));
+    const img = nativeImage.createFromPath(path.join(__dirname, 'assets', 'electron-icon.png'));
+    return img.isEmpty() ? undefined : img;
   } catch (_) {
     return undefined;
   }
@@ -92,15 +94,29 @@ function createMainWindow() {
   // 状态变更推送到页面
   state.on('changed', () => broadcast());
 
+  // 窗口标题固定为「DSH」：内嵌 dsh web 页面会把自己的 <title>（会话标题 — DeepSeek
+  // Harness）同步到窗口标题栏，这里接管并阻止，避免显示"DSH桌面版开发评估 — DeepSeek Harness"
+  const appTitle = 'DSH';
+  mainWindow.on('page-title-updated', (e) => {
+    e.preventDefault();
+    mainWindow.setTitle(appTitle);
+  });
+  mainWindow.on('ready-to-show', () => mainWindow.setTitle(appTitle));
+
   // 在 dsh web 页面注入壳级能力：悬浮入口 + 输入框上下键历史
   mainWindow.webContents.on('did-finish-load', () => {
     let url = '';
     try { url = mainWindow.webContents.getURL(); } catch (_) { /* 忽略 */ }
-    if (url.indexOf('127.0.0.1:' + state.port) === 0) {
+    // URL 形如 http://127.0.0.1:<port>/?token=...（indexOf 定位端口，不能用 ===0，
+    // http:// 前缀使 indexOf 必不为 0）
+    if (url.indexOf('127.0.0.1:' + state.port) >= 0) {
+      mainWindow.setTitle(appTitle);
       mainWindow.webContents.executeJavaScript(FLOAT_BUTTONS_JS).catch(() => { /* 忽略 */ });
-      mainWindow.webContents.executeJavaScript(INPUT_HISTORY_JS).catch(() => { /* 忽略 */ });
     }
   });
+  // 输入框上下键历史：主进程 before-input-event 拦截（不依赖页面注入时机），
+  // 历史保存在本会话（按端口+路径隔离），读写输入框经 executeJavaScript。
+  wireInputHistory(mainWindow, () => state.port);
 }
 
 // 注入到 dsh web 页面的两个悬浮入口（右上角，透明风格；点击打开壳设置窗并定位到对应卡片）
@@ -110,9 +126,7 @@ const FLOAT_BUTTONS_JS = [
   'var d=document.createElement("div");d.id="__dshapp_float";',
   'd.style.cssText="position:fixed;top:10px;right:34px;z-index:2147483647;display:flex;gap:8px;";',
   'function mk(txt,act){var b=document.createElement("button");b.textContent=txt;',
-  'b.style.cssText="border:1px solid rgba(120,140,170,.45);background:rgba(24,30,40,.62);color:#cdd6e4;',
-  'border-radius:14px;padding:4px 12px;font:12px \\"Segoe UI\\",\\"Microsoft YaHei UI\\",sans-serif;cursor:pointer;',
-  'backdrop-filter:blur(4px);";',
+  'b.style.cssText=\'border:1px solid rgba(120,140,170,.45);background:rgba(24,30,40,.62);color:#cdd6e4;border-radius:14px;padding:4px 12px;font:12px "Segoe UI","Microsoft YaHei UI",sans-serif;cursor:pointer;backdrop-filter:blur(4px);\';',
   'b.onmouseenter=function(){b.style.background="rgba(40,52,70,.82)";};',
   'b.onmouseleave=function(){b.style.background="rgba(24,30,40,.62)";};',
   'b.onclick=function(){try{if(window.dshApp&&window.dshApp.action)window.dshApp.action(act);}catch(e){}};',
@@ -123,71 +137,190 @@ const FLOAT_BUTTONS_JS = [
   '})();',
 ].join('\n');
 
-// 注入到 dsh 对话输入框的"上下键历史"：
-//   ↑ 在行首/空框时回溯本会话已发送的输入；↓ 前进；Enter（发送）后自动入列。
-//   - 按会话（URL）分别存储于 localStorage，最多 200 条；
-//   - 仅拦截 ↑/↓ 快捷键，不影响 dsh 自身的 Enter 发送/换行逻辑；
-//   - 找不到输入框（布局变化）时静默跳过，跨版本容错。
-const INPUT_HISTORY_JS = [
+// —— 输入框上下键历史（主进程实现）——
+//
+// 原理：Electron 窗口级 before-input-event 在主进程拦截按键，**不依赖页面注入时机**，
+// 对 dsh 的 Lexical contenteditable / textarea 统一生效。历史按会话（port+路径）存于
+// 主进程内存（≤200 条）；读写输入框值经 executeJavaScript 调用页面内辅助函数：
+//   window.__dshAppIhGet() -> { val, atTop }（当前值 + 光标是否在文首）
+//   window.__dshAppIhSet(v)  -> 写回输入框（contenteditable 用 insertText 触发编辑器）
+// 页面辅助函数由 did-finish-load 的注入提供；若注入未到，按键处理仍然安全跳过。
+const IH_KEYS = Object.freeze(['ArrowUp', 'ArrowDown', 'Enter']);
+const IH_MAX = 200;
+
+// 页面内辅助函数（通过 executeJavaScript 注入到 dsh web 页面）
+// 除 get/set 外，还维护一个"当前输入框状态缓存"（keyup/input/mouseup 时刷新），
+// 供主进程 before-input-event **同步**决策（异步查询赶不上按键派发）。
+const INPUT_HELPER_JS = [
   '(function(){',
-  'if (document.getElementById("__dshapp_ih")) return;',
-  'var LS="__dshapp_ih";',
-  'var key=LS+":"+(location.pathname+location.search+location.hash);',
-  'var hist=[];try{hist=JSON.parse(localStorage.getItem(key)||"[]")}catch(e){}',
-  'if(!Array.isArray(hist))hist=[];',
-  'var idx=hist.length,active=false,draft="";',
-  'function inputEl(){',
-  '  var els=document.querySelectorAll("textarea,[contenteditable=\\"true\\"]");',
-  '  var best=null;',
-  '  for(var i=0;i<els.length;i++){var el=els[i];',
-  '    try{var r=el.getBoundingClientRect();',
-  '    if(r.width>60&&r.height>12&&el.offsetParent!==null){best=el;}}catch(e){}}',
-  '  return best;',
+  'if (window.__dshAppIhInstalled) return;',
+  'window.__dshAppIhInstalled=true;',
+  'window.__dshAppIhCache={val:"",atTop:true,tag:""};',
+  // 查找输入框：聚焦元素 > dsh 会话输入框 > textarea
+  'function el(){',
+  '  var a=document.activeElement;',
+  '  if(a&&a!==document.body&&isIn(a))return a;',
+  '  var c=document.querySelector("[data-composer-input]");',
+  '  if(c&&isIn(c))return c;',
+  '  var t=document.querySelector("textarea");',
+  '  if(t&&isIn(t))return t;',
+  '  return null;',
   '}',
-  'function curVal(el){return el.tagName==="TEXTAREA"?el.value:(el.textContent||"");}',
-  'function setVal(el,v){',
-  '  if(el.tagName==="TEXTAREA"){el.value=v;}else{el.textContent=v;}',
-  '  try{el.dispatchEvent(new Event("input",{bubbles:true}));}catch(e){}',
+  'function isIn(n){',
+  '  if(!n)return false;',
+  '  if(n.tagName==="TEXTAREA")return true;',
+  '  if(n.isContentEditable)return true;',
+  '  if(n.tagName==="INPUT"&&/^(text|search)$/.test(n.type||""))return true;',
+  '  return false;',
   '}',
-  'function atTop(el){',
-  '  if(el.tagName==="TEXTAREA"){return el.selectionStart===0;}',
+  'function valOf(n){return n.tagName==="TEXTAREA"||n.tagName==="INPUT"?n.value:(n.textContent||"");}',
+  'function atTopOf(n){',
+  '  if(n.tagName==="TEXTAREA"||n.tagName==="INPUT")return (n.selectionStart||0)===0;',
+  '  try{var s=window.getSelection();',
+  '    if(s&&s.rangeCount){var r=s.getRangeAt(0),p=document.createRange();',
+  '      p.selectNodeContents(n);p.setEnd(r.startContainer,r.startOffset);return p.toString().length===0;}}catch(e){}',
   '  return true;',
   '}',
-  'function handle(el,e){',
-  '  if(e.key==="ArrowUp"&&(atTop(el)||curVal(el)==="")){',
-  '    if(hist.length===0)return;',
-  '    if(!active){draft=curVal(el);idx=hist.length;active=true;}',
-  '    if(idx>0){idx--;setVal(el,hist[idx]);e.preventDefault();}',
-  '    return;',
-  '  }',
-  '  if(e.key==="ArrowDown"&&active){',
-  '    if(idx<hist.length-1){idx++;setVal(el,hist[idx]);}',
-  '    else{idx=hist.length;setVal(el,draft);draft="";active=false;}',
-  '    e.preventDefault();',
-  '    return;',
-  '  }',
-  '  if(e.key==="Enter"&&!e.shiftKey&&!e.ctrlKey&&!e.metaKey){',
-  '    var v=curVal(el);',
-  '    if(v&&v!==hist[hist.length-1]){',
-  '      hist.push(v);',
-  '      if(hist.length>200)hist=hist.slice(-200);',
-  '      try{localStorage.setItem(key,JSON.stringify(hist));}catch(err){}',
+  'function refresh(){',
+  '  var n=el();',
+  '  window.__dshAppIhCache=n?{val:valOf(n),atTop:atTopOf(n),tag:n.tagName}:null;',
+  '}',
+  'window.__dshAppIhGet=function(){refresh();return window.__dshAppIhCache;};',
+  'window.__dshAppIhSet=function(v){',
+  '  var n=el();',
+  '  if(!n)return false;',
+  '  try{',
+  '    if(n.tagName==="TEXTAREA"||n.tagName==="INPUT"){',
+  '      n.value=v;',
+  '      try{n.dispatchEvent(new Event("input",{bubbles:true}));}catch(e){}',
+  '    }else{',
+  '      n.focus();',
+  '      var s=window.getSelection();',
+  '      if(s&&s.rangeCount){s.removeAllRanges();var r=document.createRange();r.selectNodeContents(n);s.addRange(r);}',
+  '      document.execCommand("insertText",false,v);',
   '    }',
-  '    idx=hist.length;active=false;draft="";',
-  '  }',
-  '}',
-  'var bound=null;',
-  'function tick(){',
-  '  var el=inputEl();',
-  '  if(el&&el!==bound){',
-  '    if(bound)bound.removeEventListener("keydown",handle);',
-  '    bound=el;el.addEventListener("keydown",handle);',
-  '  }',
-  '}',
-  'setInterval(tick,800);tick();',
-  'document.addEventListener("visibilitychange",tick);',
+  '    if(typeof n.focus==="function")n.focus();',
+  '    refresh();',
+  '    return true;',
+  '  }catch(e){ return false; }',
+  '};',
+  // 定期与事件刷新缓存（主进程同步决策用）
+  'document.addEventListener("input",refresh,true);',
+  'document.addEventListener("keyup",refresh,true);',
+  'document.addEventListener("mouseup",refresh,true);',
+  'setInterval(refresh,800);',
   '})();',
 ].join('\n');
+
+function wireInputHistory(win, getPort) {
+  // 每会话历史：key = por t + 页面路径
+  const histories = new Map();   // key -> string[]
+  const drafts = new Map();      // key -> { idx, active, draft }（↑ 回溯状态）
+  let keyFor = '';
+
+  async function sessionKey() {
+    try {
+      const url = win.webContents.getURL();
+      const port = typeof getPort === 'function' ? getPort() : 3080;
+      // 取 pathname+search+hash，隔离不同会话页
+      const m = url.indexOf('127.0.0.1:' + port);
+      const pathPart = m >= 0 ? url.slice(m + ('127.0.0.1:' + port).length) : url;
+      return port + '|' + pathPart;
+    } catch (_) { return 'default'; }
+  }
+
+  // 注入页面辅助函数（幂等；did-finish-load 与按键前都尝试）
+  async function ensureHelper() {
+    try {
+      await win.webContents.executeJavaScript(INPUT_HELPER_JS);
+    } catch (_) { /* 页面未就绪时跳过 */ }
+  }
+
+  async function getInputState() {
+    try {
+      const r = await win.webContents.executeJavaScript(
+        'window.__dshAppIhGet ? window.__dshAppIhGet() : null'
+      );
+      return r && typeof r === 'object' ? r : null;
+    } catch (_) { return null; }
+  }
+
+  // 同步读取页面缓存的输入框状态（决策用，避免异步赶不上按键派发）
+  async function peekInputState() {
+    try {
+      const r = await win.webContents.executeJavaScript(
+        'window.__dshAppIhCache ? window.__dshAppIhCache : null'
+      );
+      return r && typeof r === 'object' ? r : null;
+    } catch (_) { return null; }
+  }
+
+  async function setInput(val) {
+    try {
+      await win.webContents.executeJavaScript(
+        'window.__dshAppIhSet ? window.__dshAppIhSet(' + JSON.stringify(val) + ') : false'
+      );
+    } catch (_) { /* 忽略 */ }
+  }
+
+  const onBeforeInput = async (event, input) => {
+    // 快捷键带修饰符时不拦截（保留 dsh 自己的 Ctrl/Cmd 组合）
+    if (input.control || input.meta || input.alt) return;
+    if (input.type !== 'keyDown') return;
+    if (IH_KEYS.indexOf(input.key) < 0) return;
+
+    keyFor = await sessionKey();
+    let hist = histories.get(keyFor);
+    if (!hist) { hist = []; histories.set(keyFor, hist); }
+    let st = drafts.get(keyFor);
+    if (!st) { st = { idx: hist.length, active: false, draft: '' }; drafts.set(keyFor, st); }
+
+    if (input.key === 'ArrowUp') {
+      const stateNow = await peekInputState();
+      if (!stateNow) return;                    // 不在输入框
+      if (!(stateNow.atTop || stateNow.val === '')) return;  // 非文首/空 → 交还 dsh
+      if (hist.length === 0) return;
+      if (!st.active) { st.draft = stateNow.val; st.idx = hist.length; st.active = true; }
+      if (st.idx > 0) {
+        st.idx--;
+        event.preventDefault();
+        setInput(hist[st.idx]);   // 异步写回（不回退整个按键派发）
+      }
+      return;
+    }
+
+    if (input.key === 'ArrowDown') {
+      if (!st.active) return;
+      event.preventDefault();
+      if (st.idx < hist.length - 1) {
+        st.idx++;
+        setInput(hist[st.idx]);
+      } else {
+        st.idx = hist.length;
+        setInput(st.draft);
+        st.draft = '';
+        st.active = false;
+      }
+      return;
+    }
+
+    if (input.key === 'Enter' && !input.shift && !input.control && !input.meta) {
+      const stateNow = await peekInputState();
+      if (!stateNow) return;
+      const v = stateNow.val;
+      if (v && v !== hist[hist.length - 1]) {
+        hist.push(v);
+        if (hist.length > IH_MAX) hist.splice(0, hist.length - IH_MAX);
+      }
+      st.idx = hist.length; st.active = false; st.draft = '';
+      return;   // 不拦截 Enter，交给 dsh 发送
+    }
+  };
+
+  win.webContents.on('before-input-event', onBeforeInput);
+  win.webContents.on('did-finish-load', () => { ensureHelper(); });
+  ensureHelper();
+}
 
 function createSettingsWindow(section) {
   if (settingsWindow) {
@@ -196,9 +329,11 @@ function createSettingsWindow(section) {
     return;
   }
   settingsWindow = new BrowserWindow({
-    width: 720,
-    height: 640,
-    resizable: false,
+    width: 1000,
+    height: 720,
+    minWidth: 920,
+    minHeight: 640,
+    resizable: true,
     parent: mainWindow,
     modal: false,
     backgroundColor: '#10141b',
@@ -445,7 +580,8 @@ async function bootstrap() {
     if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
   });
 
-  const userData = app.getPath('userData');
+  // 数据目录：exe 旁 data\ 优先（绿色便携，随程序目录走）；不可写才回退 %APPDATA%
+  const userData = resolveDataDir();
   logger.init(userData);
   settings = new Settings(userData);
   settings.load();
