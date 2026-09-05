@@ -54,29 +54,74 @@ function pngFromPixels(w, h, rgba) {
   return Buffer.concat([PNG_SIG, chunk('IHDR', ihdr), chunk('IDAT', idat), chunk('IEND', Buffer.alloc(0))]);
 }
 
-// 渲染品牌徽标：圆角方块（主色）+ 中心白色圆点，外围透明
+// 渲染图标：深色圆底 + 白色原子轨道（与 Electron 官方 exe 图标同一风格）。
+// 底色 = rgb（服务状态色：运行时托盘随状态变色；白色轨道/中心点不变）。
 function renderIcon(size, rgb) {
   const w = size, h = size;
   const rgba = new Uint8Array(w * h * 4);
   const r = rgb[0], g = rgb[1], b = rgb[2];
-  const corner = Math.max(1, Math.round(size * 0.22));      // 圆角半径
-  const dotR = Math.max(1, size * 0.2);                     // 中心白点半径
   const cx = (w - 1) / 2, cy = (h - 1) / 2;
+  const RR = w / 2 - Math.max(1, size * 0.02);       // 圆底半径（留 1px 抗锯齿余量）
+
+  // 三条椭圆轨道（±35° / 水平）
+  const a = w * 0.40, bb = w * 0.17;
+  const tracks = [];
+  for (const th of [-0.6, 0, 0.6]) {
+    const cos = Math.cos(th), sin = Math.sin(th);
+    const pts = [];
+    for (let k = 0; k <= 180; k++) {
+      const t = (Math.PI * 2 * k) / 180;
+      const x0 = a * Math.cos(t), y0 = bb * Math.sin(t);
+      pts.push([cx + x0 * cos - y0 * sin, cy + x0 * sin + y0 * cos]);
+    }
+    tracks.push(pts);
+  }
+  // 轨道长轴两端的空心环点
+  const dots = [];
+  for (const th of [-0.6, 0, 0.6]) {
+    const cos = Math.cos(th), sin = Math.sin(th);
+    dots.push([cx + a * 0.86 * cos, cy + a * 0.86 * sin]);
+    dots.push([cx - a * 0.86 * cos, cy - a * 0.86 * sin]);
+  }
+
+  const lineW2 = Math.max(1, size * 0.052) / 2;       // 轨道线宽/2
+  const ringIn2 = Math.pow(size * 0.03, 2);           // 环点内径²
+  const ringOut2 = Math.pow(size * 0.105, 2);         // 环点外径²
+  const centerR2 = Math.pow(Math.max(1, size * 0.075), 2);
+
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const i = (y * w + x) * 4;
-      // 圆角矩形判定
-      const inRect =
-        x >= corner && x < w - corner ? true :
-        y >= corner && y < h - corner ? true :
-        Math.hypot(x - (x < corner ? corner : w - 1 - corner), y - (y < corner ? corner : h - 1 - corner)) <= corner;
-      if (!inRect) { rgba[i + 3] = 0; continue; }
-      rgba[i] = r; rgba[i + 1] = g; rgba[i + 2] = b; rgba[i + 3] = 255;
-      // 中心白点
       const dx = x - cx, dy = y - cy;
-      if (dx * dx + dy * dy <= dotR * dotR) {
-        rgba[i] = 255; rgba[i + 1] = 255; rgba[i + 2] = 255;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > RR * RR) { rgba[i + 3] = 0; continue; }   // 圆外透明
+      rgba[i] = r; rgba[i + 1] = g; rgba[i + 2] = b; rgba[i + 3] = 255;
+
+      let white = d2 <= centerR2;
+      // 轨道（采样点最近距离判定，先粗筛再精算）
+      if (!white) {
+        for (const pts of tracks) {
+          if (Math.abs(x - cx) > a + Math.max(1, size * 0.06) && Math.abs(y - cy) > a + Math.max(1, size * 0.06)) continue;
+          let best = Infinity;
+          for (const p of pts) {
+            const ddx = x - p[0], ddy = y - p[1];
+            const dd = ddx * ddx + ddy * ddy;
+            if (dd < best) best = dd;
+            if (best <= lineW2 * lineW2) break;
+          }
+          if (best <= lineW2 * lineW2) { white = true; break; }
+        }
       }
+      // 空心环点（轨道端点）
+      if (!white) {
+        for (const dot of dots) {
+          const ddx = x - dot[0], ddy = y - dot[1];
+          const dd = ddx * ddx + ddy * ddy;
+          if (dd >= ringIn2 && dd <= ringOut2) { white = true; break; }
+        }
+      }
+
+      if (white) { rgba[i] = 255; rgba[i + 1] = 255; rgba[i + 2] = 255; }
     }
   }
   return { buffer: Buffer.from(rgba.buffer), width: w, height: h };
