@@ -1,7 +1,7 @@
 {
   "name": "dsh-app",
   "productName": "DSH App",
-  "version": "1.5.0",
+  "version": "1.5.5",
   "description": "自研 DSH 桌面壳：参考 anywhere-labs/dsh-desktop 架构的轻量 Electron 实现（进程外启动 dsh web，窗口/托盘/看门狗/安全模式）",
   "main": "src/main.js",
   "private": true,
@@ -37,7 +37,6 @@
         "nsis",
         "portable"
       ],
-      "icon": "assets/icon.ico",
       "artifactName": "DSHApp-${version}-${arch}.${ext}"
     },
     "portable": {
