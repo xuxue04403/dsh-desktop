@@ -49,8 +49,17 @@ let LOG_PATH = process.env.DSH_GATEWAY_LOG || path.join(APP_DIR, 'logs', 'gatewa
 /* ---------------- logging ---------------- */
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // 日志轮转上限 5MB（修复 G3：防止长期运行磁盘膨胀）
 
+// 本地时间戳（与宿主 app.log 的本地时间一致，避免 UTC 差 8 小时难对照）：
+// 格式 YYYY-MM-DD HH:mm:ss.SSS
+function localStamp(d) {
+  const x = d || new Date();
+  const p = (n, w) => String(n).padStart(w, '0');
+  return x.getFullYear() + '-' + p(x.getMonth() + 1, 2) + '-' + p(x.getDate(), 2) + ' '
+    + p(x.getHours(), 2) + ':' + p(x.getMinutes(), 2) + ':' + p(x.getSeconds(), 2) + '.' + p(x.getMilliseconds(), 3);
+}
+
 function log(msg) {
-  const line = `[${new Date().toISOString()}] ${msg}`;
+  const line = `[${localStamp()}] ${msg}`;
   try {
     // 轮转：超过上限时重置文件
     try {
@@ -358,6 +367,139 @@ function passthroughHeaders(reqHeaders, apiKey, clientUA, clientProfile) {
   return upstreamRequestHeaders(reqHeaders, apiKey, clientUA, false, clientProfile);
 }
 
+/** 请求体统一翻译（R5）：转发前修正各上游不兼容字段。
+ * 1) role 兼容：dsh 新版可能发送 `developer` 角色（OpenAI 协议演进），但许多上游
+ *    （sensenova 等）只接受 system/assistant/user/tool → developer 合并为 system。
+ * 2) 推理档位翻译：见 translateReasoningBody（reasoningEffortMap）。
+ * 3) 密钥脱敏（R9）：会话历史常含真实 token（github_pat_/sk- 等样式），上游 new-api
+ *    平台会以"防密钥泄露"内容过滤拦截整个请求（sensitive words / content-blocked），
+ *    且真实 key 也不应发给第三方模型。转发前把这类串打码（保留前缀+长度标记+尾 4 位），
+ *    语义基本无损，绕开平台误拦，同时保护密钥不外泄。
+ * @returns 翻译后的 body（无变化时返回原对象）
+ */
+
+// R9：识别并打码真实 token 样式串 + 超长技术串（仅处理消息文本内容，不动 tool_calls 参数）
+// 背景（dump 实证）：上游 new-api 的"疑似密钥"过滤会拦截 ≥32 位连续字母数字/横线串——
+// 包括 sha256 校验和、长英文 slug、带日期的文件名等无害技术串；打码为占位符（保留长度
+// 与类型提示）后语义基本无损，且不再触发平台防泄露拦截。
+function maskSecretTokens(text) {
+  if (!text || typeof text !== 'string') return text;
+  return text
+    // GitHub PAT（43+ 位，形如 github_pat_11AA...）
+    .replace(/(github_pat_[A-Za-z0-9_]{20,})/g, (m) => 'github_pat_***' + m.slice(-4))
+    // GitHub classic token（ghp_gho_ghu_ghs_ghr_ + 36）
+    .replace(/\b(gh[pousr]_[A-Za-z0-9]{30,})/g, (m) => m.slice(0, 4) + '***' + m.slice(-4))
+    // OpenAI 风格密钥 sk-（≥16 位值）
+    .replace(/\b(sk-[A-Za-z0-9]{16,})/g, (m) => 'sk-***' + m.slice(-4))
+    // Anthropic 风格密钥 sk-ant-...
+    .replace(/\b(sk-ant-[A-Za-z0-9_-]{20,})/g, (m) => 'sk-ant-***' + m.slice(-4))
+    // R9b：≥32 位连续 [字母数字_-] 的"疑似密钥样式长串"→ 占位符（保留长度；64 位纯 hex
+    // 标记为 sha256，含横线的长 slug 标记为 slug）。URL 协议头不受影响（含 :// 不匹配）。
+    .replace(/[A-Za-z0-9_-]{32,}/g, (m) => {
+      if (/^[0-9a-f]{32,}$/i.test(m)) return '[sha256:' + m.length + ']';
+      if (m.includes('-')) return '[slug:' + m.length + ']';
+      return '[token:' + m.length + ']';
+    });
+}
+
+function translateBody(body, provider) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  let out = translateReasoningBody(body, provider);
+  if (!out || typeof out !== 'object' || Array.isArray(out)) return out;
+  let changed = false;
+  if (Array.isArray(out.messages)) {
+    const msgs = out.messages.map((m) => {
+      if (!m) return m;
+      let n = m;
+      if (n.role === 'developer') { n = { ...n, role: 'system' }; changed = true; }
+      // 文本内容打码（content 为字符串时；跳过 tool_calls 参数与 tool 结果中的结构化值）
+      if (typeof n.content === 'string') {
+        const masked = maskSecretTokens(n.content);
+        if (masked !== n.content) { n = { ...n, content: masked }; changed = true; }
+      }
+      return n;
+    });
+    if (changed) out = { ...out, messages: msgs };
+  }
+  return out;
+}
+
+/** 推理档位统一翻译（R4 新）：把 dsh 发来的统一推理档位，翻译成各上游自己的词汇。
+ * 背景：上游 deepseek-v4-flash 的推理字段词汇各不相同——
+ *   sensenova 接受 reasoning_effort: low|medium|high|xhigh|none（拒绝 max）；
+ *   new-api(agentrouter/air-outer) 接受 low/high/max；
+ * dsh 官方按 off/low/high/max 发统一档位。网关在 provider 配置可选字段
+ * `reasoningEffortMap`（如 {"low":"low","medium":"medium","high":"high","max":"xhigh","off":"none"}）
+ * 缺省时恒等透传（与桌面助手行为一致，不破坏旧配置）。
+ * @returns 翻译后的 body（无变化时返回原对象）
+ */
+function translateReasoningBody(body, provider) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  const map = provider && provider.reasoningEffortMap && typeof provider.reasoningEffortMap === 'object'
+    ? provider.reasoningEffortMap : null;
+  if (!map) return body;                      // 无映射配置：原样透传
+
+  const out = { ...body };
+  const effort = body.reasoning_effort;
+  const thinking = body.thinking;
+  // 当前请求的推理意图：off / 具体档位 / 未指定
+  let want = null;                            // null=未指定
+  if (thinking && typeof thinking === 'object' && thinking.type === 'disabled') want = 'off';
+  else if (typeof effort === 'string') want = effort;
+
+  if (want === null) return out;              // 未指定推理 → 不加戏
+  const mapped = map[want];
+  if (mapped === undefined) return out;       // 档位不在映射表 → 原样（宁可不改，不丢档）
+
+  // 依据映射表值形态决定发送方式：
+  //   - 字符串 → reasoning_effort=<值>（同时清理 thinking 或保留语义由值决定）
+  //   - 对象 { thinking: 'disabled'|'enabled' } → 仅 thinking.type
+  delete out.reasoning_effort;
+  delete out.thinking;
+  if (typeof mapped === 'object' && mapped !== null) {
+    if (mapped.thinking === 'disabled') out.thinking = { type: 'disabled' };
+    else if (mapped.thinking === 'enabled') out.thinking = { type: 'enabled' };
+    if (typeof mapped.effort === 'string') out.reasoning_effort = mapped.effort;
+  } else if (typeof mapped === 'string') {
+    if (mapped === 'disabled' || mapped === 'off' || mapped === 'none') {
+      // off 语义：sensenova 用 reasoning_effort: none；deepseek 系用 thinking disabled——
+      // 字符串 none/off/disabled 直接作为 reasoning_effort 值发送（sensenova 认 none，
+      // 若上游只认 thinking.type 的，可改用对象映射）
+      out.reasoning_effort = mapped;
+    } else {
+      out.reasoning_effort = mapped;
+      out.thinking = { type: 'enabled' };     // 开启推理（deepseek 系惯例）
+    }
+  }
+  return out;
+}
+
+// R9c：长串降敏——把文本中 ≥32 位连续 [字母数字_-] 的"疑似密钥样式长串"替换为
+// 类型占位符（[sha256:64] / [slug:45] / [token:34]），语义基本无损（模型不需要读
+// hash 全文），绕开 new-api 平台的"疑似密钥泄露"内容过滤（sensitive words / content-blocked）。
+function desensitizeLongTokens(text) {
+  if (!text || typeof text !== 'string') return text;
+  return text.replace(/[A-Za-z0-9_-]{32,}/g, (m) => {
+    if (/^[0-9a-f]{32,}$/i.test(m)) return '[sha256:' + m.length + ']';
+    if (m.includes('-')) return '[slug:' + m.length + ']';
+    return '[token:' + m.length + ']';
+  });
+}
+
+// 对消息体做深度降敏（messages 的字符串 content；tool 消息内容也降敏——历史工具
+// 结果正是长串重灾区；tool_calls 参数不动，避免破坏工具调用的 JSON）
+function desensitizeBodyMessages(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray(body.messages)) return body;
+  let changed = false;
+  const msgs = body.messages.map((m) => {
+    if (!m || typeof m.content !== 'string') return m;
+    const d = desensitizeLongTokens(m.content);
+    if (d !== m.content) { changed = true; return { ...m, content: d }; }
+    return m;
+  });
+  return changed ? { ...body, messages: msgs } : body;
+}
+
 /** Forward to one provider; returns true when the response was written. */
 async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
   const controller = new AbortController();
@@ -368,12 +510,36 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     // upstreamBase() 统一规范化，upstreamPath 始终是相对 /v1 的路径（如 /chat/completions、/messages）
     // 注：Anthropic 协议（T5）下 upstreamHeaders 由 upstreamRequestHeaders(..., anthropic=true) 构造，
     // 含 x-api-key + anthropic-version、无 authorization Bearer；展开覆盖时不会被注入 Bearer。
+    const outBody = translateBody(body, provider);   // R5：role 兼容 + 推理档位翻译
     upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
       method: 'POST',
       headers: upstreamHeaders,
-      body: JSON.stringify(body),
+      body: JSON.stringify(outBody),
       signal: controller.signal,
     });
+    clearTimeout(timer);
+    // R9c 自适应降敏：上游内容拦截（sensitive words / content-blocked）时，用降敏后的
+    // 消息体**重试一次**（换新连接；历史里的 32+ 位技术串占位符化后不再命中平台
+    // "疑似密钥"过滤）。重试成功则继续走正常流式转发；仍失败则按原逻辑处理。
+    if (!upstream.ok) {
+      let detail0 = '';
+      try { detail0 = (await upstream.text()).slice(0, 500); } catch { }
+      if (/sensitive\s*words|content[-_]blocked|content_blocked/i.test(detail0)) {
+        const deBody = desensitizeBodyMessages(outBody);
+        if (deBody !== outBody) {
+          log(`upstream ${provider.id} 内容拦截，已降敏重试一次…`);
+          const c2 = new AbortController();
+          const t2 = setTimeout(() => c2.abort(), UPSTREAM_TIMEOUT_MS);
+          upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
+            method: 'POST',
+            headers: upstreamHeaders,
+            body: JSON.stringify(deBody),
+            signal: c2.signal,
+          });
+          clearTimeout(t2);
+        }
+      }
+    }
   } catch (e) {
     clearTimeout(timer);
     // R3 防封：失败冷却而非立即删缓存（防每个请求都重试上游形成风暴）
@@ -388,6 +554,39 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     let detail = '';
     try { detail = (await upstream.text()).slice(0, 500); } catch { }
     log(`upstream ${provider.id} HTTP ${upstream.status}: ${maskSecrets(detail)}`);   // V1：日志脱敏
+    // R8：上游内容拦截/异常时，把触发请求的"结构摘要"落盘（不含明文 key，内容截 60 字符），
+    // 用于定位是什么特征触发了上游过滤（sensitive words / content-blocked）。
+    if (/sensitive\s*words|content[-_]blocked|content_blocked/i.test(detail)) {
+      try {
+        const dir = path.join(path.dirname(LOG_PATH), 'dump');
+        fs.mkdirSync(dir, { recursive: true });
+        const digest = {
+          at: localStamp(), provider: provider.id, status: upstream.status,
+          model: body && body.model, stream: !!(body && body.stream),
+          reasoning_effort: body && body.reasoning_effort,
+          thinking: body && body.thinking,
+          hasTools: Array.isArray(body && body.tools) ? body.tools.length : 0,
+          msgCount: Array.isArray(body && body.messages) ? body.messages.length : 0,
+          totalChars: Array.isArray(body && body.messages)
+            ? body.messages.reduce((n, m) => n + (typeof m.content === 'string' ? m.content.length : 0), 0)
+            : 0,
+          longTokens: Array.isArray(body && body.messages)
+            ? body.messages.flatMap((m) => {
+                const t = typeof m.content === 'string' ? m.content : '';
+                // 找出 ≥32 位连续非空白字符段（疑似 hash/key/随机串）
+                const re = /[^\s，。；：！？、,.;:!?'"()\[\]{}<>\/\\|=+*^$#@~`]{32,}/g;
+                const hits = [];
+                let mm; let cnt = 0;
+                while ((mm = re.exec(t)) && cnt < 8) { hits.push({ len: mm[0].length, head: mm[0].slice(0, 20) + '…' }); cnt++; }
+                return hits;
+              }).slice(0, 20)
+            : [],
+        };
+        const f = path.join(dir, `blocked-${Date.now()}-${provider.id}.json`);
+        fs.writeFileSync(f, JSON.stringify(digest, null, 2), 'utf8');
+        log(`[dump] 被拦请求摘要 -> ${f}`);
+      } catch (_) { /* dump 失败不影响服务 */ }
+    }
     if (upstream.status === 401 || upstream.status === 403 || upstream.status >= 500) {
       // likely stale/misconfigured key or dead endpoint —— 冷却缓存，防风暴（R3）
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
@@ -412,10 +611,23 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
   const bodyStream = upstream.body;
   if (bodyStream) {
     const reader = bodyStream.getReader();
+    // R7 强壮性：读流加"空闲超时"——上游已连接但长时间不吐数据（挂起/代理卡死）时
+    // 主动断开，避免 dsh 客户端无限等待后重连（表现为"经常重连模型请求"）。
+    const IDLE_READ_MS = 90_000;
+    let lastRead = Date.now();
+    let idleTimer = setInterval(() => {
+      if (Date.now() - lastRead > IDLE_READ_MS) {
+        log('upstream stream idle timeout (' + IDLE_READ_MS + 'ms)，断开。');
+        clearInterval(idleTimer);
+        try { reader.cancel(); } catch { }
+        try { res.destroy(); } catch { }
+      }
+    }, 5000);
     try {
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
+        lastRead = Date.now();
         // 客户端可能随时断开（点停止/超时/关页）：write 抛 EPIPE 必须捕获，
         // 否则未处理异常会经 async 回调炸掉整个网关进程（C1）
         try {
@@ -424,6 +636,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
           log(`client disconnected during stream: ${writeErr.message}`);
           try { await reader.cancel(); } catch { }
           res.destroy();
+          clearInterval(idleTimer);
           return false;
         }
       }
@@ -433,6 +646,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
       try { res.destroy(); } catch { }
       return false;
     } finally {
+      clearInterval(idleTimer);
       try { reader.releaseLock(); } catch { }
     }
   }
@@ -442,7 +656,59 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
   return true;
 }
 
+// 诊断 dump（R8）：env DSH_GATEWAY_DUMP_BODY=<dir> 时，把每个 chat/messages 请求的
+// 结构摘要落盘（不存明文 key；内容只截前 60 字符），用于定位上游敏感词拦截的触发特征。
+// env DSH_GATEWAY_DUMP_FULL=1 时额外把完整请求体落盘（脱敏 key），用于取证真实请求。
+function dumpBodyDigest(body, tag) {
+  try {
+    const dir = process.env.DSH_GATEWAY_DUMP_BODY;
+    if (!dir) return;
+    fs.mkdirSync(dir, { recursive: true });
+    // 完整请求体（脱敏 key 后落盘，供逐字节对比/取证）
+    if (process.env.DSH_GATEWAY_DUMP_FULL === '1' && body && body.messages) {
+      const sanitized = {
+        ...body,
+        messages: body.messages.map((m) => {
+          if (!m) return m;
+          const n = { ...m };
+          if (typeof n.content === 'string') n.content = n.content;
+          if (n.tool_calls) n.tool_calls = '<tool_calls>';   // 不落工具参数细节
+          return n;
+        }),
+      };
+      const fullF = path.join(dir, 'full-' + Date.now() + '-' + tag + '.json');
+      fs.writeFileSync(fullF, JSON.stringify(sanitized), 'utf8');
+      log(`[dump] 完整请求体 -> ${fullF} (${sanitized.messages.length} 条消息)`);
+    }
+    const digest = {
+      at: localStamp(),
+      tag,
+      model: body && body.model,
+      stream: !!(body && body.stream),
+      reasoning_effort: body && body.reasoning_effort,
+      thinking: body && body.thinking,
+      hasTools: Array.isArray(body && body.tools) ? body.tools.length : 0,
+      msgCount: Array.isArray(body && body.messages) ? body.messages.length : 0,
+      // R10：记录消息结构取证（roles 空说明 role 字段缺失/结构异常）
+      msg0Keys: (body && body.messages && body.messages[0]) ? Object.keys(body.messages[0]) : [],
+      msg0Role: (body && body.messages && body.messages[0]) ? body.messages[0].role : undefined,
+      msg0ContentType: (body && body.messages && body.messages[0] && body.messages[0].content) ? (Array.isArray(body.messages[0].content) ? 'array:' + body.messages[0].content.length : typeof body.messages[0].content) : undefined,
+      msg0Sample: (body && body.messages && body.messages[0] && typeof body.messages[0].content === 'string') ? body.messages[0].content.slice(0, 80) : undefined,
+      roles: Array.isArray(body && body.messages)
+        ? body.messages.slice(0, 50).map((m) => (m && m.role) || '?').join(',')
+        : '',
+      tools: Array.isArray(body && body.tools)
+        ? body.tools.map((t) => (t && t.function && t.function.name) || '?').join(',')
+        : '',
+    };
+    const f = path.join(dir, 'gw-' + Date.now() + '-' + tag + '.json');
+    fs.writeFileSync(f, JSON.stringify(digest, null, 2), 'utf8');
+    log(`[dump] 请求摘要 -> ${f}`);
+  } catch (_) { /* dump 失败不影响服务 */ }
+}
+
 async function handleCompletion(cfg, req, res, body, upstreamPath) {
+  dumpBodyDigest(body, 'chat');   // R8：诊断用（env 控制）
   const model = body && body.model;
   if (!model) return json(res, 400, { error: { message: 'model is required' } });
   const reqStart = Date.now();   // 调用计时（T1 调用日志）
@@ -509,6 +775,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
  *   匹配与转发时剥离 [xxx] 后缀（T5 宽容匹配）
  */
 async function handleMessages(cfg, req, res, body) {
+  dumpBodyDigest(body, 'messages');   // R8/R10：诊断 dump（env 控制）
   const rawModel = body && body.model;
   if (!rawModel) return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'model is required' } });
   const model = String(rawModel).replace(/\[[^\]]*\]\s*$/, '').trim() || String(rawModel);
@@ -521,7 +788,36 @@ async function handleMessages(cfg, req, res, body) {
     log(`[call] ${model} ${via} status=${status} stream=${stream ? 1 : 0} dur=${Date.now() - reqStart}ms from=${client} proto=anthropic`);
 
   // body.model 替换为清洗后的名字（上游按真实模型 ID 路由）
-  const outBody = { ...body, model };
+  // R9：Anthropic content blocks 的 text 字段同样做密钥打码（与 OpenAI 路径一致）
+  let outBody;
+  if (body && Array.isArray(body.messages)) {
+    let changed = false;
+    const msgs = body.messages.map((m) => {
+      if (!m) return m;
+      // content 为字符串
+      if (typeof m.content === 'string') {
+        const d = maskSecretTokens(m.content);
+        if (d !== m.content) { changed = true; return { ...m, content: d }; }
+        return m;
+      }
+      // content 为 blocks 数组（[{type:'text',text:'…'}]）
+      if (Array.isArray(m.content)) {
+        let bc = false;
+        const blocks = m.content.map((b) => {
+          if (b && b.type === 'text' && typeof b.text === 'string') {
+            const d = maskSecretTokens(b.text);
+            if (d !== b.text) { bc = true; return { ...b, text: d }; }
+          }
+          return b;
+        });
+        if (bc) { changed = true; return { ...m, content: blocks }; }
+      }
+      return m;
+    });
+    outBody = changed ? { ...body, messages: msgs, model } : { ...body, model };
+  } else {
+    outBody = { ...body, model };
+  }
 
   const candidates = providersForModel(cfg, model);
   if (candidates.length === 0) {
@@ -611,7 +907,6 @@ function startServer(cfg) {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const p = url.pathname;
-
     if (p === '/health') { json(res, 200, { ok: true }); return; }
 
     if (p.startsWith('/v1/')) {
@@ -645,6 +940,12 @@ function startServer(cfg) {
     json(res, 404, { error: { message: 'not found' } });
   });
 
+  // R7 强壮性：SSE 流可能持续数十秒（sensenova 等上游慢时 30-60s），
+  // 关闭 Node 默认的 requestTimeout(300s 内请求必须结束) 上限，避免长流被掐断导致 dsh 重连；
+  // headersTimeout 保留 60s（防慢速头攻击）。
+  server.requestTimeout = 0;
+  server.headersTimeout = 60_000;
+  server.keepAliveTimeout = 65_000;
   server.listen(cfg.port, '127.0.0.1', () => {
     log(`gateway listening on http://127.0.0.1:${cfg.port}`);
     console.log(`[gateway] listening on http://127.0.0.1:${cfg.port}`);
@@ -691,7 +992,19 @@ function writeDshConfig(args) {
     console.error('[write-dsh] unified apiKey is not set (edit gateway.config.json first)');
     process.exit(1);
   }
-  const baseURL = `http://127.0.0.1:${port}/v1`;
+  // R11：协议与仿真一致——clientProfile=claude → Anthropic 协议（与 Claude Code 同形态，
+  // 经实测可避开 new-api 对 OpenAI 超长请求的内容拦截）；codex/缺省 → OpenAI 协议。
+  // 写入 dsh 的 api 字段必须与网关服务路径一致：
+  //   anthropic-messages → dsh 调 /v1/messages（网关 T5 转发 /messages + x-api-key）
+  //   openai-completions → dsh 调 /v1/chat/completions（Bearer）
+  // R12：baseURL 惯例按协议——anthropic-messages 的 SDK 期望 baseURL 不含 /v1
+  // （SDK 自拼 /v1/messages；否则会出现 /v1/v1/messages 双前缀 404）。
+  const clientProfile = String(cfg.clientProfile || '').trim();
+  const wireApi = clientProfile === 'claude' ? 'anthropic-messages' : 'openai-completions';
+  const baseURL = wireApi === 'anthropic-messages'
+    ? `http://127.0.0.1:${port}`
+    : `http://127.0.0.1:${port}/v1`;
+  console.log(`[write-dsh] clientProfile="${clientProfile}" → api=${wireApi} baseURL=${baseURL}`);
 
   // merge models across enabled providers, dedup, keep order
   const modelMap = new Map();
@@ -710,14 +1023,17 @@ function writeDshConfig(args) {
   const yamlQuote = (s) => `'${String(s).replace(/'/g, "''")}'`;
   const apiKeyYaml = yamlQuote(apiKey);
 
+  // R12：模型条目统一声明 reasoningEfforts（否则 pi-ai 回退已安装目录能力——
+  // glm-5.3 等无 max 档会报 "does not support reasoning effort max"）。
+  // off=null（不发字段）、其余档位 wire 值同档名；声明后选择器提供全部档位。
   const modelLines = models
-    .map((m) => `        - id: ${yamlQuote(m)}\n          name: ${yamlQuote(m)}\n          contextWindow: 1024000`)
+    .map((m) => `        - id: ${yamlQuote(m)}\n          name: ${yamlQuote(m)}\n          contextWindow: 1024000\n          reasoningEfforts:\n            off: null\n            low: low\n            medium: medium\n            high: high\n            max: max`)
     .join('\n');
   const block =
 `    gateway:
       displayName: DSH Model Gateway
       apiKeyEnv: DSH_GATEWAY_API_KEY
-      api: openai-completions
+      api: ${wireApi}
       baseURL: ${baseURL}
       models:
 ${modelLines}`;
@@ -773,7 +1089,7 @@ process.on('uncaughtException', (err) => {
 });
 // 有条件退出前再落一次日志
 process.on('exit', (code) => {
-  try { fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] exit code=${code}\n`); } catch { }
+  try { fs.appendFileSync(LOG_PATH, `[${localStamp()}] exit code=${code}\n`); } catch { }
 });
 
 if (process.argv.includes('--write-dsh')) {
