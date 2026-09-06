@@ -146,15 +146,21 @@
     <div class="row">
       <label>客户端仿真</label>
       <select id="gwProfile" style="background:#1b212c;color:#e8ecf2;border:1px solid #2c3546;border-radius:6px;padding:6px 10px;">
-        <option value="">关闭（透传 dsh 标识）</option>
-        <option value="claude">Claude Code（claude-cli/2.0.0）</option>
-        <option value="codex">Codex（codex/0.49.0）</option>
+        <option value="">关闭（透传 dsh 标识，OpenAI 协议）</option>
+        <option value="claude">Claude Code（Anthropic 协议）</option>
+        <option value="codex">Codex（OpenAI 协议）</option>
         <option value="custom">自定义 UA…</option>
       </select>
       <input type="text" id="gwClientUA" placeholder="自定义 User-Agent（选择「自定义」时生效）"
         style="flex:1;display:none;" />
     </div>
-    <div class="hint">防屏蔽：仿真模式不透传任何 dsh 特征头；熔断（401/403 即断 30 分钟、网络/5xx 连续 3 次断 5 分钟）、catalog 探测 30s 冷却防风暴、上游错误日志自动脱敏。</div>
+    <div class="row">
+      <label>网络代理</label>
+      <input type="checkbox" id="gwProxyEnabled" title="启用后网关访问上游（如 agentrouter/air-outer 等需代理的供应商）走该代理" />
+      <input type="text" id="gwProxyUrl" placeholder="http://127.0.0.1:7890" style="flex:1;" />
+      <span style="color:#5f6b7d;font-size:11px;">访问需代理的上游时启用；留空自动探测本机代理</span>
+    </div>
+    <div class="hint">防屏蔽：仿真模式不透传任何 dsh 特征头；熔断（401/403 即断 30 分钟、网络/5xx 连续 3 次断 5 分钟）、catalog 探测 30s 冷却防风暴、上游错误日志自动脱敏。<b>协议联动</b>：「写入 dsh 配置」按此处的仿真选择写入 dsh 协议——Claude Code=Anthropic（/v1/messages），Codex/关闭=OpenAI（/v1/chat/completions）；修改仿真后需重新「写入 dsh 配置」并重启 dsh web。</div>
 
     <!-- 供应商可视化配置（仿 dsh 模型配置页：左列表 + 右编辑面板） -->
     <div class="gw-wrap">
@@ -396,7 +402,19 @@
       const portVal = parseInt(gwCfg.port, 10) || 3090;
       if (!$('gwPort').value || parseInt($('gwPort').value, 10) !== portVal) $('gwPort').value = portVal;
       $('gwBaseUrl').textContent = 'http://127.0.0.1:' + portVal + '/v1';
+      // 网络代理回填
+      const px = gwCfg.proxy || {};
+      $('gwProxyEnabled').checked = !!px.enabled;
+      $('gwProxyUrl').value = px.url || '';
+      gwProxySync();
     }
+
+    // 代理启用开关与 URL 输入框联动（关闭时禁用输入）
+    function gwProxySync() {
+      $('gwProxyUrl').disabled = !$('gwProxyEnabled').checked;
+      $('gwProxyUrl').style.opacity = $('gwProxyEnabled').checked ? '1' : '.45';
+    }
+    $('gwProxyEnabled').addEventListener('change', gwProxySync);
 
     // 「自定义 UA」选项与输入框联动
     $('gwProfile').addEventListener('change', () => {
@@ -492,6 +510,13 @@
         } else {
           delete cfg.clientProfile;
           delete cfg.clientUA;
+        }
+        // 网络代理：启用时写 {enabled,url}；未启用或 URL 空 → 删除 proxy 字段（走自动探测兜底）
+        if ($('gwProxyEnabled').checked) {
+          const u = $('gwProxyUrl').value.trim();
+          cfg.proxy = u ? { enabled: true, url: u } : { enabled: true, url: '' };
+        } else {
+          delete cfg.proxy;
         }
         text = JSON.stringify(cfg, null, 2);
       } catch (_) { /* 配置本身非法时交给后端校验报错 */ }
