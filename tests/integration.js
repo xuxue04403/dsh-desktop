@@ -99,6 +99,17 @@ t('网关：asar 内运行时解包到数据目录（外部 node 可读）', () 
   assert.ok(fs.existsSync(path.join(uData, 'gateway', 'gateway.config.example.json')), '示例应一并解包');
 });
 
+t('网关：model-gateway.mjs 主流程支持 --config/--log 覆盖（防误读 %APPDATA% 旧配置）', () => {
+  const mjs = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
+  assert.ok(mjs.includes('function argvGet'), '应有 argv 参数工具');
+  assert.ok(mjs.includes("let CONFIG_PATH"), 'CONFIG_PATH 应为可重赋值 let');
+  assert.ok(mjs.includes("let LOG_PATH"), 'LOG_PATH 应为可重赋值 let');
+  assert.ok(mjs.includes("const cfgFromArg = argvGet('--config')"), '主流程应解析 --config');
+  assert.ok(mjs.includes("if (cfgFromArg) CONFIG_PATH = cfgFromArg;"), '--config 应覆盖配置路径');
+  assert.ok(mjs.includes("const logFromArg = argvGet('--log')"), '主流程应解析 --log');
+  assert.ok(mjs.includes("if (logFromArg) LOG_PATH = logFromArg;"), '--log 应覆盖日志路径');
+});
+
 // —— 安全模式：profile 备份 / 最小配置 / 还原 ——
 const wd = new Watchdog({
   settings: fakeSettings,
