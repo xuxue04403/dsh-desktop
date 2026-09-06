@@ -496,7 +496,14 @@
         text = JSON.stringify(cfg, null, 2);
       } catch (_) { /* 配置本身非法时交给后端校验报错 */ }
       const r = await window.dshApp.gwAction('save-config', text);
-      toast(r && r.ok ? '配置已保存，网关已重启' : ('配置无效：' + (r && r.error ? r.error : '未知错误')));
+      if (r && r.ok) {
+        // "保存并重启网关"：无论之前是否运行，保存后确保网关以新配置运行
+        // （运行中 → saveConfig 内部已重启；已停止 → 这里直接启动）
+        await window.dshApp.gwAction('start');
+        toast('配置已保存，网关已重启');
+      } else {
+        toast('配置无效：' + (r && r.error ? r.error : '未知错误'));
+      }
       await gwLoad();
     };
     $('btnGwWriteDsh').onclick = async () => {
