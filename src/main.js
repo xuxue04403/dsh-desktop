@@ -577,6 +577,11 @@ function registerIpc() {
     broadcastGw();
     return true;
   });
+  // 复制文本到剪贴板（设置页"复制"按钮等）
+  ipcMain.handle('dsh:clipboard', (_e, text) => {
+    clipboard.writeText(String(text == null ? '' : text));
+    return true;
+  });
 }
 
 // ---------------- 生命周期 ----------------
