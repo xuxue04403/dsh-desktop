@@ -45,6 +45,9 @@ let readyHandled = false;   // 每次启动的就绪处理幂等闸
 
 // ---------------- 窗口 ----------------
 
+// 窗口、托盘图标资源与持久化数据目录（app.getPath('userData') 由 bootstrap 传入）
+let APP_USERDATA = '';   // 数据目录（resolveDataDir 解析结果），供输入历史持久化
+
 function createMainWindow() {
   mainWindow = new BrowserWindow({
     width: 1280,
@@ -115,11 +118,14 @@ function createMainWindow() {
     }
   });
   // 输入框上下键历史：主进程 before-input-event 拦截（不依赖页面注入时机），
-  // 历史保存在本会话（按端口+路径隔离），读写输入框经 executeJavaScript。
-  wireInputHistory(mainWindow, () => state.port);
+  // 历史按会话 key 持久化到 data\input-history.json（跨启动保留），读写输入框经 executeJavaScript。
+  wireInputHistory(mainWindow, () => state.port, APP_USERDATA);
 }
 
-// 注入到 dsh web 页面的两个悬浮入口（右上角，透明风格；点击打开壳设置窗并定位到对应卡片）
+// 注入到 dsh web 页面的两个悬浮入口（透明风格；点击打开壳设置窗并定位到对应卡片）
+// 定位策略：固定在页面右上角工具区（Session 下载等按钮）的**左侧同行**——
+// 取右上角区域最靠右的可点元素为锚点，浮层右边缘贴锚点左边缘、垂直对齐；
+// 找不到锚点时回退默认右上角。
 const FLOAT_BUTTONS_JS = [
   '(function(){',
   'if (document.getElementById("__dshapp_float")) return;',
@@ -134,6 +140,35 @@ const FLOAT_BUTTONS_JS = [
   'd.appendChild(mk("⚙ 设置","open-settings"));',
   'd.appendChild(mk("🛡 模型网关","open-settings::gateway"));',
   'document.body.appendChild(d);',
+  // —— 固定在右上角工具按钮左侧同行 ——
+  'function place(){',
+  '  var anchor=null;',
+  '  var els=document.querySelectorAll("button,[role=button],[data-session],[data-toolbar],a");',
+  '  for(var i=0;i<els.length;i++){',
+  '    var el=els[i];',
+  '    if(!el.isConnected)continue;',
+  '    if(el===d||d.contains(el))continue;',
+  '    var r=el.getBoundingClientRect();',
+  '    if(r.width===0||r.height===0)continue;',
+  '    // 限右上角工具区：视口右半 + 上部 140px，取最靠右的作为下载/工具按钮',
+  '    if(r.left>window.innerWidth*0.4 && r.top<140 && r.bottom>0){',
+  '      if(!anchor||r.right>anchor.right)anchor=r;',
+  '    }',
+  '  }',
+  '  if(anchor){',
+  '    // 垂直对齐锚点行，水平贴其左侧 10px',
+  '    d.style.top=Math.max(6,(anchor.top+anchor.height/2-15))+"px";',
+  '    d.style.right=(window.innerWidth-anchor.left+10)+"px";',
+  '    d.style.bottom="auto";',
+  '  }else{',
+  '    // 无锚点：回退默认右上角',
+  '    d.style.top="10px";d.style.right="34px";d.style.bottom="auto";',
+  '  }',
+  '}',
+  'setTimeout(place,300);setTimeout(place,1200);setTimeout(place,3000);',
+  'window.addEventListener("resize",place);',
+  'var mo=new MutationObserver(function(){clearTimeout(window.__dshappFloatT);window.__dshappFloatT=setTimeout(place,500);});',
+  'mo.observe(document.body,{childList:true,subtree:true});',
   '})();',
 ].join('\n');
 
@@ -212,22 +247,59 @@ const INPUT_HELPER_JS = [
   '})();',
 ].join('\n');
 
-function wireInputHistory(win, getPort) {
-  // 每会话历史：key = por t + 页面路径
+function wireInputHistory(win, getPort, userDataDir) {
+  // 每会话历史：key = port + 稳定路径（去掉 token 等易变 query，保留 pathname/hash）
   const histories = new Map();   // key -> string[]
   const drafts = new Map();      // key -> { idx, active, draft }（↑ 回溯状态）
   let keyFor = '';
+
+  // —— 持久化：data\input-history.json（跨启动保留）——
+  const histFile = userDataDir ? path.join(userDataDir, 'input-history.json') : '';
+  let saveTimer = null;
+  function loadHistories() {
+    try {
+      if (!histFile || !fsExists(histFile)) return;
+      const j = JSON.parse(require('fs').readFileSync(histFile, 'utf8'));
+      if (j && typeof j === 'object') {
+        for (const k of Object.keys(j)) {
+          if (Array.isArray(j[k])) histories.set(k, j[k].slice(-IH_MAX));
+        }
+      }
+      // eslint-disable-next-line no-console
+      console.log('[dshapp] 输入历史已加载：' + histories.size + ' 个会话');
+    } catch (_) { /* 损坏则忽略 */ }
+  }
+  function saveHistories() {
+    if (!histFile) return;
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    saveTimer = setTimeout(() => {
+      try {
+        const out = {};
+        histories.forEach((v, k) => { out[k] = v; });
+        require('fs').writeFileSync(histFile, JSON.stringify(out), 'utf8');
+      } catch (_) { /* 写失败忽略 */ }
+    }, 300);
+  }
+  loadHistories();
 
   async function sessionKey() {
     try {
       const url = win.webContents.getURL();
       const port = typeof getPort === 'function' ? getPort() : 3080;
-      // 取 pathname+search+hash，隔离不同会话页
+      // 只保留 pathname + hash（存根），丢弃 token 等易变 query：
+      //   dsh web URL 形如 http://127.0.0.1:<port>/?token=xxx#/session/<id>…
       const m = url.indexOf('127.0.0.1:' + port);
-      const pathPart = m >= 0 ? url.slice(m + ('127.0.0.1:' + port).length) : url;
-      return port + '|' + pathPart;
+      let rest = m >= 0 ? url.slice(m + ('127.0.0.1:' + port).length) : url;
+      const hashAt = rest.indexOf('#');
+      const hash = hashAt >= 0 ? rest.slice(hashAt) : '';
+      const qAt = rest.indexOf('?');
+      const pathname = (qAt >= 0 ? rest.slice(0, qAt) : rest.split('#')[0]) || '/';
+      return port + '|' + pathname + hash;
     } catch (_) { return 'default'; }
   }
+
+  // fs 引用（require('fs') 局部引以避免顶层绑定的命名冲突）
+  function fsExists(p) { try { return require('fs').existsSync(p); } catch (_) { return false; } }
 
   // 注入页面辅助函数（幂等；did-finish-load 与按键前都尝试）
   async function ensureHelper() {
@@ -311,6 +383,7 @@ function wireInputHistory(win, getPort) {
       if (v && v !== hist[hist.length - 1]) {
         hist.push(v);
         if (hist.length > IH_MAX) hist.splice(0, hist.length - IH_MAX);
+        saveHistories();   // 持久化（防抖）
       }
       st.idx = hist.length; st.active = false; st.draft = '';
       return;   // 不拦截 Enter，交给 dsh 发送
@@ -582,6 +655,7 @@ async function bootstrap() {
 
   // 数据目录：exe 旁 data\ 优先（绿色便携，随程序目录走）；不可写才回退 %APPDATA%
   const userData = resolveDataDir();
+  APP_USERDATA = userData;   // 供输入历史等模块持久化
   logger.init(userData);
   settings = new Settings(userData);
   settings.load();
