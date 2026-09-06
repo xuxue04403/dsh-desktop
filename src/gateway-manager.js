@@ -135,15 +135,16 @@ class GatewayManager extends EventEmitter {
     } catch (_) { return ''; }
   }
 
-  // 保存配置（JSON 校验通过后写盘；运行中则自动重启生效）
-  saveConfig(text) {
+  // 保存配置（JSON 校验通过后写盘；运行中则重启生效——await 重启完成再返回，
+// 避免 UI 紧随其后的 start() 与未完成的 stop/start 竞态）
+  async saveConfig(text) {
     const v = validateConfigText(text);
     if (!v.ok) return v;
     try {
       fs.writeFileSync(this.configPath, text, 'utf8');
       this.log('模型网关：配置已保存。');
       if (this.running) {
-        this.restart();
+        await this.restart();
       }
       return { ok: true, error: null };
     } catch (err) {
