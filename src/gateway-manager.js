@@ -161,9 +161,20 @@ class GatewayManager extends EventEmitter {
     }
     this.log('模型网关：启动（端口 ' + this.port + '）…');
     // 注意：stdio 管道用于日志捕获；此 spawn 仅在用户环境（无沙箱限制）下运行
-    this.proc = spawn(this.nodePath, [mjs, '--config', this.configPath, '--port', String(this.port)], {
+    // 传 --config/--log 并设 DSH_GATEWAY_CONFIG env，确保网关读 dsh-app 自己的数据目录
+    // （不再误读 %APPDATA%\DSHDesktop 的旧/模拟配置）
+    this.proc = spawn(this.nodePath, [
+      mjs,
+      '--config', this.configPath,
+      '--log', this.logPath,
+      '--port', String(this.port),
+    ], {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
+      env: Object.assign({}, process.env, {
+        DSH_GATEWAY_CONFIG: this.configPath,
+        DSH_GATEWAY_LOG: this.logPath,
+      }),
     });
     this.running = true;
     this.emit('state');
@@ -234,8 +245,18 @@ class GatewayManager extends EventEmitter {
   async writeDsh() {
     const r = spawnSync(
       this.nodePath,
-      [this.mjsPath, '--write-dsh', '--config', this.configPath, '--port', String(this.port)],
-      { encoding: 'utf8', timeout: 60000, windowsHide: true }
+      [
+        this.mjsPath,
+        '--write-dsh',
+        '--config', this.configPath,
+        '--port', String(this.port),
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 60000,
+        windowsHide: true,
+        env: Object.assign({}, process.env, { DSH_GATEWAY_CONFIG: this.configPath }),
+      }
     );
     const output = (r.stdout || '') + (r.stderr || '');
     this.pushLog('[write-dsh] ' + output.trim());
