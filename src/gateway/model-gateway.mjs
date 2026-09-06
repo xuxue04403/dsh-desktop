@@ -39,12 +39,12 @@ import path from 'node:path';
 import os from 'node:os';
 
 const APP_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), '.dsh'), 'DSHDesktop');
-const CONFIG_PATH = process.env.DSH_GATEWAY_CONFIG || path.join(APP_DIR, 'gateway.config.json');
+let CONFIG_PATH = process.env.DSH_GATEWAY_CONFIG || path.join(APP_DIR, 'gateway.config.json');
 const MODEL_CACHE_TTL_MS = 60_000;
 const UPSTREAM_TIMEOUT_MS = 60_000;
 // R2 防封：catalog 探测失败后的冷却期（30s 内不重试探测，防请求风暴触发风控）
 const CATALOG_FAIL_COOLDOWN_MS = 30_000;
-const LOG_PATH = process.env.DSH_GATEWAY_LOG || path.join(APP_DIR, 'logs', 'gateway.log');
+let LOG_PATH = process.env.DSH_GATEWAY_LOG || path.join(APP_DIR, 'logs', 'gateway.log');
 
 /* ---------------- logging ---------------- */
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // 日志轮转上限 5MB（修复 G3：防止长期运行磁盘膨胀）
@@ -63,6 +63,12 @@ function log(msg) {
 }
 
 /* ---------------- config ---------------- */
+// 顶层 argv 工具：--config / --log 等（服务启动与 write-dsh 共用）
+function argvGet(flag) {
+  const i = process.argv.indexOf(flag);
+  return i >= 0 && i + 1 < process.argv.length ? process.argv[i + 1] : undefined;
+}
+
 function defaultConfig() {
   return {
     port: 3090,
@@ -773,6 +779,12 @@ process.on('exit', (code) => {
 if (process.argv.includes('--write-dsh')) {
   writeDshConfig(process.argv.slice(2));
 } else {
+  // 服务启动：--config / --log 可覆盖默认的 %APPDATA%\DSHDesktop 路径，
+  // 使 dsh-app/桌面助手能把配置与日志指向自己的数据目录（否则误读/写旧位置）
+  const cfgFromArg = argvGet('--config');
+  if (cfgFromArg) CONFIG_PATH = cfgFromArg;
+  const logFromArg = argvGet('--log');
+  if (logFromArg) LOG_PATH = logFromArg;
   const cfg = loadConfig();
   if (cfg) startServer(cfg);
 }
