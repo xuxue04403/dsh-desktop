@@ -9,7 +9,7 @@ const os = require('os');
 const { parseFailedPlugins, resolveEntryIds } = require('../src/watchdog');
 const { compareVersions, REGEX_URL_LINE } = require('../src/launcher');
 const { validateConfigText } = require('../src/gateway-manager');
-const { migrateGatewayConfig } = require('../src/datadir');
+const { migrateGatewayConfig, isMockLikeConfig } = require('../src/datadir');
 const { pngFromPixels, renderIcon, iconDataURL, iconPngBuffer, iconIcoBuffer, COLORS } = require('../src/icon');
 const zlib = require('zlib');
 
@@ -116,7 +116,19 @@ t('validateConfigText 供应商缺 baseURL → 拒绝', () => {
 });
 
 // —— 数据目录：网关注入配置一次性迁移 ——
+// "真实"配置（非模拟特征：无 mock id / 127.0.0.1:319x / provider-a / example.com）
 const GATEWAY_CFG = JSON.stringify({
+  port: 3090,
+  apiKey: 'dsh-gw-test-123',
+  clientUA: 'claude-cli/2.0.0 (external, cli)',
+  routing: 'round-robin',
+  providers: [
+    { id: 'agentrouter', baseURL: 'https://agentrouter.org/', apiKey: 'sk-real-1', models: ['deepseek-v4-flash', 'glm-5.3'], priority: 1, enabled: true },
+    { id: 'air-outer', baseURL: 'https://ps.air-outer.com/', apiKey: 'sk-real-2', models: ['deepseek-v4-flash'], priority: 2, enabled: true },
+  ],
+});
+// "模拟"配置（桌面助手自带 mock 源 / 示例文件特征）
+const MOCK_CFG = JSON.stringify({
   port: 3090,
   apiKey: 'dsh-gw-test-123',
   providers: [
@@ -125,36 +137,73 @@ const GATEWAY_CFG = JSON.stringify({
   ],
 });
 
-t('migrateGatewayConfig 从已有来源复制到空目录', () => {
+t('isMockLikeConfig 识别模拟/示例/真实', () => {
+  assert.strictEqual(isMockLikeConfig(MOCK_CFG), true, 'mockA/B 应判为模拟');
+  assert.strictEqual(isMockLikeConfig(GATEWAY_CFG), false, '真实供应商不应判为模拟');
+  assert.strictEqual(isMockLikeConfig('{"providers":[{"id":"provider-a","baseURL":"https://api.example.com/v1"}]}'), true, '示例应判为模拟');
+  assert.strictEqual(isMockLikeConfig(''), true, '空内容应判为模拟');
+  assert.strictEqual(isMockLikeConfig('not json'), true, '非法 JSON 应判为模拟');
+});
+
+t('migrateGatewayConfig 从已有真实来源复制到空目录', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-unit-'));
   const src = path.join(base, 'legacy', 'gateway.config.json');
   fs.mkdirSync(path.dirname(src), { recursive: true });
   fs.writeFileSync(src, GATEWAY_CFG, 'utf8');
   const out = path.join(base, 'data');
-  const from = migrateGatewayConfig(out, [src]);
-  assert.strictEqual(from, src);
+  const r = migrateGatewayConfig(out, [src]);
+  assert.ok(r && r.action === 'migrated', '应迁移');
   assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'), GATEWAY_CFG);
 });
 
-t('migrateGatewayConfig 目标已存在 → 不覆盖', () => {
+t('migrateGatewayConfig 模拟来源 → 跳过', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-unit-'));
+  const srcMock = path.join(base, 'mock', 'gateway.config.json');
+  const srcReal = path.join(base, 'real', 'gateway.config.json');
+  fs.mkdirSync(path.dirname(srcMock), { recursive: true });
+  fs.mkdirSync(path.dirname(srcReal), { recursive: true });
+  fs.writeFileSync(srcMock, MOCK_CFG, 'utf8');
+  fs.writeFileSync(srcReal, GATEWAY_CFG, 'utf8');
+  const out = path.join(base, 'data');
+  const r = migrateGatewayConfig(out, [srcMock, srcReal]);
+  assert.ok(r && r.from === srcReal, '应跳过模拟源、命中真实源');
+  assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'), GATEWAY_CFG);
+});
+
+t('migrateGatewayConfig 目标为真实配置 → 不覆盖', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-unit-'));
   const src = path.join(base, 'legacy', 'gateway.config.json');
   fs.mkdirSync(path.dirname(src), { recursive: true });
   fs.writeFileSync(src, GATEWAY_CFG, 'utf8');
   const out = path.join(base, 'data');
   fs.mkdirSync(out, { recursive: true });
-  fs.writeFileSync(path.join(out, 'gateway.config.json'), '{"custom":1}', 'utf8');
-  const from = migrateGatewayConfig(out, [src]);
-  assert.strictEqual(from, null);
-  assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'), '{"custom":1}');
+  const custom = JSON.stringify({ port: 3091, providers: [{ id: 'my-own', baseURL: 'https://my.api/v1', apiKey: 'sk', models: ['m'] }] });
+  fs.writeFileSync(path.join(out, 'gateway.config.json'), custom, 'utf8');
+  const r = migrateGatewayConfig(out, [src]);
+  assert.strictEqual(r, null, '真实配置不应被覆盖');
+  assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'), custom);
+});
+
+t('migrateGatewayConfig 目标为模拟数据 → 升级覆盖（保留备份）', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-unit-'));
+  const src = path.join(base, 'real', 'gateway.config.json');
+  fs.mkdirSync(path.dirname(src), { recursive: true });
+  fs.writeFileSync(src, GATEWAY_CFG, 'utf8');
+  const out = path.join(base, 'data');
+  fs.mkdirSync(out, { recursive: true });
+  fs.writeFileSync(path.join(out, 'gateway.config.json'), MOCK_CFG, 'utf8');
+  const r = migrateGatewayConfig(out, [src]);
+  assert.ok(r && r.action === 'upgraded', '应升级');
+  assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'), GATEWAY_CFG, '应被替换为真实配置');
+  assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json.bak-mock'), 'utf8'), MOCK_CFG, '旧模拟配置应备份');
 });
 
 t('migrateGatewayConfig 来源缺失 → null', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-unit-'));
   const out = path.join(base, 'data');
   fs.mkdirSync(out, { recursive: true });
-  const from = migrateGatewayConfig(out, [path.join(base, 'missing', 'gateway.config.json')]);
-  assert.strictEqual(from, null);
+  const r = migrateGatewayConfig(out, [path.join(base, 'missing', 'gateway.config.json')]);
+  assert.strictEqual(r, null);
   assert.strictEqual(fs.existsSync(path.join(out, 'gateway.config.json')), false);
 });
 
