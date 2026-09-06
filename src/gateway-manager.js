@@ -225,6 +225,9 @@ async waitPortFree(port, timeoutMs) {
       env: Object.assign({}, process.env, {
         DSH_GATEWAY_CONFIG: this.configPath,
         DSH_GATEWAY_LOG: this.logPath,
+        // 网关内部日志（catalog/调用/熔断）同时输出 stdout，设置页日志框才能实时看到
+        // （默认只写文件，stdout 仅有 listening，用户会误以为"无调用记录"）
+        DSH_GATEWAY_VERBOSE: '1',
       }),
     });
     this.running = true;
