@@ -644,6 +644,19 @@ async function bootstrap() {
       openBrowser: () => shell.openExternal(state.authUrl || 'http://127.0.0.1:' + state.port + '/'),
       openSettings: (section) => createSettingsWindow(section),
       openGateway: () => createSettingsWindow('gateway'),
+      restartGateway: async () => {
+        // 托盘「重启网关」：先杀网关进程再启动（restart 已实现先杀后启 + 清熔断）
+        if (!gateway) return;
+        try {
+          await gateway.restart();
+          logger.appendLog('模型网关：已通过托盘菜单重启。');
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('dsh:state', state.snapshot());
+          }
+        } catch (err) {
+          logger.appendLog('模型网关重启失败: ' + (err && err.message ? err.message : err));
+        }
+      },
       openLogs: () => shell.openPath(logger.logDirPath() || os.homedir()),
       quit: quitAll,
     },
