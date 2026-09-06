@@ -151,12 +151,62 @@ class GatewayManager extends EventEmitter {
     }
   }
 
+  // 全局清理"孤儿网关"进程：旧实例/旧版本残留的 node model-gateway.mjs 会一直占用
+  // 配置端口，导致新实例 EADDRINUSE 启动失败（用户侧表现为"网关启动了但探测不通过"）。
+  // 识别方式精准：仅杀命令行包含 model-gateway.mjs 的 node 进程，不会误伤其他程序。
+  killStaleGatewayProcesses() {
+    try {
+      const probe = spawnSync('powershell', [
+        '-NoProfile', '-Command',
+        "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
+        "Where-Object { $_.CommandLine -and $_.CommandLine.Contains('model-gateway.mjs') } | " +
+        'ForEach-Object { Write-Output $_.ProcessId }',
+      ], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+      const pids = String(probe.status === 0 ? (probe.stdout || '') : '')
+        .split(/\r?\n/).map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n) && n > 0);
+      if (pids.length === 0) return 0;
+      let killed = 0;
+      for (const pid of pids) {
+        try {
+          const r2 = spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+          if (r2.status === 0) killed++;
+        } catch (_) { /* 忽略单个失败 */ }
+      }
+      if (killed > 0) this.log('模型网关：已清理残留网关进程 ' + killed + ' 个（旧实例占用端口）。');
+      return killed;
+    } catch (_) { return 0; }
+  }
+
+  // 等待端口释放（taskkill 后 Windows 释放端口有短暂延迟，否则新进程 EADDRINUSE）。
+// 用 TCP 连接探测（比 HTTP 更准：任何占用者都能检出）。
+async waitPortFree(port, timeoutMs) {
+    const net = require('net');
+    const tryOnce = () => new Promise((resolve) => {
+      const s = net.connect({ host: '127.0.0.1', port }, () => { s.destroy(); resolve(false); });  // 连上=占用
+      s.setTimeout(600, () => { s.destroy(); resolve(true); });                                     // 超时=空闲
+      s.on('error', () => resolve(true));                                                           // 拒绝=空闲
+    });
+    const deadline = Date.now() + (timeoutMs || 4000);
+    while (Date.now() < deadline) {
+      if (await tryOnce()) return true;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return false;
+  }
+
   async start() {
     if (this.proc) return;
     this.port = this.configPort();   // 以配置文件为准（--port 参数仅对 --write-dsh 生效）
     const mjs = this.mjsPath;
     if (!fs.existsSync(mjs)) {
       this.log('模型网关：缺少运行时 ' + mjs);
+      return;
+    }
+    // 启动前：清理旧实例残留的网关进程并等待端口释放（防 EADDRINUSE 启动即退出）
+    this.killStaleGatewayProcesses();
+    const freed = await this.waitPortFree(this.port, 4000);
+    if (!freed) {
+      this.log('模型网关：端口 ' + this.port + ' 仍被其他程序占用（非网关进程），请更换配置端口或释放该端口。');
       return;
     }
     this.log('模型网关：启动（端口 ' + this.port + '）…');
