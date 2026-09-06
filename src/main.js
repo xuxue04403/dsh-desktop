@@ -106,7 +106,7 @@ function createMainWindow() {
   });
   mainWindow.on('ready-to-show', () => mainWindow.setTitle(appTitle));
 
-  // 在 dsh web 页面注入壳级能力：悬浮入口 + 输入框上下键历史
+  // dsh web 页面加载后固定窗口标题（阻断内嵌页面 title 同步）
   mainWindow.webContents.on('did-finish-load', () => {
     let url = '';
     try { url = mainWindow.webContents.getURL(); } catch (_) { /* 忽略 */ }
@@ -114,71 +114,12 @@ function createMainWindow() {
     // http:// 前缀使 indexOf 必不为 0）
     if (url.indexOf('127.0.0.1:' + state.port) >= 0) {
       mainWindow.setTitle(appTitle);
-      mainWindow.webContents.executeJavaScript(FLOAT_BUTTONS_JS).catch(() => { /* 忽略 */ });
     }
   });
   // 输入框上下键历史：主进程 before-input-event 拦截（不依赖页面注入时机），
   // 历史按会话 key 持久化到 data\input-history.json（跨启动保留），读写输入框经 executeJavaScript。
   wireInputHistory(mainWindow, () => state.port, APP_USERDATA);
 }
-
-// 注入到 dsh web 页面的两个悬浮入口（透明风格；点击打开壳设置窗并定位到对应卡片）
-// 定位策略：固定在页面右上角工具按钮（Session 下载等）的**左侧同行**——
-// 只在注入后探测 3 次 + 窗口 resize 时定位（不用 MutationObserver，避免按钮跳动点不中）。
-// 锚点必须完全在视口内（过滤离屏/隐藏元素）；左侧放不下时回退右下角（绝不遮挡顶部按钮）。
-const FLOAT_BUTTONS_JS = [
-  '(function(){',
-  'if (document.getElementById("__dshapp_float")) return;',
-  'var d=document.createElement("div");d.id="__dshapp_float";',
-  'd.style.cssText="position:fixed;top:10px;right:34px;z-index:2147483647;display:flex;gap:8px;";',
-  'function mk(txt,act){var b=document.createElement("button");b.textContent=txt;',
-  'b.style.cssText=\'border:1px solid rgba(120,140,170,.45);background:rgba(24,30,40,.62);color:#cdd6e4;border-radius:14px;padding:4px 12px;font:12px "Segoe UI","Microsoft YaHei UI",sans-serif;cursor:pointer;backdrop-filter:blur(4px);\';',
-  'b.onmouseenter=function(){b.style.background="rgba(40,52,70,.82)";};',
-  'b.onmouseleave=function(){b.style.background="rgba(24,30,40,.62)";};',
-  'b.onclick=function(){try{if(window.dshApp&&window.dshApp.action)window.dshApp.action(act);}catch(e){}};',
-  'return b;}',
-  'd.appendChild(mk("⚙ 设置","open-settings"));',
-  'd.appendChild(mk("🛡 模型网关","open-settings::gateway"));',
-  'document.body.appendChild(d);',
-  // —— 固定在右上角工具按钮左侧同行 ——
-  'function place(){',
-  '  var W=window.innerWidth,H=window.innerHeight;',
-  '  var anchor=null;',
-  '  var els=document.querySelectorAll("button,[role=button],a[href]");',
-  '  for(var i=0;i<els.length;i++){',
-  '    var el=els[i];',
-  '    if(!el.isConnected)continue;',
-  '    if(el===d||d.contains(el))continue;',
-  '    var st=window.getComputedStyle(el);',
-  '    if(st.display==="none"||st.visibility==="hidden"||st.opacity==="0")continue;',
-  '    var r=el.getBoundingClientRect();',
-  '    // 必须完全在视口内（过滤离屏 portal 元素），尺寸像按钮',
-  '    if(r.width<16||r.width>400||r.height<14||r.height>80)continue;',
-  '    if(r.left<0||r.top<0||r.right>W+1||r.bottom>H+1)continue;',
-  '    // 右上角工具区：视口右半 + 上部 140px',
-  '    if(r.left>W*0.4&&r.top<140){',
-  '      if(!anchor||r.right>anchor.right)anchor=r;',
-  '    }',
-  '  }',
-  '  if(anchor){',
-  '    var need=d.getBoundingClientRect().width||170;',
-  '    if(anchor.left-10>=need){',
-  '      // 左侧同行：垂直对齐锚点中心，右缘贴锚点左侧 10px',
-  '      d.style.top=Math.max(6,anchor.top+anchor.height/2-15)+"px";',
-  '      d.style.right=(W-anchor.left+10)+"px";',
-  '      d.style.bottom="auto";',
-  '      return;',
-  '    }',
-  '  }',
-  '  // 无有效锚点或左侧放不下 → 右下角（远离顶部工具区，不遮挡）',
-  '  d.style.top="auto";',
-  '  d.style.bottom="18px";',
-  '  d.style.right="18px";',
-  '}',
-  'setTimeout(place,400);setTimeout(place,1500);setTimeout(place,4000);',
-  'window.addEventListener("resize",place);',
-  '})();',
-].join('\n');
 
 // —— 输入框上下键历史（主进程实现）——
 //
