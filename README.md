@@ -82,6 +82,7 @@ dsh-app/
 - 可选 `clientUA` 仿真、`/health` 健康检查；
 - **「写入 dsh 配置」**：自动把网关注册为 dsh 的 `gateway` 提供商并写入统一 Key，重启 dsh web 后在模型选择器直接选用（打包版下网关运行时自动从 asar 解包到 `data\gateway\` 供外部 node 执行；**服务启动/写配置均传 `--config`/`--log` 并设 `DSH_GATEWAY_CONFIG` 环境变量，确保读取 dsh-app 自己的 `data\gateway.config.json`，不误读 `%APPDATA%\DSHDesktop` 的旧/模拟配置**）；
 - 统一 Key 输入框右侧有「**复制**」按钮，一键复制到剪贴板；
+- **启动自愈**：启动前自动清理旧实例/旧版本残留的网关进程（仅匹配命令行含 `model-gateway.mjs` 的 node 进程，不误伤其他程序），并等待端口释放后再绑定——杜绝"保存并重启"或跨实例操作时的 `EADDRINUSE` 启动失败；端口仍被非网关程序占用时给出明确提示；
 - 配置（供应商列表/优先级/Key）保存在**程序目录旁 `data\gateway.config.json`**（绿色便携，随程序目录走；不可写时才回退 `%APPDATA%\DSH-App\`；与桌面助手配置同构，可直接沿用）；
 - **一次性自动迁移**：本地网关配置缺失、或仍是**模拟/示例数据**（mockA/mockB、provider-a/b）时，按优先级从桌面助手真实位置自动复制/升级（旧文件备份为 `.bak-mock`）——环境变量 `DSH_LEGACY_CONFIG` → 沿程序目录祖先链找 `<base>\dsh-desktop\data\`（真实便携配置） → `%USERPROFILE%\dsh-desktop\data\` → 旧 `%APPDATA%` 位置。来源本身是模拟数据的会被跳过；用户已修改的真实配置不会被覆盖；无导入按钮。
 
