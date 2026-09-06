@@ -85,6 +85,10 @@ dsh-app/
 - **「应用修改」与「保存并重启网关」分工**：前者只把右侧编辑面板内容写入表格/JSON 缓存（不落盘）；后者写盘并确保网关以新配置运行——**运行中自动重启、已停止则直接启动**（无需再手动点「启动网关」）；
 - **启动自愈**：启动前自动清理旧实例/旧版本残留的网关进程（仅匹配命令行含 `model-gateway.mjs` 的 node 进程，不误伤其他程序），并等待端口释放后再绑定——杜绝"保存并重启"或跨实例操作时的 `EADDRINUSE` 启动失败；端口仍被非网关程序占用时给出明确提示；
 - **日志实时可见**：网关内部日志（catalog 探测 / 调用 / 熔断 / 上游错误）同时输出到**设置页网关日志框与 `data\logs\gateway.log`**（`DSH_GATEWAY_VERBOSE=1`），401/余额/敏感词等上游问题可直接在界面看到原因；
+- **推理档位统一翻译**：dsh 发统一推理档位（off/low/medium/high/max），网关按各上游词汇翻译后转发（各供应商可在配置里设 `reasoningEffortMap`，如 sensenova `{"max":"xhigh","off":"none"}`；未配置时原样透传，与桌面助手一致）——解决"第三方供应商 deepseek 模型无法设置/生效推理级别"问题；dsh 侧需在 settings.yaml 的模型条目声明 `reasoningEfforts` 后选择器才提供档位；
+- **协议兼容（role 翻译）**：dsh 新版可能发送 `developer` 角色消息（OpenAI 协议演进），部分上游（sensenova 等）只接受 `system/assistant/user/tool`——网关转发时自动把 `developer` 合并为 `system`；
+- **代理自动注入**：agentrouter/air-outer 等上游需经 clash 类代理访问——网关进程启动时自动探测系统代理/常见端口（7890 等）并注入 `HTTPS_PROXY` + `NODE_USE_ENV_PROXY=1`（node≥24 fetch 原生走代理），不依赖桌面环境变量；设置页「网络代理」可显式配置（启用开关 + 地址，配置优先于自动探测）；
+- **协议与仿真联动（关键）**：客户端仿真选 **Claude Code** → 网关走 **Anthropic 协议**（`/v1/messages`，x-api-key + anthropic-version + UA=claude-cli，与 Claude Code 完全同形态——**实测可避开 new-api 对 OpenAI 超长请求的内容拦截**）；选 **Codex/关闭** → **OpenAI 协议**（`/v1/chat/completions`，Bearer）。「写入 dsh 配置」按仿真写入 dsh 的 `api` 字段（claude→`anthropic-messages`、其余→`openai-completions`）与 `baseURL`（anthropic 不带 `/v1`——SDK 自拼路径，避免 `/v1/v1/messages` 双前缀 404）；模型条目自动带 `reasoningEfforts` 声明（off/low/medium/high/max），修改仿真后需重新「写入 dsh 配置」并重启 dsh web；
 - 配置（供应商列表/优先级/Key）保存在**程序目录旁 `data\gateway.config.json`**（绿色便携，随程序目录走；不可写时才回退 `%APPDATA%\DSH-App\`；与桌面助手配置同构，可直接沿用）；
 - **一次性自动迁移**：本地网关配置缺失、或仍是**模拟/示例数据**（mockA/mockB、provider-a/b）时，按优先级从桌面助手真实位置自动复制/升级（旧文件备份为 `.bak-mock`）——环境变量 `DSH_LEGACY_CONFIG` → 沿程序目录祖先链找 `<base>\dsh-desktop\data\`（真实便携配置） → `%USERPROFILE%\dsh-desktop\data\` → 旧 `%APPDATA%` 位置。来源本身是模拟数据的会被跳过；用户已修改的真实配置不会被覆盖；无导入按钮。
 
