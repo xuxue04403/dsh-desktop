@@ -12,10 +12,10 @@ const { Watchdog } = require('../src/watchdog');
 const { findDsh, findNode } = require('../src/launcher');
 
 let passed = 0;
+// 测试支持同步/异步用例：注册后顺序执行（saveConfig 等已改为 async）
+const __tests = [];
 function t(name, fn) {
-  fn();
-  passed++;
-  console.log('PASS  ' + name);
+  __tests.push({ name, fn });
 }
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-app-it-'));
@@ -47,21 +47,21 @@ t('网关：configPort 读取配置内端口', () => {
   assert.strictEqual(gm.configPort(), 3090);   // 解析失败 → 默认
 });
 
-t('网关：saveConfig 校验并写盘（合法）', () => {
+t('网关：saveConfig 校验并写盘（合法）', async () => {
   const good = JSON.stringify({
     port: 3090,
     apiKey: 'k',
     providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk-1', models: ['m'], priority: 1, enabled: true }],
   });
-  const r = gm.saveConfig(good);
+  const r = await gm.saveConfig(good);
   assert.strictEqual(r.ok, true);
   assert.ok(fs.existsSync(gm.configPath));
 });
 
-t('网关：saveConfig 拒绝非法文本（不落盘）', () => {
+t('网关：saveConfig 拒绝非法文本（不落盘）', async () => {
   const bad = JSON.stringify({ port: 3090, providers: [{ id: 'x' }] });   // 缺 baseURL
   const before = gm.configText();
-  const r = gm.saveConfig(bad);
+  const r = await gm.saveConfig(bad);
   assert.strictEqual(r.ok, false);
   assert.strictEqual(gm.configText(), before, '非法配置不应覆盖现有文件');
 });
@@ -162,8 +162,18 @@ t('launcher：findDsh 返回结构或 null（不断言具体版本）', () => {
   }
 });
 
-// 清理
-fs.rmSync(tmp, { recursive: true, force: true });
-
-console.log('');
-console.log('===== ' + passed + ' passed, 0 failed =====');
+// 顺序执行（支持 async 用例）
+(async () => {
+  for (const { name, fn } of __tests) {
+    await fn();
+    passed++;
+    console.log('PASS  ' + name);
+  }
+  // 清理
+  fs.rmSync(tmp, { recursive: true, force: true });
+  console.log('');
+  console.log('===== ' + passed + ' passed, 0 failed =====');
+})().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
