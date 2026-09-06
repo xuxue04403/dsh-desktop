@@ -133,6 +133,7 @@
     <div class="row">
       <label>统一 Key</label>
       <input type="password" id="gwApiKey" placeholder="网关对外统一 Key（任意客户端使用）" style="flex:1;" />
+      <button id="btnGwKeyCopy" title="复制统一 Key 到剪贴板" style="white-space:nowrap;">复制</button>
     </div>
     <div class="row">
       <label>调用策略</label>
@@ -434,6 +435,15 @@
 
     $('btnGwStart').onclick = async () => { await window.dshApp.gwAction('start'); await gwLoad(); };
     $('btnGwStop').onclick = async () => { await window.dshApp.gwAction('stop'); await gwLoad(); };
+    // 复制统一 Key 到剪贴板
+    $('btnGwKeyCopy').onclick = async () => {
+      const v = $('gwApiKey').value.trim();
+      if (!v) { toast('统一 Key 为空，无法复制'); return; }
+      try {
+        await window.dshApp.copyText(v);
+        toast('统一 Key 已复制到剪贴板');
+      } catch (_) { toast('复制失败'); }
+    };
     $('btnGwAddRow').onclick = () => {
       if (!gwCfg) gwCfg = { port: 3090, apiKey: '', providers: [] };
       const n = gwCfg.providers.length + 1;
