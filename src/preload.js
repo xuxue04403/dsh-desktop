@@ -16,6 +16,9 @@ contextBridge.exposeInMainWorld('dshApp', {
   gwState: () => ipcRenderer.invoke('gw:state'),
   gwAction: (name, payload) => ipcRenderer.invoke('gw:action', name, payload),
 
+  // 复制文本到剪贴板（主进程 clipboard，渲染进程无权限问题）
+  copyText: (text) => ipcRenderer.invoke('dsh:clipboard', String(text == null ? '' : text)),
+
   // 保存设置（patch 为扁平对象）
   saveSettings: (patch) => ipcRenderer.invoke('dsh:save-settings', patch),
 
