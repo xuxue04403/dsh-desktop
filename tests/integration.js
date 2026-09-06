@@ -99,6 +99,66 @@ t('网关：asar 内运行时解包到数据目录（外部 node 可读）', () 
   assert.ok(fs.existsSync(path.join(uData, 'gateway', 'gateway.config.example.json')), '示例应一并解包');
 });
 
+t('网关：translateBody 处理 developer 角色与推理档位翻译', () => {
+  const mjs = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
+  function grab(name) {
+    const start = mjs.indexOf('function ' + name + '(');
+    if (start < 0) return null;
+    let depth = 0, i = start;
+    for (; i < mjs.length; i++) {
+      if (mjs[i] === '{') depth++;
+      else if (mjs[i] === '}') { depth--; if (depth === 0) { i++; break; } }
+    }
+    return mjs.slice(start, i);
+  }
+  const trb = grab('translateReasoningBody');
+  const tb = grab('translateBody');
+  const ms = grab('maskSecretTokens');
+  assert.ok(trb && tb && ms, '翻译函数应存在');
+  const fn = new Function(ms + '\n' + trb + '\n' + tb + '\nreturn translateBody;')();
+  const sen = { id: 'sen', reasoningEffortMap: { off: 'none', low: 'low', medium: 'medium', high: 'high', max: 'xhigh' } };
+  const ag = { id: 'ag', reasoningEffortMap: { off: 'disabled', low: 'low', medium: 'medium', high: 'high', max: 'max' } };
+  // developer → system（sensenova 只认 system/assistant/user/tool）
+  const r1 = fn({ model: 'x', messages: [{ role: 'developer', content: 'sys' }, { role: 'user', content: 'hi' }] }, sen);
+  assert.strictEqual(r1.messages[0].role, 'system', 'developer 应转 system');
+  assert.strictEqual(r1.messages[1].role, 'user');
+  // 无映射 provider 也转 system（role 兼容独立于映射）
+  const r4 = fn({ model: 'x', messages: [{ role: 'developer', content: 'a' }] }, { id: 'n' });
+  assert.strictEqual(r4.messages[0].role, 'system');
+  // sensenova max→xhigh
+  const r2 = fn({ model: 'x', reasoning_effort: 'max', thinking: { type: 'enabled' }, messages: [{ role: 'user', content: 'q' }] }, sen);
+  assert.strictEqual(r2.reasoning_effort, 'xhigh');
+  assert.strictEqual(r2.thinking.type, 'enabled');
+  // sensenova off→none
+  const r3 = fn({ model: 'x', reasoning_effort: 'off', messages: [] }, sen);
+  assert.strictEqual(r3.reasoning_effort, 'none');
+  // agentrouter max 原值+thinking
+  const r5 = fn({ model: 'x', reasoning_effort: 'max', messages: [] }, ag);
+  assert.strictEqual(r5.reasoning_effort, 'max');
+  assert.strictEqual(r5.thinking.type, 'enabled');
+  // 无映射 provider 推理字段原样
+  const r6 = fn({ model: 'x', reasoning_effort: 'max', messages: [] }, { id: 'n' });
+  assert.strictEqual(r6.reasoning_effort, 'max');
+  assert.ok(!r6.thinking, '无映射时不应新增 thinking');
+  // 未指定档位原样
+  const r7 = fn({ model: 'x', messages: [{ role: 'user', content: 'a' }] }, sen);
+  assert.deepStrictEqual(r7, { model: 'x', messages: [{ role: 'user', content: 'a' }] });
+  // R9 密钥脱敏：token 样式串打码、普通文本保留（会话历史含 key 时上游不再误拦）
+  // 注：使用合成的假 key（与真实格式同构但无泄露风险；GitHub secret 扫描曾拦截含真实 key 的版本）
+  const FAKE_PAT = 'github_pat_11' + 'FAKE0TEST0KEY0NOT0REAL0XY'.replace(/0/g, '0').padEnd(36, 'Z') + '9zAb';
+  const FAKE_SK = 'sk-' + 'TESTFAKEKEY1234567890abcdef'.padEnd(30, 'x');
+  const r8 = fn({ model: 'x', messages: [
+    { role: 'user', content: 'token: ' + FAKE_PAT + ' 和 ' + FAKE_SK + '，普通文本保留' },
+    { role: 'assistant', content: '好的。' },
+  ] }, { id: 'n' });
+  const masked = r8.messages[0].content;
+  assert.ok(!masked.includes(FAKE_PAT), 'github_pat 完整串应打码');
+  assert.ok(masked.includes('github_pat_***'), 'github_pat 保留前缀');
+  assert.ok(!masked.includes(FAKE_SK), 'sk- 完整串应打码');
+  assert.ok(masked.includes('普通文本保留'), '普通文本应保留');
+  assert.strictEqual(r8.messages[1].content, '好的。', '助手消息不变');
+});
+
 t('网关：model-gateway.mjs 主流程支持 --config/--log 覆盖（防误读 %APPDATA% 旧配置）', () => {
   const mjs = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
   assert.ok(mjs.includes('function argvGet'), '应有 argv 参数工具');
