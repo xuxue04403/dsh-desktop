@@ -152,6 +152,48 @@ class GatewayManager extends EventEmitter {
     }
   }
 
+  // 解析网关应使用的代理：配置显式 proxy.enabled → 用配置 url（空则自动探测兜底）；
+  // 未配置 → 自动探测。返回 "http://host:port" 或 null。
+  resolveProxy() {
+    try {
+      const cfg = JSON.parse(this.configText() || '{}');
+      if (cfg.proxy && cfg.proxy.enabled) {
+        const u = String(cfg.proxy.url || '').trim();
+        if (u) {
+          const norm = u.includes('://') ? u : 'http://' + u;
+          this.log('模型网关：使用配置代理 ' + norm);
+          return norm;
+        }
+        this.log('模型网关：代理已启用但未填地址，回退自动探测…');
+      }
+    } catch (_) { /* 配置解析失败忽略 */ }
+    return this.detectProxy();
+  }
+
+  // 检测本机代理（clash/v2ray 等）：返回 "http://host:port" 或 null。
+  // 优先级：显式环境变量 > 系统代理(ProxyEnable=1) > 常用 clash 端口 7890/7897。
+  // 网关进程注入后走代理；若代理实际不可用，node fetch 会直连失败回退到原错误，
+  // 与未注入等价（不影响其他功能）。
+  detectProxy() {
+    const env = process.env;
+    if (env.HTTPS_PROXY) return env.HTTPS_PROXY;
+    if (env.https_proxy) return env.https_proxy;
+    try {
+      const { spawnSync } = require('child_process');
+      const r = spawnSync('powershell', [
+        '-NoProfile', '-Command',
+        "$p = Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings' -ErrorAction SilentlyContinue; " +
+        "if ($p.ProxyEnable -eq 1 -and $p.ProxyServer) { Write-Output $p.ProxyServer }",
+      ], { encoding: 'utf8', timeout: 10000, windowsHide: true });
+      const s = String(r.status === 0 ? (r.stdout || '') : '').trim();
+      if (s) {
+        const first = s.split(';')[0].split('=').pop().trim();
+        if (first) return first.includes('://') ? first : 'http://' + first;
+      }
+    } catch (_) { /* 忽略 */ }
+    return 'http://127.0.0.1:7890';   // clash 默认混合端口（不可用时直连兜底）
+  }
+
   // 全局清理"孤儿网关"进程：旧实例/旧版本残留的 node model-gateway.mjs 会一直占用
   // 配置端口，导致新实例 EADDRINUSE 启动失败（用户侧表现为"网关启动了但探测不通过"）。
   // 识别方式精准：仅杀命令行包含 model-gateway.mjs 的 node 进程，不会误伤其他程序。
@@ -214,6 +256,23 @@ async waitPortFree(port, timeoutMs) {
     // 注意：stdio 管道用于日志捕获；此 spawn 仅在用户环境（无沙箱限制）下运行
     // 传 --config/--log 并设 DSH_GATEWAY_CONFIG env，确保网关读 dsh-app 自己的数据目录
     // （不再误读 %APPDATA%\DSHDesktop 的旧/模拟配置）
+    const gwEnv = Object.assign({}, process.env, {
+      DSH_GATEWAY_CONFIG: this.configPath,
+      DSH_GATEWAY_LOG: this.logPath,
+      // 网关内部日志（catalog/调用/熔断）同时输出 stdout，设置页日志框才能实时看到
+      // （默认只写文件，stdout 仅有 listening，用户会误以为"无调用记录"）
+      DSH_GATEWAY_VERBOSE: '1',
+    });
+    // 代理注入（R6）：上游如 agentrouter/air-outer 需经 clash 类代理才能访问；
+    // node ≥24 的 fetch 支持 NODE_USE_ENV_PROXY=1 + HTTPS_PROXY。
+    // 优先级：配置显式启用（proxy.enabled + url）> 自动探测（系统代理/常用端口）。
+    const proxy = this.resolveProxy();
+    if (proxy) {
+      gwEnv.NODE_USE_ENV_PROXY = '1';
+      gwEnv.HTTPS_PROXY = proxy;
+      gwEnv.HTTP_PROXY = proxy;
+      this.log('模型网关：网关进程走代理 ' + proxy);
+    }
     this.proc = spawn(this.nodePath, [
       mjs,
       '--config', this.configPath,
@@ -222,13 +281,7 @@ async waitPortFree(port, timeoutMs) {
     ], {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: Object.assign({}, process.env, {
-        DSH_GATEWAY_CONFIG: this.configPath,
-        DSH_GATEWAY_LOG: this.logPath,
-        // 网关内部日志（catalog/调用/熔断）同时输出 stdout，设置页日志框才能实时看到
-        // （默认只写文件，stdout 仅有 listening，用户会误以为"无调用记录"）
-        DSH_GATEWAY_VERBOSE: '1',
-      }),
+      env: gwEnv,
     });
     this.running = true;
     this.emit('state');
@@ -236,7 +289,9 @@ async waitPortFree(port, timeoutMs) {
     const onData = (chunk) => {
       const text = chunk.toString('utf8');
       this.pushLog(text);
-      try { fs.appendFileSync(this.logPath, text, 'utf8'); } catch (_) { /* 忽略 */ }
+      // 注意：网关在 DSH_GATEWAY_VERBOSE=1 时已自行把 log() 写入 LOG_PATH，
+      // 宿主再把 stdout 追加同一文件会导致每行双写（曾误判为"重复请求/重连"）。
+      // 因此这里只推送界面，不再追加文件。
     };
     if (this.proc.stdout) this.proc.stdout.on('data', onData);
     if (this.proc.stderr) this.proc.stderr.on('data', onData);
@@ -279,7 +334,13 @@ async waitPortFree(port, timeoutMs) {
   }
 
   async restart() {
+    // 先停本实例进程
     await this.stop();
+    // 再全局清理残留网关进程（其他实例/旧版本遗留的 model-gateway.mjs 也会占用端口、
+    // 其内存熔断状态延续——必须杀干净再启动，否则旧熔断继续 skip provider）
+    this.killStaleGatewayProcesses();
+    // 等待端口彻底释放（taskkill 树杀有延迟）
+    await this.waitPortFree(this.port, 4000);
     await this.start();
   }
 
