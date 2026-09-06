@@ -22,12 +22,12 @@ let outName = process.env.OUT_NAME || defaultOut;
 let appDir = path.join(outDir, outName);
 const electronDist = path.join(root, 'node_modules', 'electron', 'dist');
 
-// 清理旧输出目录；EBUSY（有实例在运行）→ 自动回退目录
+// 清理旧输出目录；目录被占用（EBUSY/EPERM，实例在运行或文件被锁）→ 自动回退目录
 function prepareAppDir() {
   try {
     rmSync(appDir, { recursive: true, force: true });
   } catch (err) {
-    if (err.code !== 'EBUSY') throw err;
+    if (err.code !== 'EBUSY' && err.code !== 'EPERM') throw err;
     if (outName === fallbackOut) {
       console.error('[错误] 输出目录 ' + appDir + ' 被占用（应用可能正在运行）。请退出 DSH App 后重试。');
       process.exit(1);
@@ -37,7 +37,7 @@ function prepareAppDir() {
     try {
       rmSync(alt, { recursive: true, force: true });
     } catch (err2) {
-      if (err2.code === 'EBUSY') {
+      if (err2.code === 'EBUSY' || err2.code === 'EPERM') {
         console.error('[错误] 备用目录 ' + alt + ' 也被占用。请退出 DSH App 后重试。');
         process.exit(1);
       }
