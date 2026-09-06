@@ -123,9 +123,9 @@ function createMainWindow() {
 }
 
 // 注入到 dsh web 页面的两个悬浮入口（透明风格；点击打开壳设置窗并定位到对应卡片）
-// 定位策略：固定在页面右上角工具区（Session 下载等按钮）的**左侧同行**——
-// 取右上角区域最靠右的可点元素为锚点，浮层右边缘贴锚点左边缘、垂直对齐；
-// 找不到锚点时回退默认右上角。
+// 定位策略：固定在页面右上角工具按钮（Session 下载等）的**左侧同行**——
+// 只在注入后探测 3 次 + 窗口 resize 时定位（不用 MutationObserver，避免按钮跳动点不中）。
+// 锚点必须完全在视口内（过滤离屏/隐藏元素）；左侧放不下时回退右下角（绝不遮挡顶部按钮）。
 const FLOAT_BUTTONS_JS = [
   '(function(){',
   'if (document.getElementById("__dshapp_float")) return;',
@@ -142,33 +142,41 @@ const FLOAT_BUTTONS_JS = [
   'document.body.appendChild(d);',
   // —— 固定在右上角工具按钮左侧同行 ——
   'function place(){',
+  '  var W=window.innerWidth,H=window.innerHeight;',
   '  var anchor=null;',
-  '  var els=document.querySelectorAll("button,[role=button],[data-session],[data-toolbar],a");',
+  '  var els=document.querySelectorAll("button,[role=button],a[href]");',
   '  for(var i=0;i<els.length;i++){',
   '    var el=els[i];',
   '    if(!el.isConnected)continue;',
   '    if(el===d||d.contains(el))continue;',
+  '    var st=window.getComputedStyle(el);',
+  '    if(st.display==="none"||st.visibility==="hidden"||st.opacity==="0")continue;',
   '    var r=el.getBoundingClientRect();',
-  '    if(r.width===0||r.height===0)continue;',
-  '    // 限右上角工具区：视口右半 + 上部 140px，取最靠右的作为下载/工具按钮',
-  '    if(r.left>window.innerWidth*0.4 && r.top<140 && r.bottom>0){',
+  '    // 必须完全在视口内（过滤离屏 portal 元素），尺寸像按钮',
+  '    if(r.width<16||r.width>400||r.height<14||r.height>80)continue;',
+  '    if(r.left<0||r.top<0||r.right>W+1||r.bottom>H+1)continue;',
+  '    // 右上角工具区：视口右半 + 上部 140px',
+  '    if(r.left>W*0.4&&r.top<140){',
   '      if(!anchor||r.right>anchor.right)anchor=r;',
   '    }',
   '  }',
   '  if(anchor){',
-  '    // 垂直对齐锚点行，水平贴其左侧 10px',
-  '    d.style.top=Math.max(6,(anchor.top+anchor.height/2-15))+"px";',
-  '    d.style.right=(window.innerWidth-anchor.left+10)+"px";',
-  '    d.style.bottom="auto";',
-  '  }else{',
-  '    // 无锚点：回退默认右上角',
-  '    d.style.top="10px";d.style.right="34px";d.style.bottom="auto";',
+  '    var need=d.getBoundingClientRect().width||170;',
+  '    if(anchor.left-10>=need){',
+  '      // 左侧同行：垂直对齐锚点中心，右缘贴锚点左侧 10px',
+  '      d.style.top=Math.max(6,anchor.top+anchor.height/2-15)+"px";',
+  '      d.style.right=(W-anchor.left+10)+"px";',
+  '      d.style.bottom="auto";',
+  '      return;',
+  '    }',
   '  }',
+  '  // 无有效锚点或左侧放不下 → 右下角（远离顶部工具区，不遮挡）',
+  '  d.style.top="auto";',
+  '  d.style.bottom="18px";',
+  '  d.style.right="18px";',
   '}',
-  'setTimeout(place,300);setTimeout(place,1200);setTimeout(place,3000);',
+  'setTimeout(place,400);setTimeout(place,1500);setTimeout(place,4000);',
   'window.addEventListener("resize",place);',
-  'var mo=new MutationObserver(function(){clearTimeout(window.__dshappFloatT);window.__dshappFloatT=setTimeout(place,500);});',
-  'mo.observe(document.body,{childList:true,subtree:true});',
   '})();',
 ].join('\n');
 
