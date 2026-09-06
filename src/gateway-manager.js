@@ -57,6 +57,38 @@ class GatewayManager extends EventEmitter {
     this.running = false;
     this.logTail = '';
     this.port = 3090;   // 端口权威 = gateway.config.json 的 port（网关运行模式只认配置文件的端口）
+
+    // 打包后（app.asar 内）外部 node 无法读取 asar 内部文件，
+    // 因此把网关运行时解包到数据目录（可写、真实文件），spawn 用解包后的路径。
+    this.ensureRuntimeExtracted();
+  }
+
+  // 若 model-gateway.mjs 位于 asar 内，复制到 userDataDir\gateway\ 下供外部 node 执行
+  ensureRuntimeExtracted() {
+    try {
+      const asarMark = 'app.asar' + path.sep;
+      const inAsar = this.mjsPath.indexOf(asarMark) >= 0 || this.mjsPath.indexOf('app.asar\\') >= 0 || this.mjsPath.indexOf('app.asar/') >= 0;
+      if (!inAsar) return;                       // 开发/源码树直跑：路径本来就是真实文件
+      if (!fs.existsSync(this.mjsPath)) {
+        this.log('模型网关：缺少运行时 ' + this.mjsPath);
+        return;
+      }
+      const destDir = path.join(this.userDataDir, 'gateway');
+      fs.mkdirSync(destDir, { recursive: true });
+      const dest = path.join(destDir, 'model-gateway.mjs');
+      // 每次复制（asar 内为最新分发版本；数据目录只作执行副本）
+      fs.copyFileSync(this.mjsPath, dest);
+      this.mjsPath = dest;
+      this.log('模型网关：运行时已解包到 ' + dest);
+      // 示例配置一并解包（供首次初始化生成配置用）
+      const example = path.join(this.gatewayDir, 'gateway.config.example.json');
+      if (fs.existsSync(example)) {
+        const destExample = path.join(destDir, 'gateway.config.example.json');
+        fs.copyFileSync(example, destExample);
+      }
+    } catch (err) {
+      this.log('模型网关：运行时解包失败 ' + (err && err.message ? err.message : err));
+    }
   }
 
   // 读取配置中的端口（无配置/解析失败 → 默认 3090）
@@ -72,8 +104,14 @@ class GatewayManager extends EventEmitter {
   init() {
     try {
       if (!fs.existsSync(this.configPath)) {
-        const example = path.join(this.gatewayDir, 'gateway.config.example.json');
-        if (fs.existsSync(example)) {
+        // 优先用数据目录下的解包示例（打包后 asar 内示例也读不了——用 fs 其实可读，
+        // 但统一走解包副本更稳）
+        const candidates = [
+          path.join(this.userDataDir, 'gateway', 'gateway.config.example.json'),
+          path.join(this.gatewayDir, 'gateway.config.example.json'),
+        ];
+        const example = candidates.find((p) => fs.existsSync(p));
+        if (example) {
           fs.copyFileSync(example, this.configPath);
           this.log('模型网关：已从示例生成 ' + this.configPath + '（请修改为真实供应商后启动）');
         }
