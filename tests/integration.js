@@ -71,6 +71,34 @@ t('网关：validateConfigText 边界（空 providers 拒绝）', () => {
   assert.strictEqual(r.ok, false);
 });
 
+t('网关：asar 内运行时解包到数据目录（外部 node 可读）', () => {
+  // 模拟打包后：mjsPath 位于 app.asar 内
+  const asarTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-it-asar-'));
+  const asarDir = path.join(asarTmp, 'app.asar');
+  fs.mkdirSync(path.join(asarDir, 'gateway'), { recursive: true });
+  const srcMjs = path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs');
+  fs.copyFileSync(srcMjs, path.join(asarDir, 'gateway', 'model-gateway.mjs'));
+  const ex = path.join(__dirname, '..', 'src', 'gateway', 'gateway.config.example.json');
+  fs.copyFileSync(ex, path.join(asarDir, 'gateway', 'gateway.config.example.json'));
+
+  const uData = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-it-ud-'));
+  // 直接实例化并手动设置 gatewayDir/mjsPath 为 asar 路径后再跑解包
+  const g2 = new GatewayManager({
+    userDataDir: uData,
+    nodePath: 'node',
+    settings: fakeSettings,
+    logger: { appendLog: noopLog },
+  });
+  g2.gatewayDir = path.join(asarDir, 'gateway');
+  g2.mjsPath = path.join(asarDir, 'gateway', 'model-gateway.mjs');
+  g2.ensureRuntimeExtracted();
+
+  assert.ok(fs.existsSync(g2.mjsPath), 'mjsPath 应指向真实文件');
+  assert.ok(g2.mjsPath.indexOf('app.asar') < 0, '解包后不应仍指向 asar');
+  assert.strictEqual(g2.mjsPath, path.join(uData, 'gateway', 'model-gateway.mjs'));
+  assert.ok(fs.existsSync(path.join(uData, 'gateway', 'gateway.config.example.json')), '示例应一并解包');
+});
+
 // —— 安全模式：profile 备份 / 最小配置 / 还原 ——
 const wd = new Watchdog({
   settings: fakeSettings,
