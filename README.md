@@ -6,8 +6,10 @@
 - **进程外启动 `dsh web`**：通过稳定契约（`--no-open --port`、stdout `dsh web:<url>` 就绪行、`--patch` 覆盖层）驱动官方 dsh CLI，壳与 dsh 完全解耦——升级 dsh 不影响壳；
 - **看门狗 + 安全模式**：插件故障导致 dsh 启动失败时，自动解析日志 → `--dump-config` 匹配条目 → 生成 `--patch safe.yml` 禁用故障插件重启（Level 1）；无法定位时临时剥离第三方插件（Level 2，原配置自动备份），一键恢复；
 - **模型网关（可视化配置）**：设置页内置网关卡——供应商表格（启用开关 / ID / baseURL / 模型数 / 优先级），行末「编辑 / 删除」，下方编辑面板仿 dsh 模型配置页布局；JSON 高级区与表格双向同步；优先级路由 + 故障切换 + SSE + 分级熔断 + 一键「写入 dsh 配置」；
-- **对话输入历史**：在 Harness 对话框内按 **↑ / ↓** 查看本会话历史输入（按会话独立存储，Enter 发送后自动入列；不干扰 dsh 的 Enter/换行逻辑）；
-- **壳级入口常驻**：dsh 页面右上角悬浮「⚙ 设置 / 🛡 模型网关」按钮（服务就绪后仍可直达并定位高亮）；托盘菜单同款入口；
+- **对话输入历史**：在 Harness 对话框内按 **↑ / ↓** 查看本会话历史输入；历史**持久化到 `data\input-history.json`**（跨启动保留），按会话独立存储，Enter 发送后自动入列，不干扰 dsh 的 Enter/换行逻辑；实现在主进程（`before-input-event` 拦截），对 dsh 的 Lexical 富文本输入框兼容，不依赖页面注入时序；
+- **壳级入口常驻**：dsh 页面右上角悬浮「⚙ 设置 / 🛡 模型网关」按钮——**固定定位在页面右上角工具按钮（Session 下载等）的左侧同行**（自动探测锚点、垂直对齐，不遮挡任何页面按钮）；服务就绪后仍可直达并定位高亮；托盘菜单同款入口；
+- **图标全链一致**：托盘 / 窗口 / exe 全部使用 Electron 官方深蓝原子图标（`scripts/extract-exe-icon.mjs` 从 electron.exe 内嵌资源原样提取，与 DSH-App.exe 逐字节同源）；
+- **便携数据目录**：运行数据（设置/日志/网关配置/输入历史）保存在 **exe 旁 `data\`**，随程序目录走；首次运行自动从桌面助手（`dsh-desktop\data\`）一次性迁移网关配置；
 - **零原生依赖**：不需要 Visual Studio C++ 工具链（未引入 node-pty/koffi 等原生模块），`npm install` 即可。
 
 ## 环境要求
@@ -31,23 +33,30 @@ npm start          # 启动壳
 ```
 dsh-app/
 ├── src/
-│   ├── main.js         # 主进程：装配 + IPC + 生命周期 + 单实例锁
-│   ├── preload.js      # 渲染进程安全桥（contextIsolation）
+│   ├── main.js         # 主进程：装配 + IPC + 生命周期 + 单实例锁 + 输入历史（before-input-event）
+│   ├── preload.js      # 渲染进程安全桥（contextIsolation；含网关 gwState/gwAction 通道）
 │   ├── launcher.js     # dsh 发现/启动/停止/健康/就绪行解析（稳定契约）
 │   ├── watchdog.js     # 看门狗 + 安全模式（Level 1 / Level 2 / 一键恢复）
+│   ├── datadir.js      # 数据目录解析（exe 旁 data\ 优先 + 网关配置一次性迁移）
 │   ├── settings.js     # 设置持久化（数据目录 settings.json）
 │   ├── logger.js       # 日志落盘（app.log + web.log）
 │   ├── state.js        # 壳级状态机 + 广播
-│   ├── tray.js         # 系统托盘
+│   ├── tray.js         # 系统托盘（官方 electron 图标 + 状态 tooltip）
 │   ├── updater.js      # dsh 版本检查（直连 npm registry，免外部程序）
 │   ├── gateway-manager.js # 模型网关托管（复用桌面助手网关运行时）
+│   ├── icon.js         # 程序化图标工具（预留；实际使用官方提取资源）
+│   ├── assets/         # 从 electron.exe 提取的官方图标（electron-icon.png/.ico）
 │   └── gateway/        # 模型网关运行时（model-gateway.mjs，零依赖，原样分发）
 ├── renderer/
 │   ├── status.html     # 引导/失败/安全模式页
 │   └── settings.html   # 设置页（含模型网关面板）
 ├── scripts/
 │   ├── build-portable.mjs   # 绿色免安装版（手工 asar + dist 复制）
-│   └── portable.mirror.mjs  # 单文件便携 exe（electron-builder + 镜像）
+│   ├── portable.mirror.mjs  # 单文件便携 exe（electron-builder + 镜像）
+│   ├── extract-exe-icon.mjs # 从 electron.exe 提取官方内嵌图标（zero-dep PE 解析）
+│   ├── dist.mirror.mjs      # NSIS 安装版 + 单文件便携（npmmirror 镜像）
+│   ├── release.ps1          # 通用发布脚本（版本号从 package.json 读取）
+│   └── reupload-zip.ps1     # 单资产补传（大文件上传断线重试）
 └── tests/unit.js       # 纯逻辑单测（node tests/unit.js）
 ```
 
@@ -72,7 +81,8 @@ dsh-app/
 - **分级熔断**：401/403 业务拒绝立即熔断 30 分钟；网络错误/5xx 连续 3 次熔断 5 分钟；日志自动脱敏；
 - 可选 `clientUA` 仿真、`/health` 健康检查；
 - **「写入 dsh 配置」**：自动把网关注册为 dsh 的 `gateway` 提供商并写入统一 Key，重启 dsh web 后在模型选择器直接选用；
-- 配置（供应商列表/优先级/Key）保存在**程序目录旁 `data\gateway.config.json`**（绿色便携，随程序目录走；不可写时才回退 `%APPDATA%\DSH-App\`；与桌面助手配置同构，可直接沿用）。
+- 配置（供应商列表/优先级/Key）保存在**程序目录旁 `data\gateway.config.json`**（绿色便携，随程序目录走；不可写时才回退 `%APPDATA%\DSH-App\`；与桌面助手配置同构，可直接沿用）；
+- **一次性自动迁移**：首次运行且本地尚无网关配置时，按优先级从桌面助手真实位置复制——环境变量 `DSH_LEGACY_CONFIG` → `%USERPROFILE%\dsh-desktop\data\` → `%USERPROFILE%\DSHDesktop\data\` → 工作区 `dsh-desktop\data\` → 旧 `%APPDATA%` 位置。不覆盖已存在的配置，无导入按钮。
 
 ## 打包分发（免安装版）
 
@@ -84,9 +94,12 @@ node scripts/portable.mirror.mjs       # 单文件便携 exe（electron-builder 
 npm run dist                           # 完整安装包（NSIS）
 ```
 
-- 绿色版无需安装、不写注册表；**运行数据（设置/日志/网关配置）保存在程序目录旁 `data\`**——复制/移动整个目录即随身携带，删除即重置；不可写时才回退 `%APPDATA%\DSH-App\`（旧数据会自动迁移一次）；
+- 绿色版无需安装、不写注册表；**运行数据（设置/日志/网关配置/输入历史）保存在程序目录旁 `data\`**——复制/移动整个目录即随身携带，删除即重置；不可写时才回退 `%APPDATA%\DSH-App\`（旧数据会自动迁移一次）；
+- **图标全链一致（Electron 官方图标）**：`scripts/extract-exe-icon.mjs` 从 `node_modules\electron\dist\electron.exe` 的内嵌资源原样提取官方深蓝原子图标（`src/assets/electron-icon.png` + `.ico`），托盘 / 窗口 / 绿色版 icon 与 DSH-App.exe 完全一致；安装版/单文件便携版由 electron-builder 直接使用默认 Electron 图标，无需 rcedit 手动步骤；
 - 两种打包均**不需要 Visual Studio C++ 工具链**；
-- 若 GitHub 下载慢，打包工具已走 npmmirror 镜像（`portable.mirror.mjs` 内置），也可用环境变量 `ELECTRON_MIRROR` / `ELECTRON_BUILDER_BINARIES_MIRROR` 覆盖。
+- 若 GitHub 下载慢，打包工具已走 npmmirror 镜像（`portable.mirror.mjs` / `dist.mirror.mjs` 内置），也可用环境变量 `ELECTRON_MIRROR` / `ELECTRON_BUILDER_BINARIES_MIRROR` 覆盖。
+
+> 若托盘图标仍看不到：右击任务栏空白处 →「任务栏设置」→「选择要在任务栏上显示的图标」→ 打开 DSH App 开关（Windows 11）/ 或在「通知区域」设置中把 DSH App 设为"始终显示"（Windows 10）。
 
 ## 安全模式（插件故障兜底）
 
@@ -123,45 +136,31 @@ npm i -g @deepseek-ai/dsh@latest     # 全局安装/升级
 
 壳启动时自动采用可用版本最高者（npm 全局 / npx 缓存）；升级后重启服务即生效，壳无需任何改动。
 
-## 打包分发
+## 发布
 
-```powershell
-npm run dist    # electron-builder 产出 NSIS 安装包（out/）
-npm run pack    # 仅产出解包目录（快速自测）
-```
-
-图标由 `src/icon.js` 程序化生成（品牌蓝徽标，零外部资源），保证 **托盘 / 窗口 / exe 图案统一**：
-
-- **托盘图标**：与 exe 同一徽标图案，随服务状态**变色**——灰=已停止 / 黄=启动中 / 绿=运行中 / 红=失败 / 橙=安全模式；首次启动会弹出气泡提示（若图标被 Windows 收进溢出区，点任务栏「^」即可找到）；
-- **窗口/任务栏图标**：启动时生成（`BrowserWindow.icon`），与托盘同图案；
-- **exe 图标**：打包脚本会生成标准 `icon.ico`（16/32/256 多尺寸，绿色目录根与 `assets/`）。绿色版的 exe 资源图标请在本机执行一次：
-  ```powershell
-  npm i -D rcedit
-  node scripts/set-exe-icon.cjs      # 替换 out\DSH-App\DSH-App.exe 图标（重启后生效）
-  ```
-  之后资源管理器/任务栏中的 exe 图标即与托盘/窗口图案一致；electron-builder 单文件打包（`npm run portable:mirror`）会直接用 `assets/icon.ico` 自动嵌入，无需手动步骤。
-
-> 若托盘图标仍看不到：右击任务栏空白处 →「任务栏设置」→「选择要在任务栏上显示的图标」→ 打开 DSH App 开关（Windows 11）/ 或在「通知区域」设置中把 DSH App 设为"始终显示"（Windows 10）。
-
-## 发布（V1.5.0）
+版本号在 `package.json` 的 `version` 字段；发布脚本自动读取（v1.5.5 → tag `v1.5.5`），无需改脚本：
 
 ```powershell
 # 1) 编译产物（本机执行）
-npm i -D rcedit
-npm run dist:mirror          # NSIS 安装版 + 单文件便携（dist/，走 npmmirror 镜像，免 VS 工具链）
-node scripts/build-portable.mjs   # 绿色版（out/DSH-App/；若旧目录被运行中实例占用：
-                                #   $env:OUT_NAME='DSH-App-v1.5.0' 后重跑）
+npm run dist:mirror              # NSIS 安装版 + 单文件便携（dist/，走 npmmirror 镜像，免 VS 工具链）
+node scripts/build-portable.mjs  # 绿色版（out/DSH-App/；若旧目录被运行中实例占用自动回退，
+                                 #   也可 $env:OUT_NAME='DSH-App-v1.5.5' 指定）
 
-# 2) 发布到 GitHub（无需 git 客户端，API Token 仅在内存中）
-powershell -ExecutionPolicy Bypass -File scripts\release-v1.5.0.ps1 -Token <TOKEN> [-CleanOld]
-#   -CleanOld：清理仓库里 v1.x C# 桌面助手的旧文件（setup/、gateway/、DSHDesktop.cs 等）
-#   Release v1.5.0 附带：安装版 exe / 单文件便携 exe / 绿色版 zip
+# 2) 发布到 GitHub（无需 git 客户端；API Token 仅在内存中）
+powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Token <TOKEN> [-CleanOld]
+#   -CleanOld：清理仓库里 v1.x C# 桌面助手的旧文件（setup/、gateway/、DSHDesktop.cs 等，仅首次需要）
+#   Release 附带：安装版 exe / 单文件便携 exe / 绿色版 zip（同名资产自动替换）
+
+# 3) 大文件上传断线补传（可选）
+powershell -ExecutionPolicy Bypass -File scripts\reupload-zip.ps1 -Token <TOKEN>
 ```
+
+> 提示：PS5.1 下脚本须为 UTF-8 **带 BOM**（否则中文注释乱码）；脚本内读 `package.json` 显式指定 `-Encoding UTF8`。
 
 ## 测试
 
 ```powershell
-npm test          # 单测 16 项 + 集成 9 项（看门狗/网关/图标/安全模式文件往返）
+npm test          # 单测 22 项 + 集成 9 项（看门狗/网关/图标/数据迁移/安全模式文件往返）
 npm run check     # 语法检查
 ```
 
