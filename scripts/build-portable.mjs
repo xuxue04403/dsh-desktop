@@ -20,10 +20,26 @@ const defaultOut = 'DSH-App';
 const fallbackOut = 'DSH-App-v' + pkg.version;
 let outName = process.env.OUT_NAME || defaultOut;
 let appDir = path.join(outDir, outName);
+let dataBackupPath = null;   // R13：构建前备份的 data 目录（模块级，回退时也可靠）
 const electronDist = path.join(root, 'node_modules', 'electron', 'dist');
 
 // 清理旧输出目录；目录被占用（EBUSY/EPERM，实例在运行或文件被锁）→ 自动回退目录
+// R13：构建不销毁用户数据——剔除旧的 data\（运行数据）并在构建后还原；
+// 否则每次构建都把用户的网关配置/日志/设置清空，启动时从桌面助手迁移旧配置（数据回退）。
 function prepareAppDir() {
+  // R13：data 备份用固定名（回退目录时 outName 会变，不能用 outName 命名否则
+  // restore 找不到）；构建是单实例操作，固定名无并发冲突。
+  const dataBackup = path.join(outDir, '_data-backup');
+  let hadData = false;
+  // (a) 当前目标目录的数据备份
+  const dataDir = path.join(appDir, 'data');
+  try {
+    if (existsSync(dataDir)) {
+      rmSync(dataBackup, { recursive: true, force: true });
+      cpSync(dataDir, dataBackup, { recursive: true });
+      hadData = true;
+    }
+  } catch (_) { /* 备份失败继续 */ }
   try {
     rmSync(appDir, { recursive: true, force: true });
   } catch (err) {
@@ -45,6 +61,31 @@ function prepareAppDir() {
     }
     outName = fallbackOut;
     appDir = alt;
+    // (b) 回退目录的数据备份（回退目标同样可能携带用户数据）
+    const altData = path.join(appDir, 'data');
+    try {
+      if (existsSync(altData)) {
+        rmSync(dataBackup, { recursive: true, force: true });
+        cpSync(altData, dataBackup, { recursive: true });
+        hadData = true;
+      }
+    } catch (_) { /* 忽略 */ }
+  }
+  if (hadData) dataBackupPath = dataBackup;   // 模块级保存（appDir 重赋值不影响）
+}
+
+// 构建完成后还原用户数据目录（R13）
+function restoreDataDir() {
+  const dataBackup = dataBackupPath;
+  if (!dataBackup) return;
+  try {
+    if (existsSync(dataBackup)) {
+      cpSync(dataBackup, path.join(appDir, 'data'), { recursive: true });
+      rmSync(dataBackup, { recursive: true, force: true });
+      console.log('[数据保留] 已还原 data\\ （构建未销毁用户配置/日志）。');
+    }
+  } catch (err) {
+    console.log('[警告] data\\ 还原失败（' + (err && err.message ? err.message : err) + '），可手动复制。');
   }
 }
 
@@ -100,6 +141,7 @@ writeFileSync(path.join(appDir, '使用说明.txt'),
   'utf8');
 
 console.log('[OK] 绿色免安装版已生成: ' + appDir);
+restoreDataDir();   // R13：构建后还原用户 data\（配置/日志不丢）
 console.log('OUTDIR=' + appDir);
 console.log('     启动方式：双击 ' + path.join(appDir, 'DSH-App.exe'));
 console.log('     分发方式：将 ' + outName + ' 目录压缩为 zip 即可（解压即用）。');
