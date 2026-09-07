@@ -488,13 +488,28 @@ function desensitizeLongTokens(text) {
 
 // 对消息体做深度降敏（messages 的字符串 content；tool 消息内容也降敏——历史工具
 // 结果正是长串重灾区；tool_calls 参数不动，避免破坏工具调用的 JSON）
+// R14：兼容 Anthropic blocks 数组（[{type:'text',text:'…'}]）——对 text 块降敏
 function desensitizeBodyMessages(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body) || !Array.isArray(body.messages)) return body;
   let changed = false;
   const msgs = body.messages.map((m) => {
-    if (!m || typeof m.content !== 'string') return m;
-    const d = desensitizeLongTokens(m.content);
-    if (d !== m.content) { changed = true; return { ...m, content: d }; }
+    if (!m) return m;
+    if (typeof m.content === 'string') {
+      const d = desensitizeLongTokens(m.content);
+      if (d !== m.content) { changed = true; return { ...m, content: d }; }
+      return m;
+    }
+    if (Array.isArray(m.content)) {
+      let bc = false;
+      const blocks = m.content.map((b) => {
+        if (b && b.type === 'text' && typeof b.text === 'string') {
+          const d = desensitizeLongTokens(b.text);
+          if (d !== b.text) { bc = true; return { ...b, text: d }; }
+        }
+        return b;
+      });
+      if (bc) { changed = true; return { ...m, content: blocks }; }
+    }
     return m;
   });
   return changed ? { ...body, messages: msgs } : body;
@@ -505,12 +520,18 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   let upstream;
+  let firstDetail = null;   // 首次响应体（若已读取，后续分支复用，避免 body 二次消费报错）
   try {
     // baseURL 允许“带 /v1”或“不带 /v1”两种写法（OpenAI SDK 惯例 / 用户习惯）：
     // upstreamBase() 统一规范化，upstreamPath 始终是相对 /v1 的路径（如 /chat/completions、/messages）
     // 注：Anthropic 协议（T5）下 upstreamHeaders 由 upstreamRequestHeaders(..., anthropic=true) 构造，
     // 含 x-api-key + anthropic-version、无 authorization Bearer；展开覆盖时不会被注入 Bearer。
-    const outBody = translateBody(body, provider);   // R5：role 兼容 + 推理档位翻译
+    // R14：translateBody（role 兼容/推理翻译）是 OpenAI 协议专用——Anthropic 路径
+    // 误用会破坏协议语义（如 thinking:{type:'disabled'} 被换成 reasoning_effort 字段，
+    // 导致"关闭推理"失效——上游收到非 Anthropic 字段而按默认开推理处理）。
+    // Anthropic 请求的 R9 打码已在 handleMessages 完成，这里原样透传。
+    const isAnthropicPath = upstreamPath === '/messages';
+    const outBody = isAnthropicPath ? body : translateBody(body, provider);   // R5：role 兼容 + 推理档位翻译
     upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
       method: 'POST',
       headers: upstreamHeaders,
@@ -522,9 +543,8 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     // 消息体**重试一次**（换新连接；历史里的 32+ 位技术串占位符化后不再命中平台
     // "疑似密钥"过滤）。重试成功则继续走正常流式转发；仍失败则按原逻辑处理。
     if (!upstream.ok) {
-      let detail0 = '';
-      try { detail0 = (await upstream.text()).slice(0, 500); } catch { }
-      if (/sensitive\s*words|content[-_]blocked|content_blocked/i.test(detail0)) {
+      try { firstDetail = (await upstream.text()).slice(0, 500); } catch { }
+      if (/sensitive\s*words|content[-_]blocked|content_blocked/i.test(firstDetail)) {
         const deBody = desensitizeBodyMessages(outBody);
         if (deBody !== outBody) {
           log(`upstream ${provider.id} 内容拦截，已降敏重试一次…`);
@@ -537,6 +557,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
             signal: c2.signal,
           });
           clearTimeout(t2);
+          firstDetail = null;   // 换了新响应，detail 需重读
         }
       }
     }
@@ -550,9 +571,12 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
   }
   clearTimeout(timer);
   if (!upstream.ok) {
-    // surface upstream error body if small
-    let detail = '';
-    try { detail = (await upstream.text()).slice(0, 500); } catch { }
+    // surface upstream error body if small（复用 firstDetail：body 只能读一次，
+    // 之前 text() 已消费时再读会抛 "body already consumed" 丢失详情）
+    let detail = firstDetail;
+    if (detail === null) {
+      try { detail = (await upstream.text()).slice(0, 500); } catch { }
+    }
     log(`upstream ${provider.id} HTTP ${upstream.status}: ${maskSecrets(detail)}`);   // V1：日志脱敏
     // R8：上游内容拦截/异常时，把触发请求的"结构摘要"落盘（不含明文 key，内容截 60 字符），
     // 用于定位是什么特征触发了上游过滤（sensitive words / content-blocked）。
@@ -664,21 +688,26 @@ function dumpBodyDigest(body, tag) {
     const dir = process.env.DSH_GATEWAY_DUMP_BODY;
     if (!dir) return;
     fs.mkdirSync(dir, { recursive: true });
-    // 完整请求体（脱敏 key 后落盘，供逐字节对比/取证）
+    // 完整请求体（脱敏后落盘，供逐字节对比/取证——明文 key/长串经 maskSecretTokens 打码）
     if (process.env.DSH_GATEWAY_DUMP_FULL === '1' && body && body.messages) {
       const sanitized = {
         ...body,
         messages: body.messages.map((m) => {
           if (!m) return m;
           const n = { ...m };
-          if (typeof n.content === 'string') n.content = n.content;
+          if (typeof n.content === 'string') n.content = maskSecretTokens(n.content);
+          if (Array.isArray(n.content)) {
+            n.content = n.content.map((b) =>
+              (b && b.type === 'text' && typeof b.text === 'string')
+                ? { ...b, text: maskSecretTokens(b.text) } : b);
+          }
           if (n.tool_calls) n.tool_calls = '<tool_calls>';   // 不落工具参数细节
           return n;
         }),
       };
       const fullF = path.join(dir, 'full-' + Date.now() + '-' + tag + '.json');
       fs.writeFileSync(fullF, JSON.stringify(sanitized), 'utf8');
-      log(`[dump] 完整请求体 -> ${fullF} (${sanitized.messages.length} 条消息)`);
+      log(`[dump] 完整请求体(脱敏) -> ${fullF} (${sanitized.messages.length} 条消息)`);
     }
     const digest = {
       at: localStamp(),
