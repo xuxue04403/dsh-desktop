@@ -72,6 +72,8 @@ node (Join-Path $root 'scripts\dist.mirror.mjs')
 if ($LASTEXITCODE -ne 0) { Write-Host '[FAIL] dist.mirror.mjs (NSIS build)'; exit 1 }
 
 # portable zip for release asset（从 build 输出的实际绿色目录打包；文件名用 ASCII，避免 PS5.1 编码问题）
+# 安全（R15）：发布 zip 必须剔除 data\（用户运行数据含真实供应商 key——绝不外发）。
+# 做法先把 data\ 移到临时位置，打包后还原（build-portable 的 R13 数据保留在本机不受影响）。
 $zipOut = Join-Path $root 'dist'
 $zipPath = Join-Path $zipOut ("DSHApp-" + $Version.Substring(1) + "-Portable.zip")
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
@@ -79,7 +81,20 @@ if (-not (Test-Path (Join-Path $greenDir 'DSH-App.exe'))) {
     Write-Host "[FAIL] green dir missing exe: $greenDir"
     exit 1
 }
-Compress-Archive -Path (Join-Path $greenDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
+$dataDir = Join-Path $greenDir 'data'
+$dataStash = Join-Path $root ('out\_data-stash-' + (Get-Date -Format 'yyyyMMddHHmmss'))
+$moved = $false
+if (Test-Path $dataDir) {
+    New-Item -ItemType Directory -Path (Split-Path $dataStash -Parent) -Force | Out-Null
+    Move-Item $dataDir $dataStash -Force
+    $moved = $true
+    Write-Host '[安全] 发布 zip 已剔除 data\（不含任何 key/配置/日志）'
+}
+try {
+    Compress-Archive -Path (Join-Path $greenDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
+} finally {
+    if ($moved) { Move-Item $dataStash $dataDir -Force; Write-Host '[安全] data\ 已还原到绿色目录（本机数据保留）' }
+}
 
 # ---------- 1. verify identity ----------
 Write-Host '[..] 4/4 publish...'
