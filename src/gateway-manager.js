@@ -57,6 +57,7 @@ class GatewayManager extends EventEmitter {
     this.running = false;
     this.logTail = '';
     this.port = 3090;   // 端口权威 = gateway.config.json 的 port（网关运行模式只认配置文件的端口）
+    this._starting = null;   // 启动互斥锁：并发 start/restart 只执行一次（防双 spawn EADDRINUSE）
 
     // 打包后（app.asar 内）外部 node 无法读取 asar 内部文件，
     // 因此把网关运行时解包到数据目录（可写、真实文件），spawn 用解包后的路径。
@@ -239,6 +240,19 @@ async waitPortFree(port, timeoutMs) {
 
   async start() {
     if (this.proc) return;
+    // 启动互斥：并发 start/restart（保存按钮的 start 与 restart 尾部、托盘双击等）
+    // 只允许一个在执行——否则双 spawn 一个 EADDRINUSE 退出、this.proc 引用互相覆盖。
+    if (this._starting) return this._starting;
+    this._starting = this._doStart();
+    try {
+      return await this._starting;
+    } finally {
+      this._starting = null;
+    }
+  }
+
+  async _doStart() {
+    if (this.proc) return;
     this.port = this.configPort();   // 以配置文件为准（--port 参数仅对 --write-dsh 生效）
     const mjs = this.mjsPath;
     if (!fs.existsSync(mjs)) {
@@ -358,13 +372,15 @@ async waitPortFree(port, timeoutMs) {
 
   // 一键写入 dsh 配置（把网关注册为 dsh 的 gateway 提供商 + 统一 Key）
   async writeDsh() {
+    // 端口以配置文件为准（this.port 是上次 start 的值——网关未运行/刚改端口时会是旧值）
+    const port = this.configPort();
     const r = spawnSync(
       this.nodePath,
       [
         this.mjsPath,
         '--write-dsh',
         '--config', this.configPath,
-        '--port', String(this.port),
+        '--port', String(port),
       ],
       {
         encoding: 'utf8',
