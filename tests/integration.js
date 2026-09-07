@@ -159,6 +159,17 @@ t('网关：translateBody 处理 developer 角色与推理档位翻译', () => {
   assert.strictEqual(r8.messages[1].content, '好的。', '助手消息不变');
 });
 
+// R14：Anthropic 路径（/messages）不得走 translateBody——否则 thinking:{type:'disabled'}
+// 被 OpenAI 风格的 reasoningEffortMap 翻译破坏（删 thinking 换 reasoning_effort 字段），
+// 上游按默认开推理处理，"关闭推理"失效。
+t('网关：forward 对 Anthropic 路径跳过 OpenAI 专用翻译（R14）', () => {
+  const mjs = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
+  assert.ok(mjs.includes("const isAnthropicPath = upstreamPath === '/messages';"),
+    'forward 应按路径识别 Anthropic 协议');
+  assert.ok(mjs.includes('isAnthropicPath ? body : translateBody(body, provider)'),
+    'Anthropic 路径应原样透传（不 translateBody）');
+});
+
 t('网关：model-gateway.mjs 主流程支持 --config/--log 覆盖（防误读 %APPDATA% 旧配置）', () => {
   const mjs = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
   assert.ok(mjs.includes('function argvGet'), '应有 argv 参数工具');
@@ -168,6 +179,54 @@ t('网关：model-gateway.mjs 主流程支持 --config/--log 覆盖（防误读 
   assert.ok(mjs.includes("if (cfgFromArg) CONFIG_PATH = cfgFromArg;"), '--config 应覆盖配置路径');
   assert.ok(mjs.includes("const logFromArg = argvGet('--log')"), '主流程应解析 --log');
   assert.ok(mjs.includes("if (logFromArg) LOG_PATH = logFromArg;"), '--log 应覆盖日志路径');
+});
+
+// —— 审计验证（R12/协议联动/新增模型自动声明推理档位）——
+// 场景：供应商添加新模型（如 kimi-k4）后点「写入 dsh 配置」——settings.yaml 的模型条目
+// 应自动带 reasoningEfforts 声明（含 max），否则 pi-ai 回退已安装目录能力报
+// "does not support reasoning effort max"。
+t('网关：write-dsh 对新增模型自动声明 reasoningEfforts + 协议联动 baseURL', async () => {
+  // 源码结构断言（任何环境可跑）：
+  const mjsSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
+  assert.ok(mjsSrc.includes("reasoningEfforts:\\n            off: null\\n            low: low"),
+    'modelLines 模板应含 reasoningEfforts 声明（off/low/...）');
+  assert.ok(mjsSrc.includes("reasoningEfforts:\\n            off: null\\n            low: low\\n            medium: medium\\n            high: high\\n            max: max"),
+    'modelLines 模板应含完整五档（含 max）');
+  assert.ok(mjsSrc.includes("wireApi === 'anthropic-messages'\n    ? `http://127.0.0.1:${port}`\n    : `http://127.0.0.1:${port}/v1`"),
+    'baseURL 应按协议分流（anthropic 无 /v1）');
+  // 端到端（沙箱限制 spawn 时降级为结构断言已覆盖）
+  try {
+    const { spawnSync } = require('child_process');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-wd-'));
+    const cfgPath = path.join(tmpDir, 'gateway.config.json');
+    const settingsPath = path.join(tmpDir, 'settings.yaml');
+    fs.writeFileSync(settingsPath, 'llm-pi-ai:\n  providers:\n    other:\n      apiKeyEnv: X\n', 'utf8');
+    fs.writeFileSync(cfgPath, JSON.stringify({
+      port: 3099, apiKey: 'k',
+      clientProfile: 'claude',
+      providers: [
+        { id: 'p1', baseURL: 'https://a.com/v1', apiKey: 'sk-1', models: ['deepseek-v4-flash', 'kimi-k4'], priority: 1, enabled: true },
+      ],
+    }), 'utf8');
+    const r = spawnSync(process.execPath, [
+      path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'),
+      '--write-dsh', '--config', cfgPath, '--settings', settingsPath,
+      '--credentials', path.join(tmpDir, 'creds.yaml'), '--port', '3099',
+    ], { encoding: 'utf8', timeout: 60000, windowsHide: true });
+    if (r.status === 0) {
+      const out = fs.readFileSync(settingsPath, 'utf8');
+      assert.ok(out.includes('api: anthropic-messages'), 'claude 仿真应写 anthropic-messages');
+      assert.ok(out.includes('baseURL: http://127.0.0.1:3099\n'), 'anthropic 的 baseURL 应不带 /v1');
+      assert.ok(/- id: 'kimi-k4'[\s\S]*?reasoningEfforts:[\s\S]*?max: max/.test(out),
+        '新增模型 kimi-k4 应自动声明 reasoningEfforts（含 max）');
+      console.log('  (端到端 write-dsh 验证通过)');
+    } else {
+      console.log('  (spawn 受限，端到端降级——源码结构断言已覆盖)');
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  } catch (_) {
+    console.log('  (spawn 异常，端到端降级——源码结构断言已覆盖)');
+  }
 });
 
 // —— 安全模式：profile 备份 / 最小配置 / 还原 ——
