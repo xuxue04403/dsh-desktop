@@ -401,7 +401,9 @@
       $('gwClientUA').style.display = (sel === 'custom') ? '' : 'none';
       const portVal = parseInt(gwCfg.port, 10) || 3090;
       if (!$('gwPort').value || parseInt($('gwPort').value, 10) !== portVal) $('gwPort').value = portVal;
-      $('gwBaseUrl').textContent = 'http://127.0.0.1:' + portVal + '/v1';
+      // 对外地址按协议显示（anthropic 协议的 baseURL 不带 /v1，与「写入 dsh 配置」一致）
+      const isAnthropic = ($('gwProfile').value === 'claude');
+      $('gwBaseUrl').textContent = 'http://127.0.0.1:' + portVal + (isAnthropic ? '' : '/v1');
       // 网络代理回填
       const px = gwCfg.proxy || {};
       $('gwProxyEnabled').checked = !!px.enabled;
@@ -421,10 +423,17 @@
       $('gwClientUA').style.display = ($('gwProfile').value === 'custom') ? '' : 'none';
     });
 
-    // 端口输入实时联动对外地址显示
+    // 端口输入实时联动对外地址显示（按当前仿真协议决定是否带 /v1）
     $('gwPort').addEventListener('input', () => {
       const p = parseInt($('gwPort').value, 10);
-      if (p >= 1 && p <= 65535) $('gwBaseUrl').textContent = 'http://127.0.0.1:' + p + '/v1';
+      const isAnthropic = ($('gwProfile').value === 'claude');
+      if (p >= 1 && p <= 65535) $('gwBaseUrl').textContent = 'http://127.0.0.1:' + p + (isAnthropic ? '' : '/v1');
+    });
+    // 仿真切换时同步对外地址显示
+    $('gwProfile').addEventListener('change', () => {
+      const p = parseInt($('gwPort').value, 10) || 3090;
+      const isAnthropic = ($('gwProfile').value === 'claude');
+      $('gwBaseUrl').textContent = 'http://127.0.0.1:' + p + (isAnthropic ? '' : '/v1');
     });
 
     async function gwLoad() {
