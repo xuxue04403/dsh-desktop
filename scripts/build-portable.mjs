@@ -156,6 +156,25 @@ cpSync(path.join(root, 'src', 'assets', 'electron-icon.ico'), path.join(root, 'a
 cpSync(path.join(root, 'src', 'assets', 'electron-icon.png'), path.join(appDir, 'icon.png'));
 cpSync(path.join(root, 'src', 'assets', 'electron-icon.ico'), path.join(appDir, 'icon.ico'));
 
+// —— 5.5) 内置 pnpm（v1.5.18b：dsh plugin 内部调 pnpm——必须内置，否则
+//   'pnpm' 不是内部或外部命令。版本与官方 dsh-desktop 一致：11.8.0（pnpm 10+ 不再
+//   拒绝 workspace-root add）。来源：项目 vendor 目录（构建机预下载）或本次构建下载。 ——
+{
+  const pnpmVer = '11.8.0';
+  const pnpmDst = path.join(appDir, 'resources', 'node_modules', 'pnpm');
+  const vendored = path.join(root, 'vendor', 'pnpm-' + pnpmVer);
+  let src = null;
+  if (existsSync(path.join(vendored, 'bin', 'pnpm.cjs'))) src = vendored;
+  else if (existsSync(path.join(root, 'out', '_pnpm11', 'package', 'bin', 'pnpm.cjs'))) src = path.join(root, 'out', '_pnpm11', 'package');
+  if (src) {
+    rmSync(pnpmDst, { recursive: true, force: true });
+    cpSync(src, pnpmDst, { recursive: true });
+    console.log('[内嵌] pnpm ' + pnpmVer + ' → resources\\node_modules\\pnpm（源: ' + src + '）');
+  } else {
+    console.log('[警告] 未找到 pnpm ' + pnpmVer + '——dsh plugin 安装/卸载将失败（需 pnpm）');
+  }
+}
+
 // —— 6) 说明文件 ————————————————————————————————————
 writeFileSync(path.join(appDir, '使用说明.txt'),
   'DSH App（DeepSeek Harness 桌面壳）· 绿色免安装版\r\n'
