@@ -139,7 +139,7 @@
     </div>
     <div class="row">
       <label>对外地址</label>
-      <span id="gwBaseUrl" style="font-family:Consolas;font-size:12px;color:#9fe08a;">http://127.0.0.1:3090/v1</span>
+      <span id="gwBaseUrl" style="font-family:Consolas;font-size:12px;color:#9fe08a;">http://127.0.0.1:3091/v1</span>
     </div>
     <div class="row">
       <label>统一 Key</label>
@@ -221,6 +221,29 @@
       <button id="btnGwLogClear" style="align-self:flex-end;">清屏</button>
     </div>
     <div class="hint" style="margin-top:10px;">同模型多上游按优先级路由 + 故障切换 + SSE + 熔断；「写入 dsh 配置」把网关注册为 dsh 的 gateway 提供商（重启 dsh web 生效）。</div>
+  </div>
+
+  <div class="card" id="card-market">
+    <h2>插件市场</h2>
+    <div class="row">
+      <label>搜索</label>
+      <input type="text" id="mkQ" placeholder="按名称/描述搜索插件（默认源：DSH 1024Store）" style="flex:1;" />
+      <button id="mkSearch">搜索</button>
+      <button id="mkRefresh">刷新</button>
+    </div>
+    <div class="row">
+      <label>状态</label>
+      <span id="mkStatus" style="color:#8b93a3;font-size:12px;">空闲</span>
+    </div>
+    <div id="mkList" style="max-height:360px;overflow-y:auto;border:1px solid #2c3546;border-radius:8px;padding:4px;scrollbar-width:thin;scrollbar-color:#3d4a60 transparent;">
+      <div style="color:#5f6b7d;font-size:12px;padding:14px 8px;">点击「搜索/刷新」浏览插件市场。</div>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <label>已安装</label>
+      <button id="mkInstalledBtn">查看已安装插件</button>
+      <span style="color:#5f6b7d;font-size:11px;">来自 dsh 真实 profile（市场/命令行/手工安装互通）</span>
+    </div>
+    <div class="hint">安全边界（参考官方 DSH Community Market）：目录源数据仅用于发现——<b>源提供的版本不作为安装目标</b>；一键安装前经 npm registry 校验（同名 + 稳定版本 + 有效 <code>dsh.bundle.patch</code>）；安装/卸载执行标准 <code>dsh plugin add/remove</code> 命令（与手工完全一致，<b>不影响自行安装的插件</b>）；仅浏览型条目（无 npm 包身份）只展示详情。插件改动后需重启 dsh 服务生效。</div>
   </div>
 
   <div class="card">
@@ -412,7 +435,7 @@
       $('gwProfile').value = sel;
       $('gwClientUA').value = (sel === 'custom') ? (gwCfg.clientUA || '') : '';
       $('gwClientUA').style.display = (sel === 'custom') ? '' : 'none';
-      const portVal = parseInt(gwCfg.port, 10) || 3090;
+      const portVal = parseInt(gwCfg.port, 10) || 3091;
       if (!$('gwPort').value || parseInt($('gwPort').value, 10) !== portVal) $('gwPort').value = portVal;
       // 对外地址按协议显示（anthropic 协议的 baseURL 不带 /v1，与「写入 dsh 配置」一致）
       const isAnthropic = ($('gwProfile').value === 'claude');
@@ -444,15 +467,15 @@
     });
     // 仿真切换时同步对外地址显示
     $('gwProfile').addEventListener('change', () => {
-      const p = parseInt($('gwPort').value, 10) || 3090;
+      const p = parseInt($('gwPort').value, 10) || 3091;
       const isAnthropic = ($('gwProfile').value === 'claude');
       $('gwBaseUrl').textContent = 'http://127.0.0.1:' + p + (isAnthropic ? '' : '/v1');
     });
 
     async function gwLoad() {
       const gs = await window.dshApp.gwState();
-      // 端口兜底：后端未返回时用 3090（网关默认端口），避免显示 undefined
-      $('gwPort').value = (gs && gs.port > 0) ? gs.port : 3090;
+      // 端口兜底：后端未返回时用 3091（dsh-app 网关约定端口），避免显示 undefined
+      $('gwPort').value = (gs && gs.port > 0) ? gs.port : 3091;
       gwRender(gs);
       const c = await window.dshApp.gwAction('get-config');
       if (c && c.text) {
@@ -485,7 +508,7 @@
       } catch (_) { toast('复制失败'); }
     };
     $('btnGwAddRow').onclick = () => {
-      if (!gwCfg) gwCfg = { port: 3090, apiKey: '', providers: [] };
+      if (!gwCfg) gwCfg = { port: 3091, apiKey: '', providers: [] };
       const n = gwCfg.providers.length + 1;
       gwCfg.providers.push({ id: 'provider-' + n, baseURL: '', apiKey: '', models: [], priority: n, enabled: true });
       gwSel = gwCfg.providers.length - 1;
@@ -569,6 +592,123 @@
         gwSyncText();
         gwRenderRows();
       }
+    };
+
+    // —— 插件市场（v1.5.18，参考官方 dsh-community-market 四视图的轻量实现）——
+    let mkCursor = '';
+    let mkLoading = false;
+
+    function mkRow(item, installedSet) {
+      const row = document.createElement('div');
+      row.style.cssText = 'border-bottom:1px solid #232b39;padding:8px 10px;font-size:12px;display:flex;gap:10px;align-items:flex-start;';
+      const installed = installedSet && installedSet.has(item.pkg);
+      const info = document.createElement('div');
+      info.style.cssText = 'flex:1;min-width:0;';
+      info.innerHTML =
+        '<div style="font-weight:600;color:#e8ecf2;">' + esc(item.displayName || item.name) +
+        (item.version ? ' <span style="color:#5f6b7d;font-weight:400;">v' + esc(item.version) + '（源版本，仅供参考）</span>' : '') +
+        (installed ? ' <span style="color:#3ecf8e;">✓ 已安装</span>' : '') + '</div>' +
+        '<div style="color:#9aa7bc;margin:2px 0;">' + esc(item.summary || '（无描述）') + '</div>' +
+        '<div style="color:#5f6b7d;font-size:11px;">' +
+        (item.pkg ? 'npm: <span style="font-family:Consolas;color:#9fb2cc;">' + esc(item.pkg) + '</span>' : '仅浏览（无 npm 包身份）') +
+        (item.author ? ' · ' + esc(item.author) : '') +
+        (item.homepage ? ' · <a href="#" class="mk-home" style="color:#4f8cff;">主页</a>' : '') + '</div>';
+      row.appendChild(info);
+      if (item.pkg && !installed) {
+        const btn = document.createElement('button');
+        btn.textContent = '安装';
+        btn.style.cssText = 'white-space:nowrap;';
+        btn.onclick = () => mkInstall(item.pkg, item.displayName || item.name);
+        row.appendChild(btn);
+      }
+      if (item.pkg && installed) {
+        const btn = document.createElement('button');
+        btn.textContent = '卸载';
+        btn.style.cssText = 'white-space:nowrap;';
+        btn.onclick = () => mkRemove(item.pkg);
+        row.appendChild(btn);
+      }
+      const home = info.querySelector('.mk-home');
+      if (home) home.onclick = (e) => { e.preventDefault(); window.open(item.homepage, '_blank'); };
+      return row;
+    }
+
+    async function mkLoad(q) {
+      if (mkLoading) return;
+      mkLoading = true;
+      $('mkStatus').textContent = '加载中…';
+      const list = $('mkList');
+      const inst = await window.dshApp.mkInstalled().catch(() => null);
+      const installedSet = new Set((inst && inst.plugins || []).map((p) => p.name));
+      const r = await window.dshApp.mkDiscover({ q: q || '', cursor: mkCursor, limit: 50 }).catch(() => null);
+      mkLoading = false;
+      if (!r || !r.ok) {
+        $('mkStatus').textContent = '加载失败（' + (r && r.error || '网络') + '）';
+        return;
+      }
+      mkCursor = r.nextCursor || '';
+      $('mkStatus').textContent = '已加载 ' + r.items.length + ' 个插件' + (mkCursor ? '（可再次搜索加载更多）' : '（已到末页）');
+      if (!q && mkCursor === '' && list.dataset.fresh !== '1') list.innerHTML = '';
+      else if (q) list.innerHTML = '';
+      list.dataset.fresh = '1';
+      for (const item of r.items) list.appendChild(mkRow(item, installedSet));
+      if (!r.items.length) list.innerHTML = '<div style="color:#5f6b7d;font-size:12px;padding:14px 8px;">无匹配结果。</div>';
+    }
+
+    async function mkInstall(pkg, label) {
+      $('mkStatus').textContent = '校验 ' + pkg + '（npm registry）…';
+      const p = await window.dshApp.mkPreview(pkg).catch(() => null);
+      if (!p || !p.ok) {
+        toast('无法自动安装：' + (p && p.reason || '校验失败') + '。可手动执行 dsh plugin add ' + pkg);
+        $('mkStatus').textContent = '校验未通过（' + (p && p.reason || '失败') + '）';
+        return;
+      }
+      if (!confirm('安装插件？\n\n包：' + p.name + '\n版本：' + p.version + '（npm latest）\n\n安装后需重启 dsh 服务生效。')) return;
+      $('mkStatus').textContent = '安装中…（dsh plugin add，详见日志）';
+      const r = await window.dshApp.mkAction('install', pkg).catch(() => null);
+      if (r && r.ok) {
+        toast('已安装 ' + pkg + '，重启 dsh 服务后生效');
+        $('mkStatus').textContent = '安装成功（重启 dsh 服务后生效）';
+      } else {
+        toast('安装失败（详见日志），可手动执行 dsh plugin add ' + pkg);
+        $('mkStatus').textContent = '安装失败';
+      }
+      mkCursor = '';
+      mkLoad('');
+    }
+
+    async function mkRemove(pkg) {
+      if (!confirm('卸载插件 ' + pkg + '？\n\n卸载后需重启 dsh 服务生效。')) return;
+      $('mkStatus').textContent = '卸载中…';
+      const r = await window.dshApp.mkAction('remove', pkg).catch(() => null);
+      if (r && r.ok) {
+        toast('已卸载 ' + pkg + '，重启 dsh 服务后生效');
+        $('mkStatus').textContent = '卸载成功';
+      } else {
+        toast('卸载失败（详见日志）');
+        $('mkStatus').textContent = '卸载失败';
+      }
+      mkCursor = '';
+      mkLoad('');
+    }
+
+    $('mkSearch').onclick = () => { mkCursor = ''; mkLoad($('mkQ').value.trim()); };
+    $('mkQ').addEventListener('keydown', (e) => { if (e.key === 'Enter') { mkCursor = ''; mkLoad($('mkQ').value.trim()); } });
+    $('mkRefresh').onclick = () => { mkCursor = ''; mkLoad(''); };
+    // 打开设置页即自动加载市场第一页（数据在主进程拉取，失败静默——状态栏可见原因）
+    mkLoad('');
+    $('mkInstalledBtn').onclick = async () => {
+      const r = await window.dshApp.mkInstalled().catch(() => null);
+      if (!r || !r.ok) { toast('读取已安装插件失败'); return; }
+      const list = $('mkList');
+      list.innerHTML = '';
+      const set = new Set((r.plugins || []).map((p) => p.name));
+      for (const p of r.plugins) {
+        const item = { pkg: p.name, name: p.name, displayName: p.name, summary: (p.isBundle ? 'dsh bundle 插件' : '直接依赖') + ' @ ' + (p.version || '?'), version: p.version };
+        list.appendChild(mkRow(item, set));
+      }
+      if (!r.plugins.length) list.innerHTML = '<div style="color:#5f6b7d;font-size:12px;padding:14px 8px;">profile（' + esc(r.profile) + '）暂无已安装插件。</div>';
+      $('mkStatus').textContent = '已安装视图：profile ' + r.profile + '（' + r.plugins.length + ' 个）';
     };
 
     // —— 定位到指定卡片（来自托盘等入口的"模型网关"）——
