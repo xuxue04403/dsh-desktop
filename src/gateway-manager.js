@@ -41,12 +41,13 @@ function validateConfigText(text) {
 
 class GatewayManager extends EventEmitter {
   /**
-   * @param {object} opts { userDataDir, nodePath, settings, logger }
+   * @param {object} opts { userDataDir, nodePath, nodeEnv, settings, logger }
    */
   constructor(opts) {
     super();
     this.userDataDir = opts.userDataDir;
     this.nodePath = opts.nodePath || 'node';
+    this.nodeEnv = opts.nodeEnv || {};   // v1.5.17：内嵌运行时需 ELECTRON_RUN_AS_NODE=1（spawn 时合并 env）
     this.settings = opts.settings;
     this.log = opts.logger.appendLog.bind(opts.logger);
     this.gatewayDir = path.join(__dirname, 'gateway');
@@ -276,7 +277,7 @@ async waitPortFree(port, timeoutMs) {
       // 网关内部日志（catalog/调用/熔断）同时输出 stdout，设置页日志框才能实时看到
       // （默认只写文件，stdout 仅有 listening，用户会误以为"无调用记录"）
       DSH_GATEWAY_VERBOSE: '1',
-    });
+    }, this.nodeEnv || {});   // v1.5.17：内嵌运行时的 ELECTRON_RUN_AS_NODE 等
     // 代理注入（R6）：上游如 agentrouter/air-outer 需经 clash 类代理才能访问；
     // node ≥24 的 fetch 支持 NODE_USE_ENV_PROXY=1 + HTTPS_PROXY。
     // 优先级：配置显式启用（proxy.enabled + url）> 自动探测（系统代理/常用端口）。
@@ -322,8 +323,13 @@ async waitPortFree(port, timeoutMs) {
       this.emit('state');
     });
 
-    // 健康探测确认
-    const healthy = await this.probeHealth(4000);
+    // 健康探测确认（v1.5.17d：网关进程 listen 需 1-3 秒，单次探测会在就绪前误报
+    // "端口探测未通过"；改为最多 8 秒的重试探测，任一次通过即就绪）
+    let healthy = false;
+    for (let i = 0; i < 8 && !healthy; i++) {
+      healthy = await this.probeHealth(2000);
+      if (!healthy) await new Promise((r) => setTimeout(r, 800));
+    }
     if (healthy) {
       this.log('模型网关已就绪: http://127.0.0.1:' + this.port + '/v1');
     } else {
@@ -386,7 +392,7 @@ async waitPortFree(port, timeoutMs) {
         encoding: 'utf8',
         timeout: 60000,
         windowsHide: true,
-        env: Object.assign({}, process.env, { DSH_GATEWAY_CONFIG: this.configPath }),
+        env: Object.assign({}, process.env, { DSH_GATEWAY_CONFIG: this.configPath }, this.nodeEnv || {}),
       }
     );
     const output = (r.stdout || '') + (r.stderr || '');
