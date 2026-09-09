@@ -18,6 +18,53 @@ const { EventEmitter } = require('events');
 const LOG_TAIL_MAX = 64 * 1024;
 
 // 配置文本校验（供 UI 保存前检查与单测）：返回 { ok, error }
+// 按命令行特征杀进程树（R18 抽出共用）：仅匹配 node.exe/DSH-App.exe 且命令行含指定
+// 特征串的进程，taskkill /T 树杀；返回杀掉的进程数。排除自身 PID。
+function killProcessesByCommandline(marker, logLabel, logFn) {
+  try {
+    const probe = spawnSync('powershell', [
+      '-NoProfile', '-Command',
+      "Get-CimInstance Win32_Process | " +
+      "Where-Object { ($_.Name -eq 'node.exe' -or $_.Name -eq 'DSH-App.exe' -or $_.Name -eq 'cmd.exe') -and $_.CommandLine -and $_.CommandLine.Contains('" + marker + "') -and $_.ProcessId -ne " + process.pid + " } | " +
+      'ForEach-Object { Write-Output $_.ProcessId }',
+    ], { encoding: 'utf8', timeout: 15000, windowsHide: true });
+    const pids = String(probe.status === 0 ? (probe.stdout || '') : '')
+      .split(/\r?\n/).map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n) && n > 0 && n !== process.pid);
+    if (pids.length === 0) return 0;
+    let killed = 0;
+    for (const pid of pids) {
+      try {
+        const r2 = spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+        if (r2.status === 0) killed++;
+      } catch (_) { /* 忽略单个失败 */ }
+    }
+    if (killed > 0 && logFn) logFn(logLabel + ' ' + killed + ' 个进程树。');
+    return killed;
+  } catch (_) { return 0; }
+}
+
+// R18（退出全清）：杀掉所有 dsh-app 拉起的 dsh 相关进程树——特征匹配：
+//   - dsh web 主进程（bin.js ... web --no-open）
+//   - dsh plugin 操作树（bin.js ... plugin / pnpm 安装树）
+//   - 网关进程（model-gateway.mjs）
+//   - broker cmd（launch-dsh.cmd / plugin-op.cmd）
+// 注意：只杀命令行含特征且可识别为 node/DSH-App/cmd 的进程；dsh 用户在系统终端手工
+// 跑的命令（cwd 不同、无我们的特征串）不受影响——特征串足够特异（bin.js 全路径/脚本名）。
+function killAllDshProcesses(logFn) {
+  const markers = [
+    'model-gateway.mjs',
+    'launch-dsh.cmd',
+    'plugin-op.cmd',
+    '@deepseek-ai',
+  ];
+  let total = 0;
+  for (const m of markers) {
+    total += killProcessesByCommandline(m, '[退出清理]', logFn);
+  }
+  return total;
+}
+
+// 配置文本校验（供 UI 保存前检查与单测）：返回 { ok, error }
 function validateConfigText(text) {
   let cfg;
   try {
@@ -30,6 +77,14 @@ function validateConfigText(text) {
   }
   if (!Array.isArray(cfg.providers) || cfg.providers.length === 0) {
     return { ok: false, error: '缺少 providers 数组（至少一个供应商）' };
+  }
+  // R22：端口必须显式且合法——缺失/非法时静默回退会占错端口（dsh-app 网关约定
+  // 3091，桌面助手为 3090，二者不能混占），保存前直接拦截并提示
+  {
+    const p = Number(cfg.port);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) {
+      return { ok: false, error: '缺少或非法 port（必须是 1-65535 整数；dsh-app 网关约定 3091）' };
+    }
   }
   for (const p of cfg.providers) {
     if (!p || typeof p !== 'object') return { ok: false, error: 'providers 中存在非对象条目' };
@@ -57,7 +112,8 @@ class GatewayManager extends EventEmitter {
     this.proc = null;
     this.running = false;
     this.logTail = '';
-    this.port = 3090;   // 端口权威 = gateway.config.json 的 port（网关运行模式只认配置文件的端口）
+    this.port = 3091;   // 端口权威 = gateway.config.json 的 port（网关运行模式只认配置文件的端口）；
+                        // 约定（R22）：dsh-app 网关 = 3091，桌面助手 = 3090，二者不可混占
     this._starting = null;   // 启动互斥锁：并发 start/restart 只执行一次（防双 spawn EADDRINUSE）
 
     // 打包后（app.asar 内）外部 node 无法读取 asar 内部文件，
@@ -93,13 +149,13 @@ class GatewayManager extends EventEmitter {
     }
   }
 
-  // 读取配置中的端口（无配置/解析失败 → 默认 3090）
+  // 读取配置中的端口（无配置/解析失败 → 默认 3091：dsh-app 网关约定端口，R22）
   configPort() {
     try {
       const cfg = JSON.parse(this.configText());
       const p = Number(cfg && cfg.port);
-      return Number.isInteger(p) && p > 0 && p <= 65535 ? p : 3090;
-    } catch (_) { return 3090; }
+      return Number.isInteger(p) && p > 0 && p <= 65535 ? p : 3091;
+    } catch (_) { return 3091; }
   }
 
   // 首次使用：配置不存在时从示例生成
@@ -200,26 +256,7 @@ class GatewayManager extends EventEmitter {
   // 配置端口，导致新实例 EADDRINUSE 启动失败（用户侧表现为"网关启动了但探测不通过"）。
   // 识别方式精准：仅杀命令行包含 model-gateway.mjs 的 node 进程，不会误伤其他程序。
   killStaleGatewayProcesses() {
-    try {
-      const probe = spawnSync('powershell', [
-        '-NoProfile', '-Command',
-        "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
-        "Where-Object { $_.CommandLine -and $_.CommandLine.Contains('model-gateway.mjs') } | " +
-        'ForEach-Object { Write-Output $_.ProcessId }',
-      ], { encoding: 'utf8', timeout: 15000, windowsHide: true });
-      const pids = String(probe.status === 0 ? (probe.stdout || '') : '')
-        .split(/\r?\n/).map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n) && n > 0);
-      if (pids.length === 0) return 0;
-      let killed = 0;
-      for (const pid of pids) {
-        try {
-          const r2 = spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
-          if (r2.status === 0) killed++;
-        } catch (_) { /* 忽略单个失败 */ }
-      }
-      if (killed > 0) this.log('模型网关：已清理残留网关进程 ' + killed + ' 个（旧实例占用端口）。');
-      return killed;
-    } catch (_) { return 0; }
+    return killProcessesByCommandline('model-gateway.mjs', '模型网关：已清理残留网关进程');
   }
 
   // 等待端口释放（taskkill 后 Windows 释放端口有短暂延迟，否则新进程 EADDRINUSE）。
@@ -254,6 +291,7 @@ async waitPortFree(port, timeoutMs) {
 
   async _doStart() {
     if (this.proc) return;
+    this.stopping = false;   // R17：主动启动清除停止标记（自愈恢复启用）
     this.port = this.configPort();   // 以配置文件为准（--port 参数仅对 --write-dsh 生效）
     const mjs = this.mjsPath;
     if (!fs.existsSync(mjs)) {
@@ -321,6 +359,16 @@ async waitPortFree(port, timeoutMs) {
       this.running = false;
       this.log('模型网关已退出（退出码 ' + code + '）');
       this.emit('state');
+      // R17（假死自愈）：网关进程意外退出（self-watchdog 自杀/崩溃）且非用户主动停止
+      // （stop() 会置 this.stopping）时自动重启——熔断/连接池等全部状态随之清空复活。
+      if (!this.stopping) {
+        this.log('模型网关异常退出，3 秒后自动重启（self-heal）…');
+        setTimeout(() => {
+          if (!this.stopping && !this.proc) this.start().catch((e) => {
+            this.log('模型网关自愈重启失败: ' + (e && e.message ? e.message : e));
+          });
+        }, 3000);
+      }
     });
 
     // 健康探测确认（v1.5.17d：网关进程 listen 需 1-3 秒，单次探测会在就绪前误报
@@ -339,6 +387,7 @@ async waitPortFree(port, timeoutMs) {
   }
 
   async stop() {
+    this.stopping = true;   // R17：标记主动停止——exit 处理不触发自愈重启
     const p = this.proc;
     this.proc = null;
     if (!p || p.exitCode !== null) return;
@@ -419,4 +468,4 @@ async waitPortFree(port, timeoutMs) {
   }
 }
 
-module.exports = { GatewayManager, validateConfigText };
+module.exports = { GatewayManager, validateConfigText, killAllDshProcesses, killProcessesByCommandline };
