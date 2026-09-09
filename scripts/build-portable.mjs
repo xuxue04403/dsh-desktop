@@ -96,6 +96,8 @@ mkdirSync(staging, { recursive: true });
 cpSync(path.join(root, 'src'), path.join(staging, 'src'), { recursive: true });
 cpSync(path.join(root, 'renderer'), path.join(staging, 'renderer'), { recursive: true });
 cpSync(path.join(root, 'package.json'), path.join(staging, 'package.json'));
+// v1.5.17：内嵌 npm（见步骤 3.5——放 asar 外的 resources\node_modules\npm，
+// 因为 ELECTRON_RUN_AS_NODE 子进程读不了 asar 虚拟文件系统内的文件）
 
 // —— 2) asar 打包 ————————————————————————————————————
 prepareAppDir();
@@ -117,6 +119,34 @@ const exeNew = path.join(appDir, 'DSH-App.exe');
 if (existsSync(exeOld)) renameSync(exeOld, exeNew);
 const defaultAsar = path.join(appDir, 'resources', 'default_app.asar');
 if (existsSync(defaultAsar)) rmSync(defaultAsar, { force: true });
+
+// —— 3.5) 内嵌 npm（v1.5.17 零系统依赖链路）——————————————————
+// 放 resources\node_modules\npm（asar 外的真实文件——ELECTRON_RUN_AS_NODE 子进程
+// 读不了 asar 内文件）；launcher.findEmbeddedNpmCli 按此路径定位。
+// 用途：dsh 首次安装/自动升级用内嵌 npm（DSH-App.exe 作为 node 运行 npm-cli.js），
+// 用户机器无需安装 node/npm。
+{
+  // npm 来源：项目 node_modules\npm 优先；无则用当前 node 自带的 npm（nvm/标准安装都在
+  // node 旁 node_modules\npm）。复制时排除文档/测试减体积（保留 bin/lib/node_modules 依赖）。
+  let npmSrc = path.join(root, 'node_modules', 'npm');
+  if (!existsSync(npmSrc)) {
+    const sysNpm = path.join(path.dirname(process.execPath), 'node_modules', 'npm');
+    if (existsSync(sysNpm)) npmSrc = sysNpm;
+  }
+  const npmDst = path.join(appDir, 'resources', 'node_modules', 'npm');
+  if (existsSync(npmSrc)) {
+    rmSync(path.join(appDir, 'resources', 'node_modules'), { recursive: true, force: true });
+    cpSync(npmSrc, npmDst, { recursive: true });
+    // 减体积：npm 的文档/测试/多语言不在运行链路上
+    for (const junk of ['docs', 'test', 'tap-snapshots', 'node_modules/.bin']) {
+      const j = path.join(npmDst, junk);
+      try { if (existsSync(j)) rmSync(j, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
+    }
+    console.log('[内嵌] npm → resources\\node_modules\\npm（源: ' + npmSrc + '）');
+  } else {
+    console.log('[警告] 未找到 npm（项目与系统均无）——内嵌安装/升级将回退系统 npm');
+  }
+}
 
 // —— 5) 品牌图标（与 DSH-App.exe 内嵌图标完全一致：src/assets/electron-icon.*
 //       是从 electron.exe 资源原样提取的官方图标，见 scripts/extract-exe-icon.mjs）——
