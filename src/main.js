@@ -415,6 +415,76 @@ async function stopService() {
   await launcher.stop();
 }
 
+// ---------------- dsh 自动升级（v1.5.17）----------------
+// 流程：停服（防 Windows 文件占用）→ npm i -g @deepseek-ai/dsh@latest → detect 刷新版本 →
+// 若之前在运行则重启服务。任何失败都写日志并回退提示手动命令。
+let upgrading = false;   // 升级互斥（自动触发与手动按钮并发保护）
+
+async function upgradeDsh(trigger) {
+  if (upgrading) {
+    logger.appendLog('[升级] 已有升级进行中，忽略重复触发（' + trigger + '）');
+    return { ok: false, error: 'upgrade-in-progress' };
+  }
+  upgrading = true;
+  const wasRunning = launcher.running;
+  try {
+    const before = launcher.found ? launcher.found.version : '(未安装)';
+    logger.appendLog('[升级] 开始自动升级 dsh（' + trigger + '，当前 ' + before + '）…');
+    state.update({ phase: '正在升级 dsh…（先停止服务，完成后自动重启）' });
+
+    // 1) 停止服务（运行中的 bin.js 被替换会 EBUSY）
+    if (wasRunning) {
+      await launcher.stop();
+      logger.appendLog('[升级] 已停止 dsh web 服务');
+      await sleep(500);   // 释放文件句柄的短暂缓冲
+    }
+
+    // 2) 执行 npm 全局安装（v1.5.17：内嵌运行时模式装到便携前缀 data\node-global，
+    //    绿色随程序走；升级即同前缀替换，dsh 的 ~/.dsh 配置/会话不受影响）
+    const prefix = launcher.nodeInfo && launcher.nodeInfo.embedded ? launcher.portablePrefix() : null;
+    const r = await updater.performUpgrade({
+      nodeInfo: launcher.nodeInfo || { exe: 'node', env: {}, embedded: false },
+      prefix,
+      onProgress: (line) => logger.appendLog('[npm] ' + line),
+    });
+    if (!r.ok) {
+      logger.appendLog('[升级] 安装失败：' + r.output.slice(-600));
+      state.update({ phase: 'dsh 升级失败（详见日志），可手动执行: npm i -g @deepseek-ai/dsh@latest' });
+      // 失败回退：若之前在运行，重启旧版继续可用
+      if (wasRunning) { await startService(); }
+      return { ok: false, error: r.output.slice(-300) };
+    }
+
+    // 3) 刷新检测结果并验证新版本
+    launcher.detect();
+    const after = launcher.found ? launcher.found.version : null;
+    logger.appendLog('[升级] 安装完成，检测到 dsh ' + (after || '(未找到)'));
+    if (!after) {
+      logger.appendLog('[升级] 警告：安装后未检测到 dsh（可能装到了非扫描路径）');
+      state.update({ phase: 'dsh 升级完成但未检测到安装（详见日志）' });
+      return { ok: false, error: 'installed but not detected' };
+    }
+    state.update({ dshVersion: after });
+
+    // 4) 之前在运行 → 重启服务
+    if (wasRunning) {
+      logger.appendLog('[升级] 重启 dsh web 服务…');
+      await startService();
+    } else {
+      state.update({ phase: 'dsh 已升级到 ' + after });
+    }
+    logger.appendLog('[升级] 完成：' + before + ' → ' + after);
+    return { ok: true, from: before, to: after };
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    logger.appendLog('[升级] 异常：' + msg);
+    if (wasRunning) { try { await startService(); } catch (_) { /* 忽略 */ } }
+    return { ok: false, error: msg };
+  } finally {
+    upgrading = false;
+  }
+}
+
 // 端口轮询兜底：URL 行缺失的极旧版本也能判定就绪。
 // 注意：兜底 URL（明文、无 token）只用于窗口加载，**绝不**触发系统浏览器（会 401）。
 async function waitReadyByProbe() {
@@ -543,6 +613,8 @@ function registerIpc() {
       case 'copy-upgrade-command':
         clipboard.writeText('npm i -g @deepseek-ai/dsh@latest');
         break;
+      case 'upgrade-dsh':
+        return await upgradeDsh('手动');
       case 'browse-workdir': {
         const r = await dialog.showOpenDialog({ properties: ['openDirectory'] });
         if (!r.canceled && r.filePaths.length) return r.filePaths[0];
@@ -626,6 +698,7 @@ async function bootstrap() {
   gateway = new GatewayManager({
     userDataDir: userData,
     nodePath: launcher.nodePath || 'node',
+    nodeEnv: (launcher.nodeInfo && launcher.nodeInfo.env) || {},   // v1.5.17：内嵌运行时需 ELECTRON_RUN_AS_NODE=1
     settings,
     logger,
   });
@@ -679,10 +752,18 @@ async function bootstrap() {
     state.update({ dshVersion: launcher.found.version });
     logger.appendLog('检测到 dsh ' + launcher.found.version + ' @ ' + launcher.found.dir);
     if (settings.data.checkUpdates) {
+      // v1.5.17：开启"启动时检查更新"→ 检测到新版**自动升级**（停服→npm i -g→重启）
       updater.checkForUpdate(launcher.found.version).then((info) => {
         if (info) {
-          logger.appendLog('发现新版本 dsh ' + info.latest + '（当前 ' + info.local + '），升级命令: ' + info.command);
-          state.update({ phase: '发现新版本 dsh ' + info.latest + '，可在「设置」中查看升级命令' });
+          logger.appendLog('发现新版本 dsh ' + info.latest + '（当前 ' + info.local + '），开始自动升级…');
+          state.update({ phase: '发现新版本 dsh ' + info.latest + '，自动升级中…' });
+          upgradeDsh('启动自动').then((r) => {
+            if (r && r.ok) {
+              logger.appendLog('自动升级成功：' + r.from + ' → ' + r.to);
+            } else {
+              logger.appendLog('自动升级失败，可手动执行: npm i -g @deepseek-ai/dsh@latest');
+            }
+          });
         }
       });
     }
