@@ -198,12 +198,19 @@ class Launcher extends EventEmitter {
     this.running = false;
     this.ready = false;
     this.manualStop = false;   // 手动停止标志：避免退出事件触发看门狗
+    this.webLogBaseline = 0;   // R22：本次启动前 web.log 字节基线（看门狗切分用）
   }
 
   detect() {
     this.nodeInfo = findNode();
     this.nodePath = typeof this.nodeInfo === 'string' ? this.nodeInfo : this.nodeInfo.exe;
     this.found = findDsh();
+    // R19：检测到 dsh 后立即打黑窗 patch（幂等）——启动/工具进程不再弹窗
+    if (this.found) {
+      this.applySubprocessPatch(this.found);
+      // R21：OpenCode Go 的 x-opencode-session 头（2026-09-05 起上游强制）
+      this.applyOpenCodeSessionPatch(this.found);
+    }
     return this.found;
   }
 
@@ -223,6 +230,109 @@ class Launcher extends EventEmitter {
     }
   }
 
+  // R19（黑窗根治，官方 dsh-desktop 双补丁对等实现）：
+  //   补丁1（dsh-subprocess-local）：spawn 加 windowsHide:true（node 层）。
+  //   补丁2（dsh-win32-process）：native CreateProcessAsUserW 的 STARTUPINFO
+  //     dwFlags 256(STARTF_USESTDHANDLES)→257(+STARTF_USESHOWWINDOW) +
+  //     wShowWindow:0(SW_HIDE)——ACL sandbox 的 pwsh 由原生 API 创建，node 的
+  //     windowsHide 管不到，必须改 native 层（官方 dsh-win32-process patch 同款）。
+  // 幂等：已 patch 跳过；dsh 升级替换文件后自动重打。
+  applySubprocessPatch(found) {
+    if (process.platform !== 'win32') return false;
+    if (!found || !found.dir) return false;
+    // 补丁1：dsh-subprocess-local
+    try {
+      const t1 = path.join(found.dir, 'node_modules', '@deepseek-ai', 'dsh-subprocess-local', 'lib', 'index.js');
+      if (fs.existsSync(t1)) {
+        let src = fs.readFileSync(t1, 'utf8');
+        if (!src.includes('windowsHide: true,   // dsh-app R19')) {
+          const anchor = '\tconst child = spawn(program, args, {\n\t\tcwd: spec.cwd,';
+          if (src.includes(anchor)) {
+            src = src.replace(anchor, '\tconst child = spawn(program, args, {\n\t\twindowsHide: true,   // dsh-app R19: GUI 宿主下隐藏孙进程控制台窗口\n\t\tcwd: spec.cwd,');
+            fs.writeFileSync(t1, src, 'utf8');
+            this.log('R19 补丁1：dsh-subprocess-local windowsHide ✓');
+          }
+        }
+      }
+    } catch (e) { this.log('R19 补丁1 失败: ' + (e && e.message ? e.message : e)); }
+    // 补丁2：dsh-win32-process（native 层）
+    try {
+      const t2 = path.join(found.dir, 'node_modules', '@deepseek-ai', 'dsh-win32-process', 'lib', 'index.js');
+      if (fs.existsSync(t2)) {
+        let src = fs.readFileSync(t2, 'utf8');
+        if (!src.includes('wShowWindow: 0,   // dsh-app R19')) {
+          const anchor = 'encodeStartupInfo(startupInfo, {\n\t\t\tcb: 104,\n\t\t\tdwFlags: 256,';
+          const replacement = 'encodeStartupInfo(startupInfo, {\n\t\t\tcb: 104,\n\t\t\tdwFlags: 257,\n\t\t\twShowWindow: 0,   // dsh-app R19: STARTF_USESHOWWINDOW+SW_HIDE（隐藏 ACL runner 子进程窗口）';
+          if (src.includes(anchor)) {
+            src = src.split(anchor).join(replacement);
+            fs.writeFileSync(t2, src, 'utf8');
+            this.log('R19 补丁2：dsh-win32-process STARTF+SW_HIDE ✓');
+          } else {
+            this.log('R19 补丁2：未找到 dwFlags 锚点（dsh 版本变化？）');
+          }
+        }
+      }
+    } catch (e) { this.log('R19 补丁2 失败: ' + (e && e.message ? e.message : e)); }
+    return true;
+  }
+
+  // R21（OpenCode Go session 头）：2026-09-05 起 opencode.ai/zen/go 网关要求所有请求
+  // 携带 x-opencode-session 头（路由/缓存），否则 400 MissingSessionID。
+  // pi-ai 的 opencode-go provider 未适配——patch pi-ai 两处请求头构造（openai-completions
+  // 与 anthropic-messages），当 model.provider==='opencode-go' 或 baseUrl 含 opencode.ai
+  // 且调用方未显式提供该头时注入随机 UUID。幂等：已含 dsh-app 标记则跳过。
+  applyOpenCodeSessionPatch(found) {
+    if (!found || !found.dir) return false;
+    try {
+      const piAi = path.join(found.dir, 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'api');
+      const targets = [
+        {
+          file: path.join(piAi, 'openai-completions.js'),
+          anchor: '    // Merge options headers last so they can override defaults\n    if (optionsHeaders) {',
+          inject: '    // R21 dsh-app: OpenCode Go requires x-opencode-session (2026-09-05+)\n    if ((model.provider === "opencode-go" || (model.baseUrl || "").includes("opencode.ai")) && !headers["x-opencode-session"]) {\n        headers["x-opencode-session"] = (globalThis.crypto && globalThis.crypto.randomUUID) ? globalThis.crypto.randomUUID() : String(Date.now()) + "-" + Math.floor(Math.random() * 1e9);\n    }\n    // Merge options headers last so they can override defaults\n    if (optionsHeaders) {',
+        },
+        {
+          file: path.join(piAi, 'anthropic-messages.js'),
+          anchor: '',
+          extra: [
+            {
+              // 定义 r21Headers（仅 opencode-go 生效）
+              anchor: '    // API key or header-owned auth.\n    const sessionAffinityHeaders',
+              inject: '    // API key or header-owned auth.\n    // R21 dsh-app: OpenCode Go requires x-opencode-session (2026-09-05+)\n    const r21Headers = (model.provider === "opencode-go" || (model.baseUrl || "").includes("opencode.ai")) && !(optionsHeaders && (optionsHeaders["x-opencode-session"] || optionsHeaders["X-OpenCode-Session"])) ? { "x-opencode-session": (globalThis.crypto && globalThis.crypto.randomUUID) ? globalThis.crypto.randomUUID() : String(Date.now()) + "-" + Math.floor(Math.random() * 1e9) } : {};\n    const sessionAffinityHeaders',
+            },
+            {
+              // 并入 mergeClientHeaders
+              anchor: '    }, sessionAffinityHeaders, model.headers, optionsHeaders);',
+              inject: '    }, sessionAffinityHeaders, r21Headers, model.headers, optionsHeaders);',
+            },
+          ],
+        },
+      ];
+      let patched = 0;
+      for (const t of targets) {
+        if (!fs.existsSync(t.file)) continue;
+        let src = fs.readFileSync(t.file, 'utf8');
+        if (src.includes('// R21 dsh-app')) { patched++; continue; }
+        let ok = true;
+        if (t.extra) {
+          // 多段替换（anthropic：定义变量 + 并入 mergeClientHeaders）
+          for (const step of t.extra) {
+            if (!src.includes(step.anchor)) { ok = false; break; }
+            src = src.replace(step.anchor, step.inject);
+          }
+        } else {
+          if (!src.includes(t.anchor)) ok = false;
+          else src = src.replace(t.anchor, t.inject);
+        }
+        if (!ok) { this.log('R21 patch：锚点未找到 ' + path.basename(t.file)); continue; }
+        fs.writeFileSync(t.file, src, 'utf8');
+        this.log('R21 patch：' + path.basename(t.file) + ' x-opencode-session ✓');
+        patched++;
+      }
+      return patched > 0;
+    } catch (e) { this.log('R21 patch 失败: ' + (e && e.message ? e.message : e)); return false; }
+  }
+
   // 启动（安全模式时自动追加 --patch）。
   // v1.5.17a：首次安装改为**异步**（原 spawnSync 会阻塞 Electron 主进程最多 5 分钟，
   // UI 表现为"正在启动中"一直转圈）；失败路径保证 this.proc 不为 null 的兜底（错误事件
@@ -232,6 +342,10 @@ class Launcher extends EventEmitter {
     this.ready = false;
     this.authUrl = '';
     this.manualStop = false;
+    // R22：记录本次启动前的 web.log 字节基线——看门狗只分析「本次启动之后」追加的
+    // 输出（web.log 跨启动不清空，历史插件故障行若被误读会触发假安全模式）
+    this.webLogBaseline = 0;
+    try { this.webLogBaseline = require('./logger').webLogSize() || 0; } catch (_) { /* 忽略 */ }
     const port = this.settings.data.port;
     const patch = this.settings.data.safeMode ? this.settings.safePatchPath : null;
 
@@ -242,6 +356,30 @@ class Launcher extends EventEmitter {
     // spawn env：内嵌运行时需要 ELECTRON_RUN_AS_NODE=1
     const spawnEnv = Object.assign({}, process.env,
       this.nodeInfo && this.nodeInfo.env ? this.nodeInfo.env : {});
+    // v1.5.18b：内嵌模式下把 pnpm 环境注入 dsh（dsh 的 plugin 管理/部分插件运行
+    // 会 spawnSync('pnpm', …)——PATH 前置应用根目录(node.exe)与 pnpm shim 目录，
+    // 并提供 NODE 变量；pnpm.cmd shim 由 MarketOps._envWithPnpm 同款生成（复用以防重复）。
+    if (this.nodeInfo && this.nodeInfo.embedded) {
+      try {
+        const appDir = path.dirname(process.execPath);
+        const pnpmCjs = path.join(appDir, 'resources', 'node_modules', 'pnpm', 'bin', 'pnpm.cjs');
+        if (fs.existsSync(pnpmCjs)) {
+          const privBin = path.join(this.portablePrefix(), '..', 'market');
+          fs.mkdirSync(privBin, { recursive: true });
+          const shim = path.join(privBin, 'pnpm.cmd');
+          fs.writeFileSync(shim, [
+            '@echo off',
+            'setlocal DisableDelayedExpansion',
+            'set "ELECTRON_RUN_AS_NODE=1"',
+            `"${process.execPath}" "${pnpmCjs}" %*`,
+            'exit /b %errorlevel%',
+            '',
+          ].join('\r\n'), 'utf8');
+          spawnEnv.PATH = appDir + path.delimiter + privBin + path.delimiter + (spawnEnv.PATH || '');
+          spawnEnv.NODE = path.join(appDir, 'node.exe');
+        }
+      } catch (_) { /* pnpm 注入失败不阻塞启动 */ }
+    }
 
     if (found) {
       this._spawnDsh(args, spawnEnv);
@@ -261,6 +399,43 @@ class Launcher extends EventEmitter {
     // "--expose-internals is required for HMR service"）。内嵌运行时（Electron 的
     // node 模式）与系统 node 均支持该参数，固定带上。
     const nodeArgs = ['--expose-internals', target.bin].concat(args);
+
+    // v1.5.17e（学官方 dsh-desktop 的 launch broker）：Windows 内嵌模式下，DSH-App.exe
+    // 是 GUI 子系统——它直接 spawn 的控制台程序（dsh 内部的 pwsh/cmd 工具）会各自新建
+    // 可见控制台窗口（"执行脚本弹黑窗"）。解法：经 cmd.exe（控制台子系统）作宿主——
+    // spawn cmd /c broker.cmd 并 windowsHide 隐藏其控制台，dsh 与全部孙进程共享这个
+    // 隐藏控制台（孙进程继承，不再弹窗）。broker 是生成的 cmd 脚本（路径全部引号包裹，
+    // 无转义问题），stdout 仍走 pipe 供 URL 行解析。
+    if (process.platform === 'win32' && this.nodeInfo && this.nodeInfo.embedded) {
+      try {
+        const dataDir = path.dirname(this.portablePrefix());
+        const brokerDir = path.join(dataDir, 'broker');
+        fs.mkdirSync(brokerDir, { recursive: true });
+        const broker = path.join(brokerDir, 'launch-dsh.cmd');
+        const appExe = process.execPath;
+        const lines = [
+          '@echo off',
+          'setlocal DisableDelayedExpansion',
+          `set "ELECTRON_RUN_AS_NODE=1"`,
+          `"${appExe}" --expose-internals "${target.bin}" ${args.join(' ')}`,
+          'exit /b %errorlevel%',
+          '',
+        ];
+        fs.writeFileSync(broker, lines.join('\r\n'), 'utf8');
+        this.log('启动 dsh ' + target.version + '（cmd broker 隐藏控制台）→ ' + nodeArgs.join(' '));
+        // cmd /d/s/c：禁用 AutoRun、按字符串解析、执行后退出。
+        // 注意 broker 内已含 exe/参数（无转义问题），此处 args 不再传。
+        this.proc = spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', broker], {
+          cwd: this.workDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: spawnEnv,
+        });
+        this.running = true;
+        this._wireProc();
+        return true;
+      } catch (e) {
+        this.log('cmd broker 失败（回退直接 spawn）：' + (e && e.message ? e.message : e));
+        // 落到下方常规路径
+      }
+    }
     this.log('启动 dsh ' + target.version + ' → ' + this.nodePath + ' ' + nodeArgs.join(' '));
     this.proc = spawn(this.nodePath, nodeArgs, {
       cwd: this.workDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: spawnEnv,
@@ -274,10 +449,16 @@ class Launcher extends EventEmitter {
     const p = this.proc;
     if (!p) return;
     p.on('error', (err) => {
+      // R22：进程身份校验——stop/restart 后旧进程的迟到事件（taskkill 返回与 uv 回调
+      // 间存在时序窗口）一律忽略，避免误改新进程状态
+      if (this.proc !== p) return;
       this.running = false;
       this.emit('error', err);
     });
     p.on('exit', (code, signal) => {
+      // R22：同 error——旧进程迟到的 exit 会把 running 误置 false 并让 main 误判
+      // 「未就绪即退出」触发看门狗（误杀新进程/误进安全模式、误禁用插件）
+      if (this.proc !== p) return;
       this.running = false;
       this.emit('exit', code, signal);
     });
