@@ -44,6 +44,17 @@
     transition: opacity .25s; pointer-events: none; }
   /* —— 模型网关：供应商卡片列表（仿 dsh 模型配置页风格）—— */
   .gw-tbl { border: 1px solid #2c3546; border-radius: 8px; overflow: hidden; margin-bottom: 10px; }
+  /* 供应商列表：超高时内部滚动（右侧滚动条常显，细窄深色），「＋添加」按钮不被顶走 */
+  #gwRows { max-height: 300px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #3d4a60 transparent; }
+  #gwRows::-webkit-scrollbar { width: 8px; }
+  #gwRows::-webkit-scrollbar-track { background: transparent; }
+  #gwRows::-webkit-scrollbar-thumb { background: #3d4a60; border-radius: 4px; }
+  #gwRows::-webkit-scrollbar-thumb:hover { background: #4f5f7a; }
+  /* 网关日志滚动条（Electron/Chromium）：与供应商列表同风格 */
+  #gwLog::-webkit-scrollbar { width: 8px; }
+  #gwLog::-webkit-scrollbar-track { background: transparent; }
+  #gwLog::-webkit-scrollbar-thumb { background: #3d4a60; border-radius: 4px; }
+  #gwLog::-webkit-scrollbar-thumb:hover { background: #4f5f7a; }
   .gw-row {
     display: grid; grid-template-columns: 40px 130px minmax(0,1fr) 56px 44px 92px;
     align-items: center; gap: 8px; padding: 9px 10px; font-size: 12px;
@@ -205,8 +216,8 @@
     </div>
     <div class="row" style="align-items:flex-start;">
       <label>网关日志</label>
-      <textarea id="gwLog" rows="5" readonly spellcheck="false"
-        style="flex:1;background:#161a21;color:#9aa7bc;border:1px solid #2c3546;border-radius:6px;padding:8px;font-family:Consolas;font-size:11px;resize:vertical;"></textarea>
+      <textarea id="gwLog" rows="14" readonly spellcheck="false"
+        style="flex:1;min-height:220px;background:#161a21;color:#9aa7bc;border:1px solid #2c3546;border-radius:6px;padding:8px;font-family:Consolas;font-size:11px;resize:vertical;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#3d4a60 transparent;"></textarea>
       <button id="btnGwLogClear" style="align-self:flex-end;">清屏</button>
     </div>
     <div class="hint" style="margin-top:10px;">同模型多上游按优先级路由 + 故障切换 + SSE + 熔断；「写入 dsh 配置」把网关注册为 dsh 的 gateway 提供商（重启 dsh web 生效）。</div>
@@ -216,14 +227,16 @@
     <h2>更新与诊断</h2>
     <div class="row"><label>dsh 版本</label><span id="versions">检测中…</span></div>
     <div class="row" id="upgradeRow" style="display:none;">
-      <label>升级命令</label><span id="upgradeCmd" style="font-family:Consolas;font-size:12px;color:#9fe08a;"></span>
-      <button id="btnCopy">复制</button>
+      <label>发现新版</label><span id="upgradeCmd" style="font-family:Consolas;font-size:12px;color:#9fe08a;"></span>
+      <button id="btnUpgradeNow" class="primary" style="background:#2b5bd7;color:#fff;">立即升级</button>
+      <button id="btnCopy">复制命令</button>
     </div>
-    <div class="row"><label>启动时检查更新</label><input type="checkbox" id="checkUpdates" /></div>
+    <div class="row"><label>启动时检查更新</label><input type="checkbox" id="checkUpdates" />
+      <span style="color:#5f6b7d;font-size:11px;">开启后检测到新版将<b>自动升级</b>（自动停服→npm 全局安装→重启服务）</span></div>
     <div class="row"><label>安全模式</label>
       <button id="btnExitSafe">退出安全模式并重启</button>
     </div>
-    <div class="hint">升级命令需在终端中执行（全局安装 dsh）；壳本身不代装，避免权限与来源混杂。</div>
+    <div class="hint">自动升级：先停止 dsh web（避免 Windows 文件占用），执行 <code>npm i -g @deepseek-ai/dsh@latest</code>（<code>DSH_NPM_REGISTRY</code> 可换镜像），完成后自动重启服务；失败会在日志给出手动命令。升级使用系统 node/npm 环境。</div>
   </div>
 
   <div class="foot">
@@ -589,6 +602,27 @@
     $('btnCopy').onclick = () => {
       window.dshApp.action('copy-upgrade-command');
       toast('升级命令已复制');
+    };
+    // 立即升级（v1.5.17）：停服 → npm i -g → 重启；进度见日志与状态栏
+    $('btnUpgradeNow').onclick = async () => {
+      const btn = $('btnUpgradeNow');
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = '升级中…';
+      toast('开始升级 dsh（自动停服→安装→重启），详见日志');
+      try {
+        const r = await window.dshApp.action('upgrade-dsh');
+        if (r && r.ok) {
+          toast('升级成功：' + (r.from || '') + ' → ' + (r.to || ''));
+        } else {
+          toast('升级失败（详见日志），可手动执行 npm i -g @deepseek-ai/dsh@latest');
+        }
+      } catch (_) {
+        toast('升级请求失败（详见日志）');
+      }
+      btn.disabled = false;
+      btn.textContent = '立即升级';
+      load();   // 刷新版本显示
     };
     $('btnExitSafe').onclick = () => window.dshApp.action('exit-safe');
 
