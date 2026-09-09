@@ -1,0 +1,11 @@
+'use strict';
+const fs = require('fs');
+const mk = fs.readFileSync('src/market.js', 'utf8');
+console.log('源码 market.js:');
+console.log('  _envWithPnpm:', mk.includes('_envWithPnpm'));
+console.log('  dshfind 默认:', mk.includes("id: 'dshfind'"));
+console.log('  scoped URL:', mk.includes('@$1%2F'));
+console.log('  ComSpec:', mk.includes('ComSpec'));
+const l = fs.readFileSync('src/launcher.js', 'utf8');
+console.log('launcher.js R19 双补丁:', l.includes('wShowWindow: 0,   // dsh-app R19'));
+console.log('launcher.js pnpm 注入(spawnEnv):', l.includes('pnpmCjs'));
