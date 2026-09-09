@@ -18,6 +18,8 @@ const { TrayController } = require('./tray');
 const updater = require('./updater');
 const { GatewayManager } = require('./gateway-manager');
 const { resolveDataDir } = require('./datadir');
+const market = require('./market');   // v1.5.18 插件市场（1024Store + npm 校验 + dsh CLI）
+let marketOps = null;                 // 市场安装/卸载执行器（懒初始化，detect 后可用）
 
 // 窗口/任务栏图标：与 DSH-App.exe 内嵌图标一致（从 electron.exe 官方资源提取的
 // electron-icon.png，详见 scripts/extract-exe-icon.mjs；createFromPath 支持 asar 内读取）
@@ -119,6 +121,24 @@ function createMainWindow() {
   // 输入框上下键历史：主进程 before-input-event 拦截（不依赖页面注入时机），
   // 历史按会话 key 持久化到 data\input-history.json（跨启动保留），读写输入框经 executeJavaScript。
   wireInputHistory(mainWindow, () => state.port, APP_USERDATA);
+}
+
+// R22：确保主窗口存在并可见（minimizeToTray=false 时用户关窗后 mainWindow 为 null，
+// 托盘/二次实例/「聚焦」此前对 null 无操作 → UI 无法再打开，只能重启 app）
+function ensureMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createMainWindow();
+    // 服务已就绪 → 直接载入 dsh 界面（否则停留本地状态页）
+    if (launcher && launcher.ready && launcher.authUrl && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.loadURL(launcher.authUrl).catch((err) => {
+        logger.appendLog('加载界面失败: ' + (err && err.message ? err.message : err));
+      });
+    }
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+    mainWindow.focus();
+  }
 }
 
 // —— 输入框上下键历史（主进程实现）——
@@ -596,10 +616,10 @@ function registerIpc() {
       case 'retry': await startService(); break;
       case 'exit-safe': await watchdog.exitSafeMode(); break;
       case 'open-logs':
-        shell.openPath(logger.logDirPath() || os.homedir());
+        shell.openPath(logger.logDirPath() || os.homedir()).catch(() => { /* 忽略 */ });
         break;
       case 'open-browser':
-        shell.openExternal(state.authUrl || 'http://127.0.0.1:' + state.port + '/');
+        shell.openExternal(state.authUrl || 'http://127.0.0.1:' + state.port + '/').catch(() => { /* 忽略 */ });
         break;
       case 'open-settings': {
         // 支持 "open-settings::<section>" 形式定位到具体卡片（如 gateway）
@@ -608,7 +628,7 @@ function registerIpc() {
         break;
       }
       case 'focus':
-        if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+        ensureMainWindow();
         break;
       case 'copy-upgrade-command':
         clipboard.writeText('npm i -g @deepseek-ai/dsh@latest');
@@ -649,6 +669,40 @@ function registerIpc() {
     broadcastGw();
     return true;
   });
+  // —— 插件市场（v1.5.18，参考官方 dsh-community-market 架构）——
+  // 安全边界照搬官方：源数据只用于发现（源版本不作安装目标）；安装预览必须通过
+  // npm registry 元数据校验（同名+稳定版+有效 dsh.bundle.patch）；安装/卸载统一走
+  // 标准 dsh CLI（与手工命令一致——市场/CLI/手工三途径互通，已安装视图读 dsh 真实
+  // profile 状态，天然兼容自行安装的插件）。
+  ipcMain.handle('mk:discover', async (_e, payload) => {
+    const p = payload || {};
+    return await market.discover(String(p.sourceId || ''), String(p.q || ''), String(p.category || ''), p.cursor || '', Number(p.limit) || 50);
+  });
+  ipcMain.handle('mk:preview', async (_e, pkgName) => {
+    return await market.npmPreview(String(pkgName || ''));
+  });
+  ipcMain.handle('mk:installed', () => {
+    return market.installedPlugins();
+  });
+  ipcMain.handle('mk:action', async (_e, name, pkgName) => {
+    if (!marketOps) marketOps = new market.MarketOps({
+      nodeInfo: launcher.nodeInfo || { exe: 'node', env: {}, embedded: false },
+      dshBin: launcher.found ? launcher.found.bin : null,
+      log: (s) => logger.appendLog('[市场] ' + s),
+    });
+    const onLine = (line) => { logger.appendLog('[dsh plugin] ' + line); };
+    if (name === 'install') {
+      const r = await marketOps.install(String(pkgName || ''), onLine);
+      logger.appendLog(r.ok ? '[市场] 安装成功：' + pkgName + '（重启 dsh 服务后生效）' : '[市场] 安装失败：' + pkgName);
+      return r;
+    }
+    if (name === 'remove') {
+      const r = await marketOps.remove(String(pkgName || ''), onLine);
+      logger.appendLog(r.ok ? '[市场] 卸载成功：' + pkgName + '（重启 dsh 服务后生效）' : '[市场] 卸载失败：' + pkgName);
+      return r;
+    }
+    return { ok: false, error: 'unknown-action' };
+  });
   // 复制文本到剪贴板（设置页"复制"按钮等）
   ipcMain.handle('dsh:clipboard', (_e, text) => {
     clipboard.writeText(String(text == null ? '' : text));
@@ -663,8 +717,18 @@ let forceQuit = false;
 function quitAll() {
   forceQuit = true;
   const stopAll = async () => {
-    if (gateway) await gateway.stop();
+    // R18（退出全清）：正常停网关 + dsh 主进程后，再全局清理所有 dsh 相关进程树
+    // （孙进程/broker/plugin 操作树——此前退出后残留 node 进程、旧实例 dsh web 占用
+    // 3080、黑窗进程等都是这里漏掉的）。特征匹配足够特异，不影响系统终端手工跑的 dsh。
+    if (gateway) { gateway.stopping = true; await gateway.stop(); }
     await launcher.stop();
+    try {
+      const { killAllDshProcesses } = require('./gateway-manager');
+      const n = killAllDshProcesses((s) => logger.appendLog(s));
+      if (n > 0) logger.appendLog('退出清理：共清理 ' + n + ' 个 dsh 相关进程树。');
+    } catch (e) {
+      logger.appendLog('退出清理异常: ' + (e && e.message ? e.message : e));
+    }
     app.quit();
   };
   stopAll();
@@ -676,13 +740,21 @@ async function bootstrap() {
     return;
   }
   app.on('second-instance', () => {
-    if (mainWindow) { mainWindow.show(); mainWindow.focus(); }
+    ensureMainWindow();
   });
 
   // 数据目录：exe 旁 data\ 优先（绿色便携，随程序目录走）；不可写才回退 %APPDATA%
   const userData = resolveDataDir();
   APP_USERDATA = userData;   // 供输入历史等模块持久化
   logger.init(userData);
+  // R22：兜底未捕获异常/Promise 拒绝——主进程缺 handler 时 Node 默认直接 throw，
+  // 用户操作路径上偶发的 openExternal/加载失败即可带崩整个壳
+  process.on('unhandledRejection', (reason) => {
+    try { logger.appendLog('[未处理 Promise 拒绝] ' + ((reason && (reason.stack || reason.message)) || reason)); } catch (_) { /* 忽略 */ }
+  });
+  process.on('uncaughtException', (err) => {
+    try { logger.appendLog('[未捕获异常] ' + ((err && err.stack) || err)); } catch (_) { /* 忽略 */ }
+  });
   settings = new Settings(userData);
   settings.load();
 
@@ -711,12 +783,13 @@ async function bootstrap() {
   tray = new TrayController({
     getState: () => state.snapshot(),
     actions: {
-      showMain: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } },
+      showMain: ensureMainWindow,
       start: startService,
       stop: stopService,
-      openBrowser: () => shell.openExternal(state.authUrl || 'http://127.0.0.1:' + state.port + '/'),
+      openBrowser: () => shell.openExternal(state.authUrl || 'http://127.0.0.1:' + state.port + '/').catch(() => { /* 忽略 */ }),
       openSettings: (section) => createSettingsWindow(section),
       openGateway: () => createSettingsWindow('gateway'),
+      openMarket: () => createSettingsWindow('market'),   // v1.5.18：托盘直达插件市场
       restartGateway: async () => {
         // 托盘「重启网关」：先杀网关进程再启动（restart 已实现先杀后启 + 清熔断）
         if (!gateway) return;
@@ -730,7 +803,7 @@ async function bootstrap() {
           logger.appendLog('模型网关重启失败: ' + (err && err.message ? err.message : err));
         }
       },
-      openLogs: () => shell.openPath(logger.logDirPath() || os.homedir()),
+      openLogs: () => shell.openPath(logger.logDirPath() || os.homedir()).catch(() => { /* 忽略 */ }),
       quit: quitAll,
     },
   });
