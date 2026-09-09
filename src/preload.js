@@ -16,6 +16,12 @@ contextBridge.exposeInMainWorld('dshApp', {
   gwState: () => ipcRenderer.invoke('gw:state'),
   gwAction: (name, payload) => ipcRenderer.invoke('gw:action', name, payload),
 
+  // 插件市场（v1.5.18）：发现 / 安装预览 / 已安装 / 安装卸载
+  mkDiscover: (payload) => ipcRenderer.invoke('mk:discover', payload),
+  mkPreview: (pkgName) => ipcRenderer.invoke('mk:preview', pkgName),
+  mkInstalled: () => ipcRenderer.invoke('mk:installed'),
+  mkAction: (name, pkgName) => ipcRenderer.invoke('mk:action', name, pkgName),
+
   // 复制文本到剪贴板（主进程 clipboard，渲染进程无权限问题）
   copyText: (text) => ipcRenderer.invoke('dsh:clipboard', String(text == null ? '' : text)),
 
