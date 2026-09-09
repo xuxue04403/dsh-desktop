@@ -9,7 +9,7 @@ const path = require('path');
 
 const { GatewayManager, validateConfigText } = require('../src/gateway-manager');
 const { Watchdog } = require('../src/watchdog');
-const { findDsh, findNode } = require('../src/launcher');
+const { findDsh, findNode, findNodeStr, findEmbeddedNpmCli } = require('../src/launcher');
 
 let passed = 0;
 // 测试支持同步/异步用例：注册后顺序执行（saveConfig 等已改为 async）
@@ -268,9 +268,28 @@ t('安全模式：无插件特征日志 → parseFailedPlugins 为空（不误�
 });
 
 // —— 运行时发现（本机探测，只做类型断言）——
-t('launcher：findNode 返回 node 路径字符串', () => {
+// v1.5.17：findNode 返回 { exe, env, embedded }（内嵌运行时优先）；
+// findNodeStr 保持旧字符串契约。
+t('launcher：findNode 返回 {exe,env,embedded} 且 findNodeStr 为字符串', () => {
   const n = findNode();
-  assert.ok(typeof n === 'string' && n.length > 0);
+  assert.ok(n && typeof n.exe === 'string' && n.exe.length > 0, 'exe 应为非空字符串');
+  assert.ok(n.env && typeof n.env === 'object', 'env 应为对象');
+  assert.ok(typeof n.embedded === 'boolean', 'embedded 应为布尔');
+  // 开发模式（测试环境）：embedded=false，exe 指向系统 node
+  assert.strictEqual(n.embedded, false, '开发模式下应为系统 node');
+  const s = findNodeStr();
+  assert.ok(typeof s === 'string' && s.length > 0, 'findNodeStr 应返回字符串');
+});
+
+t('launcher：findEmbeddedNpmCli 开发模式指向项目 npm（或 null）', () => {
+  const c = findEmbeddedNpmCli();
+  if (c) {
+    assert.ok(c.endsWith('npm-cli.js'), '应以 npm-cli.js 结尾');
+    assert.ok(fs.existsSync(c), 'npm-cli.js 应存在');
+  }
+  // 开发模式下项目内有 node_modules\npm → 应找到
+  const projNpm = path.join(__dirname, '..', 'node_modules', 'npm', 'bin', 'npm-cli.js');
+  if (fs.existsSync(projNpm)) assert.ok(c === projNpm, '开发模式应指向项目 npm');
 });
 
 t('launcher：findDsh 返回结构或 null（不断言具体版本）', () => {
