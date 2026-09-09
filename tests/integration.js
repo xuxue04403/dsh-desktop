@@ -40,11 +40,11 @@ t('网关：首次使用从示例生成配置', () => {
 });
 
 t('网关：configPort 读取配置内端口', () => {
-  assert.strictEqual(gm.configPort(), 3090);   // 示例配置 port=3090
+  assert.strictEqual(gm.configPort(), 3091);   // 示例配置 port=3091（dsh-app 网关约定）
   fs.writeFileSync(gm.configPath, JSON.stringify({ port: 3123, providers: [] }), 'utf8');
   assert.strictEqual(gm.configPort(), 3123);
   fs.writeFileSync(gm.configPath, '{broken', 'utf8');
-  assert.strictEqual(gm.configPort(), 3090);   // 解析失败 → 默认
+  assert.strictEqual(gm.configPort(), 3091);   // 解析失败 → 默认 3091
 });
 
 t('网关：saveConfig 校验并写盘（合法）', async () => {
