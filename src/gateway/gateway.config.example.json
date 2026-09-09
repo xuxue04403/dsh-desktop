@@ -1,5 +1,5 @@
 {
-  "port": 3090,
+  "port": 3091,
   "apiKey": "dsh-gateway-change-me",
   "providers": [
     {
