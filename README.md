@@ -95,6 +95,7 @@ dsh-app/
 - **密钥脱敏 + 自适应降敏重试（R9/R9c）**：消息中的 `github_pat_`/`sk-` 等真实 token 自动打码（保留前缀+尾 4 位）——既防密钥外泄给第三方模型，也避免上游 new-api 的"防密钥泄露"内容过滤拦截整个请求；若仍被拦（sensitive words/content-blocked），自动把 ≥32 位技术串占位符化后**重试一次**；被拦请求的结构摘要自动落盘 `data\logs\dump\`（不含明文内容）供诊断；
 - **构建不销毁数据（R13）**：`build-portable.mjs` 重建输出目录前自动备份并还原 `data\`（配置/日志/设置）——修复"每次构建把用户数据清空、启动时从旧源迁移导致配置回退"的严重问题；
 - **审计加固（R10-R12）**：forward 响应体单次消费（错误详情/dump 不丢）、网关启动互斥（防并发双 spawn）、「写入 dsh 配置」端口实时读配置（未运行时也正确）、诊断完整 dump 落盘前脱敏；
+- **插件市场（v1.5.18，参考官方 DSH Community Market 架构）**：设置页新增「插件市场」卡片——**发现**（内置 DSH 1024Store 源，搜索/分页/详情）、**安装**（先经 npm registry 校验：同名 + 稳定版本 + 有效 `dsh.bundle.patch`，确认后执行标准 `dsh plugin add`）、**卸载**（`dsh plugin remove`）、**已安装**（读 dsh 真实 profile 状态——市场/命令行/手工安装互通，**不影响自行安装的插件**）。安全边界照搬官方：**源提供的版本不作为安装目标**（npm latest 为准）、源命令字符串一律丢弃、仅浏览型条目只展示；安装/卸载改动需重启 dsh 服务生效；`DSH_NPM_REGISTRY` 可换元数据源；
 - 配置（供应商列表/优先级/Key）保存在**程序目录旁 `data\gateway.config.json`**（绿色便携，随程序目录走；不可写时才回退 `%APPDATA%\DSH-App\`；与桌面助手配置同构，可直接沿用）；
 - **一次性自动迁移**：本地网关配置缺失、或仍是**模拟/示例数据**（mockA/mockB、provider-a/b）时，按优先级从桌面助手真实位置自动复制/升级（旧文件备份为 `.bak-mock`）——环境变量 `DSH_LEGACY_CONFIG` → 沿程序目录祖先链找 `<base>\dsh-desktop\data\`（真实便携配置） → `%USERPROFILE%\dsh-desktop\data\` → 旧 `%APPDATA%` 位置。来源本身是模拟数据的会被跳过；用户已修改的真实配置不会被覆盖；无导入按钮。
 
