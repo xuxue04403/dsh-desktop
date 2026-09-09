@@ -43,6 +43,7 @@ class TrayController {
       { type: 'separator' },
       { label: '设置', click: () => this.actions.openSettings() },
       { label: '模型网关', click: () => (this.actions.openGateway ? this.actions.openGateway() : this.actions.openSettings('gateway')) },
+      { label: '插件市场', click: () => (this.actions.openMarket ? this.actions.openMarket() : this.actions.openSettings('market')) },
       { label: '重启网关', click: () => (this.actions.restartGateway ? this.actions.restartGateway() : undefined) },
       { label: '打开日志目录', click: () => this.actions.openLogs() },
       { type: 'separator' },
