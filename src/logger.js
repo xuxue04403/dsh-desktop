@@ -59,4 +59,13 @@ function webLogPath() {
   return webLogFile;
 }
 
-module.exports = { init, appendLog, appendWeb, logDirPath, webLogPath };
+// web.log 当前字节数（看门狗"本次启动之后"基线切分用；文件不存在/未初始化 → 0）
+function webLogSize() {
+  try {
+    if (!webLogFile) return 0;
+    if (!fs.existsSync(webLogFile)) return 0;
+    return fs.statSync(webLogFile).size;
+  } catch (_) { return 0; }
+}
+
+module.exports = { init, appendLog, appendWeb, logDirPath, webLogPath, webLogSize };
