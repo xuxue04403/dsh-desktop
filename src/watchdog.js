@@ -94,7 +94,15 @@ class Watchdog {
 
     const logPath = path.join(this.settings.dir, 'logs', 'web.log');
     let logText = '';
-    try { if (fs.existsSync(logPath)) logText = fs.readFileSync(logPath, 'utf8'); } catch (_) { /* 忽略 */ }
+    try {
+      if (fs.existsSync(logPath)) {
+        const full = fs.readFileSync(logPath, 'utf8');
+        // R22：只分析本次启动之后追加的输出（web.log 跨启动不清空，1MB 轮转前的历史
+        // 故障行若被误读，任何后续非插件启动失败都会被误判为插件故障 → 假安全模式）
+        const base = (this.launcher && this.launcher.webLogBaseline) || 0;
+        logText = base > 0 && full.length > base ? full.slice(base) : full;
+      }
+    } catch (_) { /* 忽略 */ }
     const names = parseFailedPlugins(logText);
 
     const data = this.settings.data;
