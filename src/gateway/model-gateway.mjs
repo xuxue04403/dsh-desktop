@@ -16,7 +16,7 @@
  *
  * Config file (JSON):
  *   {
- *     "port": 3090,
+ *     "port": 3091,
  *     "apiKey": "dsh-gateway-xxxxxxxx",
  *     "providers": [
  *       {
@@ -80,7 +80,7 @@ function argvGet(flag) {
 
 function defaultConfig() {
   return {
-    port: 3090,
+    port: 3091,
     apiKey: 'dsh-gateway-change-me',
     providers: [
       {
@@ -132,7 +132,9 @@ const catalogInflight = new Map(); // providerId -> Promise（并发去重）
  * 目的：上游临时风控/限流时，避免持续打点加剧封禁，保护账号。
  */
 const BREAKER_THRESHOLD = 3;                    // 连续失败次数阈值
-const BREAKER_SHORT_MS = 5 * 60_000;            // 短熔断 5 分钟（网络错/5xx）
+const BREAKER_SHORT_MS = 90_000;                // R20：短熔断 90 秒（网络错/5xx——clash 抖动
+                                                // 很常见，5 分钟误伤过大：全家熔断期间请求
+                                                // 全部 404/503，用户以为网关坏了）
 const BREAKER_LONG_MS = 30 * 60_000;            // 长熔断 30 分钟（401/403 业务拒绝）
 const breaker = new Map();                      // providerId -> { fails, openUntil }
 
@@ -354,6 +356,11 @@ function upstreamRequestHeaders(reqHeaders, apiKey, clientUA, anthropic, clientP
   out['accept'] = 'application/json, text/event-stream';
   out['content-type'] = 'application/json';
   out['accept-encoding'] = 'identity';  // K7：强制上游不压缩，SSE 不乱码
+  // R16（网关假死修复）：禁用上游连接复用——undici 连接池的空闲连接会被上游/代理
+  // （clash keep-alive 超时、LB 断连）静默关闭，下次 fetch 复用死连接即挂起
+  // （表现为"无调用一段时间后假死，重启网关才恢复"）。Connection: close 让每次
+  // 请求用全新连接（本地代理下 TLS 握手开销可忽略），彻底消除死连接。
+  out['connection'] = 'close';
   return out;
 }
 
@@ -765,8 +772,16 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
 
   // V1 防封：跳过熔断中的 provider（连续失败保护期，不发起上游请求）
   const breakerOpen = (p) => { if (breakerIsOpen(p.id)) { log(`skip ${p.id} (breaker open)`); return true; } return false; };
+  const breakerSkipped = candidates.filter((p) => breakerIsOpen(p.id)).length;
   const ordered = [...withCatalog, ...unknown].filter((p) => !breakerOpen(p));
   if (ordered.length === 0) {
+    // R20：区分"未配置"与"全部熔断中"——后者是暂时状态（网络抖动/上游故障），
+    // 返回 503 + 明确原因，不再误导为 404 配置问题；catalog 未收录（unknown 全熔断）同理。
+    if (candidates.length > 0 && candidates.every((p) => breakerIsOpen(p.id) || false)) {
+      const until = Math.max(...candidates.map((p) => { const b = breaker.get(p.id); return b ? b.openUntil - Date.now() : 0; }));
+      const secs = Math.max(1, Math.ceil((until || 90000) / 1000));
+      return json(res, 503, { error: { message: `all providers for model "${model}" are temporarily in breaker cooldown (network/upstream failures); retry in ~${secs}s or restart the gateway` } });
+    }
     return json(res, 404, { error: { message: `model "${model}" is not offered by any configured provider` } });
   }
 
@@ -867,6 +882,13 @@ async function handleMessages(cfg, req, res, body) {
   const breakerOpen = (p) => { if (breakerIsOpen(p.id)) { log(`skip ${p.id} (breaker open)`); return true; } return false; };
   const ordered = [...withCatalog, ...unknown].filter((p) => !breakerOpen(p));
   if (ordered.length === 0) {
+    // R20：全部熔断中 → 503（暂时），不再误报 404 配置问题
+    if (candidates.length > 0 && candidates.every((p) => breakerIsOpen(p.id) || false)) {
+      const until = Math.max(...candidates.map((p) => { const b = breaker.get(p.id); return b ? b.openUntil - Date.now() : 0; }));
+      const secs = Math.max(1, Math.ceil((until || 90000) / 1000));
+      logCall('breaker-all', 'fail');
+      return json(res, 503, { type: 'error', error: { type: 'api_error', message: `all providers for model "${model}" are temporarily in breaker cooldown; retry in ~${secs}s or restart the gateway` } });
+    }
     logCall('no-provider', 'fail');
     return json(res, 404, { type: 'error', error: { type: 'invalid_request_error', message: `model "${model}" is not offered by any configured provider` } });
   }
@@ -985,6 +1007,33 @@ function startServer(cfg) {
     // 端口占用等致命错误：直接退出，让宿主(助手)能明确感知进程终止（C2）
     process.exit(1);
   });
+
+  // R17（假死自愈）：进程内自检 watchdog——每 60s 自请求 /health；事件循环卡死或
+  // server 假死（表现：无调用一段时间后无法连接，重启才恢复）时自检超时，连续 3 次
+  // 失败即自杀退出（宿主 gateway-manager 的 exit 处理会自动重启，清空全部状态复活）。
+  {
+    let fails = 0;
+    setInterval(() => {
+      const req = http.get({ host: '127.0.0.1', port: cfg.port, path: '/health', timeout: 8000 }, (res) => {
+        res.resume();
+        fails = res.statusCode === 200 ? 0 : fails + 1;
+        if (fails >= 3) {
+          log(`self-watchdog: /health 返回 ${res.statusCode} 连续 ${fails} 次，进程自杀重启。`);
+          process.exit(1);
+        }
+      });
+      req.on('timeout', () => { req.destroy(); checkFail('timeout'); });
+      req.on('error', () => checkFail('error'));
+    }, 60_000);
+    const checking = { fails: 0 };
+    function checkFail() {
+      fails += 1;
+      if (fails >= 3) {
+        log(`self-watchdog: /health 自检连续 ${fails} 次失败，进程自杀重启。`);
+        process.exit(1);
+      }
+    }
+  }
   return server;
 }
 
@@ -1004,7 +1053,7 @@ function writeDshConfig(args) {
   const cfgPath = get('--config') || CONFIG_PATH;
   const settingsPath = get('--settings') || process.env.DSH_SETTINGS || path.join(os.homedir(), '.dsh', 'settings.yaml');
   const credsPath = get('--credentials') || process.env.DSH_CREDENTIALS || path.join(os.homedir(), '.dsh', '.credentials.yaml');
-  const port = Number(get('--port') || 3090);
+  const port = Number(get('--port') || 3091);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     console.error(`[write-dsh] invalid --port: ${get('--port')}`);
     process.exit(1);
