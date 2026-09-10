@@ -417,7 +417,9 @@ class Launcher extends EventEmitter {
           '@echo off',
           'setlocal DisableDelayedExpansion',
           `set "ELECTRON_RUN_AS_NODE=1"`,
-          `"${appExe}" --expose-internals "${target.bin}" ${args.join(' ')}`,
+          // R25（审计修复）：args 逐个加引号——`--patch <safe.yml>` 路径含空格时
+          // （%APPDATA% 回退/用户名含空格）cmd 会拆断参数 → 安全模式补丁丢失
+          `"${appExe}" --expose-internals "${target.bin}" ${args.map((a) => '"' + a + '"').join(' ')}`,
           'exit /b %errorlevel%',
           '',
         ];
