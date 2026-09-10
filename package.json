@@ -1,14 +1,14 @@
 {
   "name": "dsh-app",
   "productName": "DSH App",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "自研 DSH 桌面壳：参考 anywhere-labs/dsh-desktop 架构的轻量 Electron 实现（进程外启动 dsh web，窗口/托盘/看门狗/安全模式）",
   "main": "src/main.js",
   "private": true,
   "license": "MIT",
   "scripts": {
     "start": "electron .",
-    "test": "node tests/unit.js && node tests/integration.js && node tests/market.test.js",
+    "test": "node tests/unit.js && node tests/integration.js && node tests/market.test.js && node tests/email-scrub.test.mjs",
     "check": "node --check src/main.js && node --check src/launcher.js && node --check src/watchdog.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder --win nsis portable",
