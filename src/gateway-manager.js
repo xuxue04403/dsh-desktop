@@ -44,18 +44,16 @@ function killProcessesByCommandline(marker, logLabel, logFn) {
 }
 
 // R18（退出全清）：杀掉所有 dsh-app 拉起的 dsh 相关进程树——特征匹配：
-//   - dsh web 主进程（bin.js ... web --no-open）
-//   - dsh plugin 操作树（bin.js ... plugin / pnpm 安装树）
-//   - 网关进程（model-gateway.mjs）
 //   - broker cmd（launch-dsh.cmd / plugin-op.cmd）
-// 注意：只杀命令行含特征且可识别为 node/DSH-App/cmd 的进程；dsh 用户在系统终端手工
-// 跑的命令（cwd 不同、无我们的特征串）不受影响——特征串足够特异（bin.js 全路径/脚本名）。
-function killAllDshProcesses(logFn) {
+//   - 本应用数据目录路径（网关 --config、broker 目录等；R25：替代裸 '@deepseek-ai'
+//     特征——旧特征会误杀用户在系统终端手工跑的 dsh / npm 升级进程，与注释矛盾）
+// R25：不再用 'model-gateway.mjs' / '@deepseek-ai' 裸特征（会误杀桌面助手网关与
+// 用户手工进程）；未提供 dataDir 时（兼容旧调用）保留 '@deepseek-ai' 兜底。
+function killAllDshProcesses(logFn, dataDir) {
   const markers = [
-    'model-gateway.mjs',
     'launch-dsh.cmd',
     'plugin-op.cmd',
-    '@deepseek-ai',
+    dataDir || '@deepseek-ai',
   ];
   let total = 0;
   for (const m of markers) {
@@ -210,11 +208,16 @@ class GatewayManager extends EventEmitter {
     }
   }
 
-  // 解析网关应使用的代理：配置显式 proxy.enabled → 用配置 url（空则自动探测兜底）；
-  // 未配置 → 自动探测。返回 "http://host:port" 或 null。
-  resolveProxy() {
+  // 解析网关应使用的代理：配置显式 proxy.enabled → 用配置 url（空则自动探测）；
+  // **显式关闭（enabled === false）→ 返回 null（直连，绝不探测/兜底）**；
+  // 未配置 → 自动探测。返回 "http://host:port" 或 null（async：探测要 TCP 连通测试）。
+  async resolveProxy() {
     try {
       const cfg = JSON.parse(this.configText() || '{}');
+      if (cfg.proxy && cfg.proxy.enabled === false) {
+        this.log('模型网关：代理已显式关闭（proxy.enabled=false），直连。');
+        return null;
+      }
       if (cfg.proxy && cfg.proxy.enabled) {
         const u = String(cfg.proxy.url || '').trim();
         if (u) {
@@ -229,10 +232,11 @@ class GatewayManager extends EventEmitter {
   }
 
   // 检测本机代理（clash/v2ray 等）：返回 "http://host:port" 或 null。
-  // 优先级：显式环境变量 > 系统代理(ProxyEnable=1) > 常用 clash 端口 7890/7897。
-  // 网关进程注入后走代理；若代理实际不可用，node fetch 会直连失败回退到原错误，
-  // 与未注入等价（不影响其他功能）。
-  detectProxy() {
+  // 优先级：显式环境变量 > 系统代理(ProxyEnable=1) > 常用 clash 端口（**TCP 探测通过才用**）。
+  // R25（审计阻断修复）：旧版对 7890 无条件兜底——未装 clash 的机器上 NODE_USE_ENV_PROXY
+  // 注入后 undici 的 EnvHttpProxyAgent **没有"代理不可达回退直连"机制**，所有上游请求
+  // ECONNREFUSED → 网络错熔断循环 → 网关必坏。现在兜底前必须探测端口可连。
+  async detectProxy() {
     const env = process.env;
     if (env.HTTPS_PROXY) return env.HTTPS_PROXY;
     if (env.https_proxy) return env.https_proxy;
@@ -249,14 +253,28 @@ class GatewayManager extends EventEmitter {
         if (first) return first.includes('://') ? first : 'http://' + first;
       }
     } catch (_) { /* 忽略 */ }
-    return 'http://127.0.0.1:7890';   // clash 默认混合端口（不可用时直连兜底）
+    // clash 默认混合端口兜底：仅当 TCP 可连时采用（400ms 超时，不阻塞启动）
+    const net = require('net');
+    const probePort = (port) => new Promise((resolve) => {
+      const s = net.connect({ host: '127.0.0.1', port }, () => { s.destroy(); resolve(true); });
+      s.setTimeout(400, () => { s.destroy(); resolve(false); });
+      s.on('error', () => resolve(false));
+    });
+    for (const port of [7890, 7897]) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await probePort(port)) return 'http://127.0.0.1:' + port;
+    }
+    return null;   // 没有可用代理 → 直连（不再无条件注入 7890）
   }
 
   // 全局清理"孤儿网关"进程：旧实例/旧版本残留的 node model-gateway.mjs 会一直占用
   // 配置端口，导致新实例 EADDRINUSE 启动失败（用户侧表现为"网关启动了但探测不通过"）。
-  // 识别方式精准：仅杀命令行包含 model-gateway.mjs 的 node 进程，不会误伤其他程序。
+  // R25（审计修复）：旧特征 'model-gateway.mjs' 会误杀**桌面助手（3090）的网关**——
+  // 两 app 并存时互杀。现在只杀命令行里带**本应用数据目录** --config 路径的网关进程。
   killStaleGatewayProcesses() {
-    return killProcessesByCommandline('model-gateway.mjs', '模型网关：已清理残留网关进程');
+    const marker = this.configPath;
+    if (!marker) return 0;
+    return killProcessesByCommandline(marker, '模型网关：已清理本应用残留网关进程');
   }
 
   // 等待端口释放（taskkill 后 Windows 释放端口有短暂延迟，否则新进程 EADDRINUSE）。
@@ -318,8 +336,8 @@ async waitPortFree(port, timeoutMs) {
     }, this.nodeEnv || {});   // v1.5.17：内嵌运行时的 ELECTRON_RUN_AS_NODE 等
     // 代理注入（R6）：上游如 agentrouter/air-outer 需经 clash 类代理才能访问；
     // node ≥24 的 fetch 支持 NODE_USE_ENV_PROXY=1 + HTTPS_PROXY。
-    // 优先级：配置显式启用（proxy.enabled + url）> 自动探测（系统代理/常用端口）。
-    const proxy = this.resolveProxy();
+    // 优先级：配置显式启用（proxy.enabled + url）> 显式关闭（直连）> 自动探测（TCP 验证后）。
+    const proxy = await this.resolveProxy();
     if (proxy) {
       gwEnv.NODE_USE_ENV_PROXY = '1';
       gwEnv.HTTPS_PROXY = proxy;
@@ -361,10 +379,21 @@ async waitPortFree(port, timeoutMs) {
       this.emit('state');
       // R17（假死自愈）：网关进程意外退出（self-watchdog 自杀/崩溃）且非用户主动停止
       // （stop() 会置 this.stopping）时自动重启——熔断/连接池等全部状态随之清空复活。
+      // R25（审计修复）：连续自愈失败上限——配置损坏/端口被占时旧版每 3 秒无限重启
+      // （日志膨胀 + CPU 空转）。连续 5 次自愈未达健康即停止，交还用户处理；
+      // 一次健康启动会清零计数。
       if (!this.stopping) {
-        this.log('模型网关异常退出，3 秒后自动重启（self-heal）…');
+        this._healFails = (this._healFails || 0);
+        if (this._healFails >= 5) {
+          this.log('模型网关：连续 ' + this._healFails + ' 次自愈未成功，停止自动重启（请检查配置/端口后手动启动）。');
+          return;
+        }
+        this._healFails += 1;
+        this.log('模型网关异常退出，3 秒后自动重启（self-heal ' + this._healFails + '/5）…');
         setTimeout(() => {
-          if (!this.stopping && !this.proc) this.start().catch((e) => {
+          if (!this.stopping && !this.proc) this.start().then(() => {
+            // start 内健康探测通过会置 this._healHealthyCheck —— 见下方
+          }).catch((e) => {
             this.log('模型网关自愈重启失败: ' + (e && e.message ? e.message : e));
           });
         }, 3000);
@@ -379,6 +408,7 @@ async waitPortFree(port, timeoutMs) {
       if (!healthy) await new Promise((r) => setTimeout(r, 800));
     }
     if (healthy) {
+      this._healFails = 0;   // R25：健康启动清零自愈失败计数
       this.log('模型网关已就绪: http://127.0.0.1:' + this.port + '/v1');
     } else {
       this.log('模型网关端口探测未通过（可能配置错误，请查看日志）。');
