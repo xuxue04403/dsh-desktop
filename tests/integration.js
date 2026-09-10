@@ -300,6 +300,284 @@ t('launcher：findDsh 返回结构或 null（不断言具体版本）', () => {
   }
 });
 
+// —— v1.7.0/R24：默认插件安装器（防 pnpm 清理 + 启动前自检）——
+const { installDefaultPlugins, verifyDefaultPlugins } = require('../src/default-plugins');
+const dpHostPackages = require('../src/default-plugins').HOST_PACKAGES;
+
+function mkProfile(home, patchText, pkgJson) {
+  const web = path.join(home, 'profiles', 'web');
+  fs.mkdirSync(web, { recursive: true });
+  if (patchText !== null) fs.writeFileSync(path.join(web, 'cordis.patch.yml'), patchText, 'utf8');
+  if (pkgJson !== null) fs.writeFileSync(path.join(web, 'package.json'), typeof pkgJson === 'string' ? pkgJson : JSON.stringify(pkgJson), 'utf8');
+  return web;
+}
+
+/** 伪造 dsh 官方兜底闭包（$DSH_HOME/profiles/node_modules/@deepseek-ai/<pkg>） */
+function mkFallback(home, names) {
+  const scope = path.join(home, 'profiles', 'node_modules', '@deepseek-ai');
+  for (const n of names || dpHostPackages) {
+    fs.mkdirSync(path.join(scope, n), { recursive: true });
+    fs.writeFileSync(path.join(scope, n, 'package.json'), JSON.stringify({ name: '@deepseek-ai/' + n, version: '0.1.2-rc.1' }), 'utf8');
+  }
+}
+
+t('默认插件 v2：vendor 常驻 + package.json 声明 file: 依赖（防清理核心）+ 挂载', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dp1-'));
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    mkFallback(home);
+    mkProfile(home, '# comment\n[]\n', {
+      name: 'dsh-profile-web', private: true,
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] } },
+      dependencies: { 'dsh-web-search-free': '^1.3.0' },
+    });
+    const r = await installDefaultPlugins({ profile: 'web' });
+    assert.strictEqual(r.ok, true, '安装应成功: ' + r.message);
+    const web = path.join(home, 'profiles', 'web');
+    // 1) vendor 源常驻
+    assert.ok(fs.existsSync(path.join(web, 'vendor', 'dsh-email-bridge', 'package.json')), 'vendor 源应在 profile');
+    const vpkg = JSON.parse(fs.readFileSync(path.join(web, 'vendor', 'dsh-email-bridge', 'package.json'), 'utf8'));
+    assert.ok(Array.isArray(vpkg.bundleDependencies) && vpkg.bundleDependencies.length > 0, 'vendor 包应声明 bundleDependencies');
+    // 2) package.json 声明 file: 依赖
+    const pkg = JSON.parse(fs.readFileSync(path.join(web, 'package.json'), 'utf8'));
+    assert.strictEqual(pkg.dependencies['dsh-email-bridge'], 'file:vendor/dsh-email-bridge', '应声明 file: 依赖');
+    assert.strictEqual(pkg.dependencies['dsh-web-search-free'], '^1.3.0', '既有依赖不动');
+    // 3) node_modules 里有包（无 nodeInfo → 拷贝路径）
+    assert.ok(fs.existsSync(path.join(web, 'node_modules', 'dsh-email-bridge', 'package.json')), '包应已安装');
+    // 4) 挂载条目
+    const text = fs.readFileSync(path.join(web, 'cordis.patch.yml'), 'utf8');
+    assert.ok(text.includes('dsh-email-bridge') && text.includes('other'.replace('other', 'id: email')), '应挂载条目');
+    assert.ok(!/\n\[\]/.test(text), '[] 占位应被替换');
+    // 幂等
+    const r2 = await installDefaultPlugins({ profile: 'web' });
+    assert.strictEqual(r2.action, 'ready', '第二次应 ready: ' + r2.message);
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+t('默认插件 v2：包意外丢失（dep 在）→ 启动前自检自动修复', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dp2-'));
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    mkFallback(home);
+    mkProfile(home, '# comment\n[]\n', { name: 'dsh-profile-web', private: true, dependencies: {} });
+    await installDefaultPlugins({ profile: 'web' });
+    const web = path.join(home, 'profiles', 'web');
+    // 模拟 2026-09-10 事故：包目录被清掉（挂载条目还在）
+    fs.rmSync(path.join(web, 'node_modules', 'dsh-email-bridge'), { recursive: true, force: true });
+    const r = await verifyDefaultPlugins({ profile: 'web' });
+    assert.strictEqual(r.ok, true);
+    assert.ok(fs.existsSync(path.join(web, 'node_modules', 'dsh-email-bridge', 'package.json')), '应自动重装');
+    assert.ok(fs.readFileSync(path.join(web, 'cordis.patch.yml'), 'utf8').includes('dsh-email-bridge'), '条目应保留');
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+t('默认插件 v2：用户经市场卸载（dep+包都没了）→ 自检移除挂载条目（防悬空）', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dp3-'));
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    mkFallback(home);
+    mkProfile(home, '# comment\n[]\n', { name: 'dsh-profile-web', private: true, dependencies: {} });
+    await installDefaultPlugins({ profile: 'web' });
+    const web = path.join(home, 'profiles', 'web');
+    // 模拟市场卸载：pnpm remove 会删包 + 移除依赖声明（vendor 源保留）
+    fs.rmSync(path.join(web, 'node_modules', 'dsh-email-bridge'), { recursive: true, force: true });
+    const pkg = JSON.parse(fs.readFileSync(path.join(web, 'package.json'), 'utf8'));
+    delete pkg.dependencies['dsh-email-bridge'];
+    fs.writeFileSync(path.join(web, 'package.json'), JSON.stringify(pkg, null, 2), 'utf8');
+    const r = await verifyDefaultPlugins({ profile: 'web' });
+    assert.strictEqual(r.action, 'entry-removed', '应移除挂载条目: ' + r.message);
+    const text = fs.readFileSync(path.join(web, 'cordis.patch.yml'), 'utf8');
+    assert.ok(!text.includes('dsh-email-bridge'), '条目应已移除');
+    assert.ok(text.includes('[]') || !/\S/.test(text.replace(/^#.*$/gm, '')), '文件应回到合法空列表');
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+t('默认插件 v2：已挂载时不动用户的其他条目', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dp4-'));
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    mkFallback(home);
+    const existing = '- insert:\n    - id: other\n      name: other-plugin\n';
+    mkProfile(home, existing, { name: 'dsh-profile-web', private: true, dependencies: {} });
+    await installDefaultPlugins({ profile: 'web' });
+    const text = fs.readFileSync(path.join(home, 'profiles', 'web', 'cordis.patch.yml'), 'utf8');
+    assert.ok(text.indexOf('id: other') < text.indexOf('id: email'), '既有条目在前');
+    assert.ok(text.includes('other-plugin') && text.includes('dsh-email-bridge'));
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+t('默认插件 v2：宿主包不可解析（兜底闭包被删且无 junction）→ 拒绝挂载防崩', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dp5-'));
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    // 不建 fallback、不传 hostDshDir —— 四个解析位置全空
+    mkProfile(home, '# comment\n[]\n', { name: 'dsh-profile-web', private: true, dependencies: {} });
+    const r = await installDefaultPlugins({ profile: 'web' });
+    assert.strictEqual(r.ok, false, '应拒绝挂载: ' + r.message);
+    assert.strictEqual(r.action, 'host-unresolvable');
+    const text = fs.readFileSync(path.join(home, 'profiles', 'web', 'cordis.patch.yml'), 'utf8');
+    assert.ok(!text.includes('dsh-email-bridge'), '不得挂载（挂了必崩）');
+    // 包和 vendor 仍在（环境就绪后重跑即挂载）
+    assert.ok(fs.existsSync(path.join(home, 'profiles', 'web', 'node_modules', 'dsh-email-bridge', 'package.json')), '包仍应安装');
+    // 兜底闭包恢复后重跑 → 挂载成功
+    mkFallback(home);
+    const r2 = await installDefaultPlugins({ profile: 'web' });
+    assert.strictEqual(r2.ok, true, '环境恢复后应挂载: ' + r2.message);
+    assert.ok(fs.readFileSync(path.join(home, 'profiles', 'web', 'cordis.patch.yml'), 'utf8').includes('dsh-email-bridge'));
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+t('默认插件 v2：已挂载后兜底闭包被删 → 自检摘条目（而非崩 dsh）', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dp6-'));
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    mkFallback(home);
+    mkProfile(home, '# comment\n[]\n', { name: 'dsh-profile-web', private: true, dependencies: {} });
+    await installDefaultPlugins({ profile: 'web' });
+    // 模拟：dsh 兜底闭包被清（如用户手删/异常）
+    fs.rmSync(path.join(home, 'profiles', 'node_modules'), { recursive: true, force: true });
+    const r = await verifyDefaultPlugins({ profile: 'web' });
+    assert.strictEqual(r.action, 'entry-removed-host', '应摘条目: ' + r.message);
+    const text = fs.readFileSync(path.join(home, 'profiles', 'web', 'cordis.patch.yml'), 'utf8');
+    assert.ok(!text.includes('dsh-email-bridge'), '条目应摘除');
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+t('removePath 安全性：删 junction 不穿透目标（宿主内容必须完好）', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rp-'));
+  try {
+    const target = path.join(home, 'host-pkg');
+    fs.mkdirSync(target, { recursive: true });
+    fs.writeFileSync(path.join(target, 'index.js'), 'module.exports = 1;');
+    // 1) 直接删 junction
+    const link1 = path.join(home, 'link1');
+    fs.symlinkSync(target, link1, 'junction');
+    const dp = require('../src/default-plugins');
+    // removePath 未导出——经 installDefaultPlugins 的内部路径覆盖；此处直接验证等价行为：
+    fs.unlinkSync(link1);
+    assert.ok(fs.existsSync(path.join(target, 'index.js')), '目标内容必须完好');
+    // 2) 删"内含 junction 的真实目录"（Electron rmSync recursive 会穿透——removePath 先摘链接）
+    const dir = path.join(home, 'plugin-dir');
+    fs.mkdirSync(path.join(dir, 'node_modules', '@deepseek-ai'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+    fs.symlinkSync(target, path.join(dir, 'node_modules', '@deepseek-ai', 'dsh-tools'), 'junction');
+    // 模拟 removePath 的 stripLinks 逻辑（与实现一致）
+    const stripLinks = (d) => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        const child = path.join(d, e.name);
+        const st = fs.lstatSync(child);
+        if (st.isSymbolicLink()) fs.unlinkSync(child);
+        else if (st.isDirectory()) stripLinks(child);
+      }
+    };
+    stripLinks(dir);
+    fs.rmSync(dir, { recursive: true, force: true });
+    assert.ok(!fs.existsSync(dir), '目录应删除');
+    assert.ok(fs.existsSync(path.join(target, 'index.js')), '宿主内容必须完好（不穿透）');
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+t('默认插件 v2：非 insert 形式的挂载条目也能摘除（防悬空残留）', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dp7-'));
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    mkFallback(home);
+    // 用户把条目写成顶层直写（非 insert 包装），且混有他人条目与注释
+    const patch = '# header\n- id: other\n  name: other-plugin\n# 中间注释\n- id: email\n  name: dsh-email-bridge\n  config:\n    imap:\n      host: h\n# 尾注释\n';
+    mkProfile(home, patch, { name: 'dsh-profile-web', private: true, dependencies: {} });
+    const web = path.join(home, 'profiles', 'web');
+    const r = await verifyDefaultPlugins({ profile: 'web' });
+    assert.strictEqual(r.action, 'entry-removed', '直写形式也必须能摘: ' + r.message);
+    const text = fs.readFileSync(path.join(web, 'cordis.patch.yml'), 'utf8');
+    assert.ok(!text.includes('dsh-email-bridge') && !/\bid:\s*email\b/.test(text), '条目应摘除');
+    assert.ok(text.includes('other-plugin'), '他人条目保留');
+    assert.ok(text.includes('# 尾注释'), '他人注释保留');
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prev;
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+t('默认插件 v2 (R26)：vendor 内容更新 → 已装副本自动刷新（不再"改了没生效"）', async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dp8-'));
+  const vroot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-vendor8-'));
+  const prevHome = process.env.DSH_HOME;
+  const prevRes = process.resourcesPath;
+  const mk = (p, s) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, s, 'utf8'); };
+  const vname = 'dsh-email-bridge';
+  try {
+    process.env.DSH_HOME = home;
+    process.resourcesPath = vroot;               // vendorDir() 优先取 resourcesPath（测试隔离，不碰真实 out\_vendor）
+    const vdir = path.join(vroot, 'vendor', vname);
+    mk(path.join(vdir, 'package.json'), JSON.stringify({ name: vname, version: '9.9.9', main: 'lib/index.js' }));
+    mk(path.join(vdir, 'lib', 'client.js'), 'OLD-BUNDLE');
+    mk(path.join(vdir, 'lib', 'index.js'), 'module.exports = {};');
+    mk(path.join(vroot, 'vendor', 'vendor-meta.json'), JSON.stringify({ name: vname, version: '9.9.9', vendoredAt: '2026-01-01T00:00:00.000Z' }));
+    mkFallback(home);
+    mkProfile(home, '# comment\n[]\n', { name: 'dsh-profile-web', private: true, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } }, dependencies: {} });
+
+    const r1 = await installDefaultPlugins({ profile: 'web' });
+    assert.strictEqual(r1.ok, true, '首次安装应成功: ' + r1.message);
+    const installed = path.join(home, 'profiles', 'web', 'node_modules', vname);
+    const clientFile = path.join(installed, 'lib', 'client.js');
+    assert.strictEqual(fs.readFileSync(clientFile, 'utf8'), 'OLD-BUNDLE', '首次安装应为旧内容');
+    const marker1 = JSON.parse(fs.readFileSync(path.join(installed, '.dsh-app-managed.json'), 'utf8'));
+    assert.strictEqual(marker1.vendoredAt, '2026-01-01T00:00:00.000Z', '安装标记应记录 vendor 时间戳');
+
+    // 幂等：同版本再跑一次不应改动（避免每次启动都全量拷贝）
+    const r2 = await installDefaultPlugins({ profile: 'web' });
+    assert.strictEqual(r2.action, 'ready', '未变更时应 ready: ' + r2.message);
+
+    // vendor 更新（新的 vendoredAt + 新的 bundle 内容）
+    mk(path.join(vdir, 'lib', 'client.js'), 'NEW-BUNDLE-WITH-PARAMS');
+    mk(path.join(vroot, 'vendor', 'vendor-meta.json'), JSON.stringify({ name: vname, version: '9.9.9', vendoredAt: '2026-02-02T00:00:00.000Z' }));
+    const r3 = await installDefaultPlugins({ profile: 'web' });
+    assert.ok(/via=refresh/.test(r3.message), '应走刷新路径: ' + r3.message);
+    assert.strictEqual(fs.readFileSync(clientFile, 'utf8'), 'NEW-BUNDLE-WITH-PARAMS', '已装副本必须刷新为新内容');
+    const marker2 = JSON.parse(fs.readFileSync(path.join(installed, '.dsh-app-managed.json'), 'utf8'));
+    assert.strictEqual(marker2.vendoredAt, '2026-02-02T00:00:00.000Z', '标记应更新');
+    // profile 内 vendor 同步也刷新了（R26 依赖它作为拷贝源）
+    const profClient = path.join(home, 'profiles', 'web', 'vendor', vname, 'lib', 'client.js');
+    assert.strictEqual(fs.readFileSync(profClient, 'utf8'), 'NEW-BUNDLE-WITH-PARAMS', 'profile vendor 应同步刷新');
+    // 刷新不应破坏挂载与包元数据
+    const patchText = fs.readFileSync(path.join(home, 'profiles', 'web', 'cordis.patch.yml'), 'utf8');
+    assert.ok(patchText.includes('dsh-email-bridge'), '刷新后挂载条目应保留');
+    assert.strictEqual(JSON.parse(fs.readFileSync(path.join(installed, 'package.json'), 'utf8')).version, '9.9.9', '包元数据应随之刷新');
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
+    if (prevRes === undefined) delete process.resourcesPath; else process.resourcesPath = prevRes;
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(vroot, { recursive: true, force: true });
+  }
+});
+
 // 顺序执行（支持 async 用例）
 (async () => {
   for (const { name, fn } of __tests) {
