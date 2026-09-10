@@ -14,6 +14,40 @@ const appDir = path.join(outDir, 'DSH-App-UAT');
 const electronDist = path.join(root, 'node_modules', 'electron', 'dist');
 
 // UAT 目录独立清理（与开发目录 DSH-App 互不干扰；若被 UAT 实例占用则报错退出）
+// R24（2026-09-10 事故）：构建**绝不销毁 UAT 用户数据**——data\（网关配置/设置/输入
+// 历史/已装 dsh/市场数据）先暂存到 out\_uat-data-backup，构建完成后还原。此前整目录
+// rmSync 会把 data\ 一起删掉，UAT 一重启配置全丢（还被旧桌面助手配置迁移污染）。
+// R25（审计加固）：暂存失败**立即中止**（旧版仅警告继续 → rmSync 照删 → 数据全丢）；
+// 旧备份只在新备份**完整写入后**才删除；data\ 不存在而备份存在时以备份为数据源；
+// 构建主体 try/finally 保证还原。
+const dataDir = path.join(appDir, 'data');
+const dataBackup = path.join(outDir, '_uat-data-backup');
+let hadData = false;
+if (existsSync(dataDir)) {
+  const staging = path.join(outDir, '_uat-data-backup-staging');
+  rmSync(staging, { recursive: true, force: true });
+  cpSync(dataDir, staging, { recursive: true });   // 失败直接抛出 → 中止（不删 data）
+  rmSync(dataBackup, { recursive: true, force: true });   // 新备份完整后才清旧备份
+  renameSync(staging, dataBackup);
+  hadData = true;
+  console.log('[数据保留] 已暂存 UAT data\\（构建后还原）');
+} else if (existsSync(dataBackup)) {
+  // data\ 不存在但备份在（上次构建中断）→ 以备份为数据源，避免用半删的 dataDir 覆盖
+  hadData = true;
+  console.log('[数据保留] data\\ 缺失，使用上次构建备份作为数据源');
+}
+function restoreUatData() {
+  if (!hadData) return;
+  try {
+    if (existsSync(dataBackup)) {
+      cpSync(dataBackup, path.join(appDir, 'data'), { recursive: true });
+      rmSync(dataBackup, { recursive: true, force: true });
+      console.log('[数据保留] UAT data\\ 已还原（网关配置/设置/历史不丢）');
+    }
+  } catch (err) {
+    console.log('[警告] data\\ 还原失败（' + (err && err.message ? err.message : err) + '）——备份在 ' + dataBackup + '，可手动复制。');
+  }
+}
 try {
   rmSync(appDir, { recursive: true, force: true });
 } catch (err) {
@@ -24,7 +58,8 @@ try {
   throw err;
 }
 
-// 1) 源码 staging
+// 1) 源码 staging —— 构建主体（R25：try/finally 保证任何一步失败都还原 data\）
+try {
 const staging = path.join(outDir, '_app-staging');
 rmSync(staging, { recursive: true, force: true });
 mkdirSync(staging, { recursive: true });
@@ -79,11 +114,27 @@ if (existsSync(defaultAsar)) rmSync(defaultAsar, { force: true });
   }
 }
 
+// 6.5) 默认插件（dsh-email-bridge）：out\_vendor → resources\vendor（见 src/default-plugins.js）
+{
+  const vendorSrc = path.join(root, 'out', '_vendor');
+  if (existsSync(path.join(vendorSrc, 'dsh-email-bridge', 'package.json'))) {
+    const vendorDst = path.join(appDir, 'resources', 'vendor');
+    rmSync(vendorDst, { recursive: true, force: true });
+    cpSync(vendorSrc, vendorDst, { recursive: true });
+    console.log('[内嵌] 默认插件 vendor → resources\\vendor');
+  } else {
+    console.log('[警告] 未找到 out\\_vendor\\dsh-email-bridge（先运行 node scripts/vendor-email-bridge.mjs）');
+  }
+}
+
 // 7) 图标 + 说明
 mkdirSync(path.join(root, 'assets'), { recursive: true });
 cpSync(path.join(root, 'src', 'assets', 'electron-icon.png'), path.join(appDir, 'icon.png'));
 cpSync(path.join(root, 'src', 'assets', 'electron-icon.ico'), path.join(appDir, 'icon.ico'));
+} finally {
+  restoreUatData();   // R24/R25：构建结束（含失败路径）还原 UAT 用户数据
+}
 
 console.log('[OK] UAT 构建完成: ' + appDir);
 console.log('     验证流程：运行 out\\DSH-App-UAT\\DSH-App.exe → 全面测试 → 无误后发布。');
-console.log('     （数据目录独立：UAT 用自己的 data\\，不污染开发/发布目录）');
+console.log('     （数据目录独立：UAT 用自己的 data\\，不污染开发/发布目录；构建不清空 data\\）');
