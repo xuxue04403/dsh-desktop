@@ -19,7 +19,9 @@ const updater = require('./updater');
 const { GatewayManager } = require('./gateway-manager');
 const { resolveDataDir } = require('./datadir');
 const market = require('./market');   // v1.5.18 插件市场（1024Store + npm 校验 + dsh CLI）
+const { installDefaultPlugins, verifyDefaultPlugins } = require('./default-plugins');   // v1.7.0 随 app 分发的默认插件（B1 修复：漏导入 verifyDefaultPlugins 曾使启动前自检静默失效）
 let marketOps = null;                 // 市场安装/卸载执行器（懒初始化，detect 后可用）
+let defaultPluginsDone = false;       // 默认插件安装幂等闸（每进程最多装一次）
 
 // 窗口/任务栏图标：与 DSH-App.exe 内嵌图标一致（从 electron.exe 官方资源提取的
 // electron-icon.png，详见 scripts/extract-exe-icon.mjs；createFromPath 支持 asar 内读取）
@@ -95,9 +97,6 @@ function createMainWindow() {
     mainWindow.show();
     broadcast();
   });
-
-  // 状态变更推送到页面
-  state.on('changed', () => broadcast());
 
   // 窗口标题固定为「DSH」：内嵌 dsh web 页面会把自己的 <title>（会话标题 — DeepSeek
   // Harness）同步到窗口标题栏，这里接管并阻止，避免显示"DSH桌面版开发评估 — DeepSeek Harness"
@@ -390,6 +389,12 @@ function createSettingsWindow(section) {
   });
   settingsWindow.loadFile(path.join(__dirname, '..', 'renderer', 'settings.html'));
   settingsWindow.on('closed', () => { settingsWindow = null; });
+  // R25（审计修复）：与主窗口同款——外链一律交系统浏览器，拒绝新开 BrowserWindow
+  // （市场页有 window.open(item.homepage) 调用）
+  settingsWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('http')) shell.openExternal(url).catch(() => { /* 忽略 */ });
+    return { action: 'deny' };
+  });
   if (section) {
     settingsWindow.webContents.once('did-finish-load', () => focusSection(section));
   }
@@ -418,21 +423,92 @@ function broadcastGw() {
   }
 }
 
+// ---------------- 默认插件（随 app 分发） ----------------
+// v1.7.0：dsh-email-bridge（邮箱桥接）随 dsh-app 分发 → 安装到 dsh profile 并挂载。
+// R24：installDefaultPlugins 为异步（含 pnpm 安装路径）；每进程最多完整执行一次；
+// verifyDefaultPlugins 在每次启动 dsh 前做「挂载条目 ⇒ 包可解析」自检并自动修复
+// （2026-09-10 事故：插件包被 pnpm 清理后挂载条目悬空 → dsh 整树启动失败）。
+async function ensureDefaultPlugins(reason) {
+  if (defaultPluginsDone) return null;
+  if (!settings || settings.data.installDefaultPlugins === false) return null;
+  const found = launcher && launcher.found;
+  if (!found) return null;
+  try {
+    const r = await installDefaultPlugins({
+      hostDshDir: found.dir,
+      nodeInfo: launcher.nodeInfo || { exe: 'node', env: {}, embedded: false },
+      profile: 'web',
+      logger,
+    });
+    defaultPluginsDone = r.ok === true;
+    logger.appendLog('[默认插件] ' + r.action + '：' + r.message + '（' + reason + '）');
+    return r;
+  } catch (err) {
+    logger.appendLog('[默认插件] 安装异常：' + (err && err.message ? err.message : err));
+    return null;
+  }
+}
+
+async function verifyDefaultPluginsBeforeStart() {
+  // 注意：自检是**安全检查**（挂载条目 ⇒ 包/宿主依赖可解析），不受 installDefaultPlugins
+  // 设置门控——用户关闭"默认插件安装"后，已挂载的插件仍必须保持可解析，否则包一旦
+  // 被清理就会悬空条目 → dsh 整树启动失败（R24 事故形态）。
+  try {
+    const r = await verifyDefaultPlugins({
+      hostDshDir: launcher && launcher.found ? launcher.found.dir : null,
+      nodeInfo: launcher ? launcher.nodeInfo : null,
+      profile: 'web',
+      logger,
+    });
+    // 用户经市场/自检确认卸载（dep+包都没了）→ 关闭"默认插件安装"，尊重用户选择，
+    // 否则下次进程启动 ensure 会静默重装回滚用户的卸载（审计高-1）。
+    // 环境性摘除（host 不可解析/修复失败）不关闭——环境恢复后要自动装回。
+    if (r && r.action === 'entry-removed' && settings) {
+      settings.update({ installDefaultPlugins: false });
+      defaultPluginsDone = true;   // 本进程不再尝试安装
+      logger.appendLog('[默认插件] 检测到用户已卸载默认插件——已关闭「默认插件安装」设置（不再自动重装；可在设置中重新开启）');
+    }
+  } catch (err) {
+    logger.appendLog('[默认插件] 启动前自检异常：' + (err && err.message ? err.message : err));
+  }
+}
+
 // ---------------- 服务控制 ----------------
 
+// 服务操作串行队列（审计高-2/中-5）：start/stop 并发进入时（启动中点停止、双击启动、
+// 托盘与设置页同时操作）按序执行，杜绝"启动中 verify/pnpm 阶段被 stop 穿透后
+// in-flight start 继续 launcher.start() 把状态翻回 ready"的竞态。
+let serviceOpQueue = Promise.resolve();
+function runServiceOp(label, fn) {
+  const next = serviceOpQueue.then(fn, fn);
+  // 队列自身错误不阻断后续操作
+  serviceOpQueue = next.then(() => undefined, () => undefined);
+  next.then(
+    () => undefined,
+    (err) => logger.appendLog('[服务操作] ' + label + ' 异常：' + (err && err.message ? err.message : err)),
+  );
+  return next;
+}
+
 async function startService() {
-  readyHandled = false;
-  state.update({ service: 'starting', phase: '正在启动 dsh 服务…', failReason: '' });
-  await launcher.stop();
-  launcher.detect();
-  launcher.start();
-  // 就绪等待由 'url'/'exit' 事件驱动；这里额外启动端口轮询兜底
-  waitReadyByProbe();
+  return runServiceOp('启动', async () => {
+    readyHandled = false;
+    state.update({ service: 'starting', phase: '正在启动 dsh 服务…', failReason: '' });
+    await launcher.stop();
+    launcher.detect();
+    // R24：启动 dsh 前自检默认插件（挂载条目 ⇒ 包可解析；不一致自动修复，防悬空条目启动失败）
+    await verifyDefaultPluginsBeforeStart();
+    launcher.start();
+    // 就绪等待由 'url'/'exit' 事件驱动；这里额外启动端口轮询兜底
+    waitReadyByProbe();
+  });
 }
 
 async function stopService() {
-  state.update({ service: 'stopped', phase: '服务未运行' });
-  await launcher.stop();
+  return runServiceOp('停止', async () => {
+    state.update({ service: 'stopped', phase: '服务未运行' });
+    await launcher.stop();
+  });
 }
 
 // ---------------- dsh 自动升级（v1.5.17）----------------
@@ -539,6 +615,10 @@ function onReady() {
   if (readyHandled) return;
   readyHandled = true;
   launcher.ready = true;
+  // R25（审计修复）：成功启动复位看门狗单发闸（否则同进程内第二次故障被闸吞掉）
+  if (watchdog) watchdog.triggered = false;
+  // v1.7.0：服务就绪后确保默认插件已安装（含首次启动才完成 dsh 安装的场景）
+  ensureDefaultPlugins('服务就绪').catch(() => { /* 内部已记录 */ });
   const safe = settings.data.safeMode;
   state.update({
     service: safe ? 'safe' : 'ready',
@@ -635,10 +715,24 @@ function registerIpc() {
         break;
       case 'upgrade-dsh':
         return await upgradeDsh('手动');
+      case 'install-default-plugins': {
+        // v1.7.0：重新安装/修复随 app 分发的默认插件（含 vendor 刷新与依赖声明）
+        const found = launcher && launcher.found;
+        if (!found) return { ok: false, action: 'skip', message: '未检测到 dsh' };
+        const r = await installDefaultPlugins({
+          hostDshDir: found.dir,
+          nodeInfo: launcher.nodeInfo || { exe: 'node', env: {}, embedded: false },
+          profile: 'web', logger,
+        });
+        defaultPluginsDone = r.ok === true;
+        logger.appendLog('[默认插件] 手动安装：' + r.action + '：' + r.message);
+        broadcast();
+        return r;
+      }
       case 'browse-workdir': {
         const r = await dialog.showOpenDialog({ properties: ['openDirectory'] });
         if (!r.canceled && r.filePaths.length) return r.filePaths[0];
-        break;
+        return null;   // R25（审计修复）：取消返回 null——旧版 break→true，渲染层把 "true" 填进输入框
       }
       default: break;
     }
@@ -699,6 +793,13 @@ function registerIpc() {
     if (name === 'remove') {
       const r = await marketOps.remove(String(pkgName || ''), onLine);
       logger.appendLog(r.ok ? '[市场] 卸载成功：' + pkgName + '（重启 dsh 服务后生效）' : '[市场] 卸载失败：' + pkgName);
+      // 审计高-1：卸载的是随 app 分发的默认插件 → 同步关闭「默认插件安装」，
+      // 否则下次进程启动会被 ensure 静默重装（卸载被回滚）
+      if (r.ok && String(pkgName || '') === 'dsh-email-bridge' && settings) {
+        settings.update({ installDefaultPlugins: false });
+        defaultPluginsDone = true;
+        logger.appendLog('[默认插件] 用户卸载了默认插件——已关闭「默认插件安装」设置（不再自动重装）');
+      }
       return r;
     }
     return { ok: false, error: 'unknown-action' };
@@ -724,7 +825,9 @@ function quitAll() {
     await launcher.stop();
     try {
       const { killAllDshProcesses } = require('./gateway-manager');
-      const n = killAllDshProcesses((s) => logger.appendLog(s));
+      // R25：限定本应用数据目录（broker/网关 --config 都在其下）——不再用裸特征误杀
+      // 用户手工跑的 dsh / 桌面助手网关
+      const n = killAllDshProcesses((s) => logger.appendLog(s), gateway ? gateway.userDataDir : undefined);
       if (n > 0) logger.appendLog('退出清理：共清理 ' + n + ' 个 dsh 相关进程树。');
     } catch (e) {
       logger.appendLog('退出清理异常: ' + (e && e.message ? e.message : e));
@@ -760,6 +863,9 @@ async function bootstrap() {
 
   state = new AppState();
   state.port = settings.data.port;
+  // 状态变更推送到窗口（全局注册一次——createMainWindow 可能因 ensureMainWindow
+  // 多次重建窗口，监听器不能跟着窗口重复注册）
+  state.on('changed', () => broadcast());
 
   const workDir = settings.data.workDir || os.homedir();
   launcher = new Launcher({ settings, logger, workDir });
@@ -824,6 +930,7 @@ async function bootstrap() {
   if (launcher.found) {
     state.update({ dshVersion: launcher.found.version });
     logger.appendLog('检测到 dsh ' + launcher.found.version + ' @ ' + launcher.found.dir);
+    ensureDefaultPlugins('启动检测后').catch(() => { /* 内部已记录 */ });   // v1.7.0：默认插件随 app 分发
     if (settings.data.checkUpdates) {
       // v1.5.17：开启"启动时检查更新"→ 检测到新版**自动升级**（停服→npm i -g→重启）
       updater.checkForUpdate(launcher.found.version).then((info) => {
