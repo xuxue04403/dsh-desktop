@@ -123,7 +123,7 @@ if (hasLive && (cfg.addresses[0] || cfg.hosts[0] || cfg.secrets[0])) {
 
 // 11) 扫描根即使名字命中跳过名单也必须被扫描（曾导致产物闸门静默扫 0 个文件）
 {
-  const stageDir = path.join(root, 'out', '_zip-stage');
+  const stageDir = path.join(root, 'out', '_guard-scanroot');   // 名字命中跳过名单/曾静默 0 文件的场景
   fs.rmSync(stageDir, { recursive: true, force: true });
   fs.mkdirSync(path.join(stageDir, 'resources'), { recursive: true });
   fs.writeFileSync(path.join(stageDir, 'resources', 'a.js'), "const h='imap.example.com';\n", 'utf8');
