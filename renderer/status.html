@@ -94,7 +94,9 @@
         badge.textContent = '🛡 安全模式：已禁用故障插件（' + (s.safePlugins || '') + '）';
       }
       const cmd = s.service === 'starting' ? '启动中…' : s.phase;
-      meta.innerHTML = 'dsh <b>' + (s.dshVersion || '未检测') + '</b> · 端口 <b>' + s.port + '</b>';
+      // R25（审计低-1）：innerHTML 插值必须转义（dshVersion 来自包元数据，防注入）
+      const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+      meta.innerHTML = 'dsh <b>' + esc(s.dshVersion || '未检测') + '</b> · 端口 <b>' + esc(s.port) + '</b>';
       $('btnStart').textContent =
         (s.service === 'starting') ? '启动中…' :
         (s.service === 'ready' || s.service === 'safe') ? '重新启动' : '启动 dsh 服务';
