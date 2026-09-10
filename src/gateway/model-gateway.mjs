@@ -106,6 +106,12 @@ function loadConfig() {
   try {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
     if (!Array.isArray(cfg.providers)) throw new Error('providers must be an array');
+    // R25（审计修复）：port 兜底——手改配置缺/坏 port 时 listen(undefined) 会随机端口
+    const p = Number(cfg.port);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) {
+      log(`config port invalid (${cfg.port}), falling back to 3091`);
+      cfg.port = 3091;
+    }
     return cfg;
   } catch (e) {
     log(`config parse error: ${e.message}`);
@@ -170,11 +176,14 @@ function breakerRecordSuccess(providerId) {
   if (breaker.has(providerId)) breaker.delete(providerId);
 }
 
-// V1 防封：日志脱敏——catalog/上游错误体可能回显 key，统一打码 sk-xxxx 片段
+// V1 防封：日志脱敏——catalog/上游错误体可能回显 key，统一打码各类凭证片段
+// R25（审计）：补 Bearer/JWT(eyJ)/统一网关 key（dsh-gateway-）与 api-key 头形态
 function maskSecrets(text) {
   return String(text || '')
     .replace(/sk-[A-Za-z0-9_\-]{8,}/g, (m) => `sk-***${m.slice(-4)}`)
-    .replace(/(x-api-key["':\s=]+)([^\s"',}]+)/gi, '$1***');
+    .replace(/dsh-gateway-[A-Za-z0-9_\-]{8,}/g, (m) => `dsh-gateway-***${m.slice(-4)}`)
+    .replace(/eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}/g, 'eyJ***.***.***')  // JWT
+    .replace(/((?:x-api-key|api-key|authorization)["':\s=]+)(Bearer\s+)?([^\s"',}]+)/gi, (m, p1, p2) => p1 + (p2 || '') + '***');
 }
 
 async function fetchCatalog(provider, force, clientUA, clientProfile) {
@@ -618,11 +627,15 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
         log(`[dump] 被拦请求摘要 -> ${f}`);
       } catch (_) { /* dump 失败不影响服务 */ }
     }
-    if (upstream.status === 401 || upstream.status === 403 || upstream.status >= 500) {
-      // likely stale/misconfigured key or dead endpoint —— 冷却缓存，防风暴（R3）
+    if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429 || upstream.status >= 500) {
+      // likely stale/misconfigured key, rate-limited, or dead endpoint —— 冷却缓存，防风暴（R3）
+      // R25：429（限流）计入熔断——不熔断会加剧限流；短熔断（90s）已足够退避
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
       breakerRecordFail(provider.id, upstream.status);   // V2：按状态码分级熔断（401/403 → 30 分钟）
     }
+    // 注意：400/404 等确定性 4xx **有意不熔断也不终止 failover**——上游内容拦截
+    // （400 blocked）换下一家供应商 + 降敏重试（R9）可能成功；由调用方在全部
+    // 供应商失败后统一回复错误。
     return false;
   }
   breakerRecordSuccess(provider.id);   // V1：成功清零熔断计数
@@ -805,6 +818,12 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
       logCall(`via=${p.id}`, 'ok');
       return;
     }
+    // R25（审计修复）：响应头已发出（流中途失败/客户端断开）→ failover 无意义，
+    // 继续只会对剩余供应商重复计费/风控
+    if (res.headersSent || res.destroyed) {
+      logCall('stream-broken', 'fail');
+      return;
+    }
   }
   logCall('all-providers', 'fail');
   json(res, 503, { error: { message: `all providers for model "${model}" are unavailable` } });
@@ -907,6 +926,11 @@ async function handleMessages(cfg, req, res, body) {
     if (ok) {
       log(`served ${model} via ${p.id} (anthropic)`);
       logCall(`via=${p.id}`, 'ok');
+      return;
+    }
+    // R25（审计修复）：响应头已发出（流中途失败/客户端断开）→ failover 无意义
+    if (res.headersSent || res.destroyed) {
+      logCall('stream-broken', 'fail');
       return;
     }
   }
@@ -1053,18 +1077,20 @@ function writeDshConfig(args) {
   const cfgPath = get('--config') || CONFIG_PATH;
   const settingsPath = get('--settings') || process.env.DSH_SETTINGS || path.join(os.homedir(), '.dsh', 'settings.yaml');
   const credsPath = get('--credentials') || process.env.DSH_CREDENTIALS || path.join(os.homedir(), '.dsh', '.credentials.yaml');
-  const port = Number(get('--port') || 3091);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    console.error(`[write-dsh] invalid --port: ${get('--port')}`);
-    process.exit(1);
-  }
-  const key = get('--key') || '';
-
   if (!fs.existsSync(cfgPath)) {
     console.error(`[write-dsh] gateway config not found: ${cfgPath}`);
     process.exit(1);
   }
   const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  // R25（审计修复）：端口优先级 --port > cfg.port > 3091——旧版硬编码 3091，
+  // 该文件随应用原样分发，直跑不传 --port 且配置为其他端口（如桌面助手 3090）时写错 baseURL
+  const port = Number(get('--port') || cfg.port || 3091);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    console.error(`[write-dsh] invalid port: ${get('--port') || cfg.port}`);
+    process.exit(1);
+  }
+  const key = get('--key') || '';
+
   const apiKey = key || cfg.apiKey || '';
   if (!apiKey || apiKey === 'dsh-gateway-change-me') {
     console.error('[write-dsh] unified apiKey is not set (edit gateway.config.json first)');
