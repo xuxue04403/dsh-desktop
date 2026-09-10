@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
   Build and publish DSH App to github.com/xuxue04403/dsh-desktop
   (source upload + installer/portable release assets). No git client required.
@@ -18,6 +18,10 @@
 
 .PARAMETER CleanOld
   Remove v1.x C# launcher leftovers from the repo before uploading.
+
+.PARAMETER Scrub
+  发布前对源码树就地脱敏（把真实邮箱地址/服务器/本机密钥替换为占位符）后再上传。
+  默认不脱敏：一旦检测到真实邮箱/密钥信息即中止发布（R27 安全闸门）。
 .NOTES
   - Version is read from package.json unless -Version is given, so bumping the
     app version only requires editing package.json.
@@ -27,12 +31,55 @@ param(
     [string]$Token,
     [string]$RepoName = 'dsh-desktop',
     [string]$Version = '',
-    [switch]$CleanOld
+    [switch]$CleanOld,
+    [switch]$Scrub
 )
 
 $ErrorActionPreference = 'Stop'
 # 脚本位于项目根/scripts/ 下：$PSScriptRoot = scripts/，项目根 = 其父目录
 $root = Split-Path -Parent $PSScriptRoot
+
+# ---------- node 解析（R27）----------
+# 绿色版目录里的 node.exe 其实是 Electron（out\...\node.exe，约 250MB）：若 PATH 上的
+# node 指向它，构建脚本会静默不执行。这里逐候选探测，只接受真正的 Node。
+function Resolve-NodeExe {
+    $cands = @()
+    if ($env:DSH_NODE) { $cands += $env:DSH_NODE }
+    $onPath = (Get-Command node -ErrorAction SilentlyContinue).Source
+    if ($onPath) { $cands += $onPath }
+    $cands += 'C:\Program Files\nodejs\node.exe'
+    $cands += (Get-ChildItem (Join-Path $env:LOCALAPPDATA 'nvm\v*\node.exe') -ErrorAction SilentlyContinue |
+        Sort-Object { [int]($_.Directory.Name -replace '^v','' -replace '\..*$','') } | ForEach-Object { $_.FullName })
+    foreach ($c in $cands) {
+        if (-not $c -or -not (Test-Path $c)) { continue }
+        $probe = (& $c -e "console.log(process.versions.electron ? 'electron' : 'node')" 2>$null)
+        if ($probe -eq 'node') { return $c }
+    }
+    return $null
+}
+$nodeExe = Resolve-NodeExe
+if (-not $nodeExe) {
+    Write-Host '[FAIL] 找不到可用的 node.exe（PATH 上的可能是绿色版 Electron）。可设 $env:DSH_NODE 指定。'
+    exit 1
+}
+Write-Host "[..] node: $nodeExe"
+
+# ---------- R27 安全闸门：真实邮箱信息/密钥绝不推送 ----------
+$scrubScript = Join-Path $root 'scripts\email-scrub.mjs'
+$srcTrees = @($root, (Join-Path (Split-Path -Parent $root) 'dsh-email-bridge')) | Where-Object { Test-Path $_ }
+function Invoke-SourceGate {
+    if ($Scrub) {
+        Write-Host '[..] 安全闸门：就地脱敏源码树 ...'
+        & $nodeExe $scrubScript --scrub @srcTrees
+    }
+    Write-Host '[..] 安全闸门：扫描源码树（真实邮箱地址/服务器/本机密钥）...'
+    & $nodeExe $scrubScript --scan @srcTrees
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '[FAIL] 检测到真实邮箱/密钥信息，已阻止发布。处理：加 -Scrub 参数重跑（自动脱敏），' -ForegroundColor Red
+        Write-Host '       或手动执行 node scripts\email-scrub.mjs --scrub 后复查。' -ForegroundColor Red
+        exit 1
+    }
+}
 
 # 版本：默认从 package.json 读取（如 1.5.5 → v1.5.5）
 if (-not $Version) {
@@ -55,8 +102,11 @@ function Api([string]$Method, [string]$Uri, $BodyObj) {
 }
 
 # ---------- 0. build chain ----------
+Write-Host '[..] 0/4 安全闸门（源码树）...'
+Invoke-SourceGate
+
 Write-Host '[..] 1/4 portable dir (green edition)...'
-$buildOut = (& node (Join-Path $root 'scripts\build-portable.mjs') 2>&1 | Out-String)
+$buildOut = (& $nodeExe (Join-Path $root 'scripts\build-portable.mjs') 2>&1 | Out-String)
 if ($LASTEXITCODE -ne 0) { Write-Host '[FAIL] build-portable.mjs'; Write-Host $buildOut; exit 1 }
 $outDirLine = ($buildOut -split "`r?`n") | Where-Object { $_ -like 'OUTDIR=*' } | Select-Object -First 1
 $greenDir = if ($outDirLine) { $outDirLine.Substring(7).Trim() } else { Join-Path $root 'out\DSH-App' }
@@ -68,7 +118,7 @@ Write-Host '[..] 2/4 icon policy: keep Electron official icon for exe/installer.
 # 托盘/窗口图标由运行时以同风格绘制（底色随服务状态变色），不再使用 rcedit 改写 exe 资源。
 
 Write-Host '[..] 3/4 NSIS installer + single-file portable (mirror)...'
-node (Join-Path $root 'scripts\dist.mirror.mjs')
+& $nodeExe (Join-Path $root 'scripts\dist.mirror.mjs')
 if ($LASTEXITCODE -ne 0) { Write-Host '[FAIL] dist.mirror.mjs (NSIS build)'; exit 1 }
 
 # portable zip for release asset（从 build 输出的实际绿色目录打包；文件名用 ASCII，避免 PS5.1 编码问题）
@@ -94,6 +144,16 @@ try {
     Compress-Archive -Path (Join-Path $greenDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
 } finally {
     if ($moved) { Move-Item $dataStash $dataDir -Force; Write-Host '[安全] data\ 已还原到绿色目录（本机数据保留）' }
+}
+
+# R27 安全闸门（产物侧）：解包扫描 zip 内容，确认没有真实邮箱信息/密钥被夹带
+if (Test-Path $zipPath) {
+    Write-Host '[..] 安全闸门：扫描发布 zip（含 resources\vendor 与 app.asar）...'
+    & $nodeExe $scrubScript --scan-zip $zipPath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host '[FAIL] 发布 zip 内检测到真实邮箱/密钥信息，已阻止发布。' -ForegroundColor Red
+        exit 1
+    }
 }
 
 # ---------- 1. verify identity ----------
@@ -145,11 +205,15 @@ Write-Host '[..] Uploading sources...'
 $count = 0
 Get-ChildItem $root -Recurse -File | ForEach-Object {
     $rel = $_.FullName.Substring($root.Length + 1).Replace('\', '/')
+    # R25（审计修复）：按**路径段**排除（-like 'x/*' 只匹配根级，anywhere-lab-sdsh-desktop
+    # 官方参考源码副本曾被整目录误传 GitHub）；同时排除任意层级的 node_modules
     if ($rel -like 'node_modules/*') { return }
     if ($rel -like 'out/*') { return }
     if ($rel -like 'dist/*') { return }
     if ($rel -like '.git/*') { return }
     if ($rel -like 'tests/*.tmp*') { return }
+    if ($rel -like 'anywhere-lab-sdsh-desktop/*') { return }
+    if ($rel -match '(^|/)node_modules/') { return }
 
     $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName))
     $uri = "https://api.github.com/repos/$login/$RepoName/contents/$rel"
