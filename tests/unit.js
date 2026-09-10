@@ -119,7 +119,7 @@ t('validateConfigText 供应商缺 baseURL → 拒绝', () => {
 // "真实"配置（非模拟特征：无 mock id / 127.0.0.1:319x / provider-a / example.com）
 const GATEWAY_CFG = JSON.stringify({
   port: 3090,
-  apiKey: 'dsh-gw-test-123',
+  apiKey: 'dsh-gw-fixture-000',
   clientUA: 'claude-cli/2.0.0 (external, cli)',
   routing: 'round-robin',
   providers: [
@@ -130,7 +130,7 @@ const GATEWAY_CFG = JSON.stringify({
 // "模拟"配置（桌面助手自带 mock 源 / 示例文件特征）
 const MOCK_CFG = JSON.stringify({
   port: 3090,
-  apiKey: 'dsh-gw-test-123',
+  apiKey: 'dsh-gw-fixture-000',
   providers: [
     { id: 'mockA', baseURL: 'http://127.0.0.1:3190/v1', apiKey: 'k-a', models: ['deepseek-v4-flash', 'glm-5.2'], priority: 1, enabled: true },
     { id: 'mockB', baseURL: 'http://127.0.0.1:3191/v1', apiKey: 'k-b', models: ['deepseek-v4-flash'], priority: 2, enabled: true },
@@ -145,18 +145,21 @@ t('isMockLikeConfig 识别模拟/示例/真实', () => {
   assert.strictEqual(isMockLikeConfig('not json'), true, '非法 JSON 应判为模拟');
 });
 
-t('migrateGatewayConfig 从已有真实来源复制到空目录', () => {
+t('migrateGatewayConfig 从已有真实来源复制到空目录（R25：3090 归一为 3091）', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-unit-'));
   const src = path.join(base, 'legacy', 'gateway.config.json');
   fs.mkdirSync(path.dirname(src), { recursive: true });
-  fs.writeFileSync(src, GATEWAY_CFG, 'utf8');
+  fs.writeFileSync(src, GATEWAY_CFG, 'utf8');   // GATEWAY_CFG.port = 3090
   const out = path.join(base, 'data');
   const r = migrateGatewayConfig(out, [src]);
   assert.ok(r && r.action === 'migrated', '应迁移');
-  assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'), GATEWAY_CFG);
+  const migrated = JSON.parse(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'));
+  assert.strictEqual(migrated.port, 3091, '迁移应把 3090 归一为 3091（R22 约定）');
+  assert.strictEqual(migrated.apiKey, 'dsh-gw-fixture-000', '其余字段原样保留');
+  assert.strictEqual(migrated.providers.length, 2, '供应商原样保留');
 });
 
-t('migrateGatewayConfig 模拟来源 → 跳过', () => {
+t('migrateGatewayConfig 模拟来源 → 跳过（真实源 3090 同样归一 3091）', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-unit-'));
   const srcMock = path.join(base, 'mock', 'gateway.config.json');
   const srcReal = path.join(base, 'real', 'gateway.config.json');
@@ -167,7 +170,21 @@ t('migrateGatewayConfig 模拟来源 → 跳过', () => {
   const out = path.join(base, 'data');
   const r = migrateGatewayConfig(out, [srcMock, srcReal]);
   assert.ok(r && r.from === srcReal, '应跳过模拟源、命中真实源');
-  assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'), GATEWAY_CFG);
+  const migrated = JSON.parse(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'));
+  assert.strictEqual(migrated.port, 3091, '3090 → 3091');
+  assert.strictEqual(migrated.providers.length, 2);
+});
+
+t('migrateGatewayConfig 非 3090 端口原样保留', () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-unit-'));
+  const src = path.join(base, 'legacy', 'gateway.config.json');
+  fs.mkdirSync(path.dirname(src), { recursive: true });
+  const custom = JSON.stringify({ port: 3105, apiKey: 'k', providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk', models: ['m'] }] });
+  fs.writeFileSync(src, custom, 'utf8');
+  const out = path.join(base, 'data');
+  const r = migrateGatewayConfig(out, [src]);
+  assert.ok(r && r.action === 'migrated');
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8')).port, 3105, '非 3090 不改写');
 });
 
 t('migrateGatewayConfig 目标为真实配置 → 不覆盖', () => {
@@ -184,7 +201,7 @@ t('migrateGatewayConfig 目标为真实配置 → 不覆盖', () => {
   assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'), custom);
 });
 
-t('migrateGatewayConfig 目标为模拟数据 → 升级覆盖（保留备份）', () => {
+t('migrateGatewayConfig 目标为模拟数据 → 升级覆盖（保留备份；R25：3090 归一 3091）', () => {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-unit-'));
   const src = path.join(base, 'real', 'gateway.config.json');
   fs.mkdirSync(path.dirname(src), { recursive: true });
@@ -194,7 +211,9 @@ t('migrateGatewayConfig 目标为模拟数据 → 升级覆盖（保留备份）
   fs.writeFileSync(path.join(out, 'gateway.config.json'), MOCK_CFG, 'utf8');
   const r = migrateGatewayConfig(out, [src]);
   assert.ok(r && r.action === 'upgraded', '应升级');
-  assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'), GATEWAY_CFG, '应被替换为真实配置');
+  const upgraded = JSON.parse(fs.readFileSync(path.join(out, 'gateway.config.json'), 'utf8'));
+  assert.strictEqual(upgraded.port, 3091, '3090 → 3091');
+  assert.strictEqual(upgraded.providers.length, 2, '真实供应商替换模拟配置');
   assert.strictEqual(fs.readFileSync(path.join(out, 'gateway.config.json.bak-mock'), 'utf8'), MOCK_CFG, '旧模拟配置应备份');
 });
 
@@ -304,6 +323,51 @@ t('icon：ICO 结构（头/条目/嵌入 PNG 魔数）', () => {
   assert.strictEqual(ico[6], 16);
   assert.strictEqual(ico[6 + 16], 32);
   assert.strictEqual(ico[6 + 32], 0);
+});
+
+// —— v1.7.0/R24：看门狗识别「loader entry 导入/应用失败」（2026-09-10 事故形态）——
+t('parseFailedPlugins 形态3：loader entry 导入失败（包被清理）→ 捕获包名', () => {
+  const log =
+    'Error: dsh: plugin tree failed to load: failed to apply loader entry include (cordis:include): ' +
+    "failed to import loader entry email (dsh-email-bridge): Cannot find package 'dsh-email-bridge' imported from C:\\x\\profiles\\web\\\r\n";
+  const names = parseFailedPlugins(log);
+  assert.deepStrictEqual(names, ['dsh-email-bridge'], '应捕获括号里的包名（与 dump-config 的 name 字段配对）');
+});
+
+t('parseFailedPlugins 形态3：无包名时退回条目 id', () => {
+  const names = parseFailedPlugins('failed to apply loader entry email: invalid config');
+  assert.deepStrictEqual(names, ['email']);
+});
+
+t('parseFailedPlugins 形态3：仅 cordis:include 包装 → 空（不可隔离核心插件）', () => {
+  const names = parseFailedPlugins('failed to apply loader entry include (cordis:include): inner error');
+  assert.deepStrictEqual(names, [], 'cordis:* 必须被过滤');
+});
+
+t('parseFailedPlugins 形态3：双插件同时故障 → 全部收集', () => {
+  const log = 'failed to import loader entry email (dsh-email-bridge): not found\r\n'
+    + 'failed to import loader entry qqbot (dsh-qqbot): not found\r\n';
+  const names = parseFailedPlugins(log);
+  assert.deepStrictEqual(names, ['dsh-email-bridge', 'dsh-qqbot']);
+});
+
+t('validateConfigText R22 端口校验：缺/非法端口拒绝', () => {
+  const mk = (port) => JSON.stringify({ port, apiKey: 'k', providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk', models: ['m'] }] });
+  assert.strictEqual(validateConfigText(mk(3091)).ok, true, '3091 合法');
+  assert.strictEqual(validateConfigText(mk(3090)).ok, true, '3090 也合法（只是约定不同）');
+  const noPort = JSON.stringify({ apiKey: 'k', providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk', models: ['m'] }] });
+  assert.strictEqual(validateConfigText(noPort).ok, false, '缺 port 拒绝');
+  assert.strictEqual(validateConfigText(mk('abc')).ok, false, 'port=abc 拒绝');
+  assert.strictEqual(validateConfigText(mk(0)).ok, false, 'port=0 拒绝');
+  assert.strictEqual(validateConfigText(mk(70000)).ok, false, 'port=70000 拒绝');
+  assert.strictEqual(validateConfigText(mk(3091.5)).ok, false, 'port=3091.5 拒绝');
+});
+
+t('main.js 接线冒烟（B1 回归）：verifyDefaultPlugins 必须导入且在启动前调用', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert.ok(/const\s*\{[^}]*verifyDefaultPlugins[^}]*\}\s*=\s*require\('\.\/default-plugins'\)/.test(src),
+    'require 解构必须包含 verifyDefaultPlugins（B1：漏导入曾使 R24 自检静默失效）');
+  assert.ok(src.includes('await verifyDefaultPluginsBeforeStart();'), 'startService 必须在启动前 await 自检');
 });
 
 console.log('');
