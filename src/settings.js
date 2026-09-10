@@ -17,6 +17,7 @@ const DEFAULTS = {
   autoOpenBrowser: false,   // 就绪后自动用系统浏览器打开（默认关：内嵌窗口即界面，避免打扰）
   minimizeToTray: true,     // 关窗最小化到托盘
   checkUpdates: true,       // 启动时检查 dsh 新版本
+  installDefaultPlugins: true,   // v1.7.0：随 app 分发默认插件（dsh-email-bridge 邮箱桥接）并挂载到 dsh profile
   // —— 安全模式状态（程序自身维护，勿手改）——
   safeMode: false,
   safeModeLevel: 0,         // 1=补丁禁用故障插件 2=临时剥离第三方插件
@@ -39,6 +40,9 @@ class Settings {
     } catch (err) {
       this.logError('settings load', err);
     }
+    // R25（审计低-4）：load 路径也校验端口（IPC 保存路径有校验，手改 settings.json 没有）
+    const p = Number(this.data.port);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) this.data.port = DEFAULTS.port;
     // 工作目录兜底
     if (!this.data.workDir) this.data.workDir = os.homedir();
     return this.data;
