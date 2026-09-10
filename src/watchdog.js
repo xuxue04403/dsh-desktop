@@ -12,11 +12,16 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// 0.1.x 两种启动失败报错形态：
+// 0.1.x 启动失败报错形态：
 //   形态1: dsh: plugin(s) failed to load: a, b; Cordis startup failed because ...
 //   形态2: dsh: N entr(ies) did not activate\n<name>: <错误摘要>\n(堆栈行…)
+//   形态3（R24，2026-09-10 事故）: failed to import/apply loader entry <id> (<包名>) ——
+//   挂载条目指向的包丢失/损坏（如被 pnpm 清理）时**整棵插件树拒绝启动**；捕获包名
+//   （缺省用条目 id），走 Level 1 隔离让 dsh 仍能启动（dump-config 的 name 字段是
+//   包名，resolveEntryIds 按包名配对条目 id）。
 const RE_FAILED_TO_LOAD = /plugin\(s\) failed to load:\s*([^;]+)/;
 const RE_DID_NOT_ACTIVATE = /(\d+)\s+entr(?:y|ies)\s+did\s+not\s+activate\s+([\s\S]*?)(?:\r?\n\s*\r?\n|$)/;
+const RE_LOADER_ENTRY_FAILED = /failed to (?:import|apply) loader entry\s+(\S+?)(?:\s+\(([^)]+)\))?[\s:]/g;
 
 // 从 dsh 启动日志提取"失败插件名"（跨版本容错）
 function parseFailedPlugins(logText) {
@@ -36,6 +41,19 @@ function parseFailedPlugins(logText) {
       if (!t || t[0] === ' ' || t[0] === '\t') continue;   // 跳过错行/堆栈缩进行
       const ci = t.indexOf(': ');
       if (ci > 0) names.push(t.slice(0, ci).trim());
+    }
+  }
+  // 形态3：failed to import/apply loader entry —— 取**最内层**匹配（外层的
+  // "loader entry include (cordis:include)" 是包装条目，真正失败的是内层插件）；
+  // cordis:* 核心包装不可隔离，跳过。R25（审计）：收集**全部**有效 token——
+  // 双插件同时故障时只禁用一个会导致第二次失败（旧版如此）。
+  const entryMatches = [...logText.matchAll(RE_LOADER_ENTRY_FAILED)];
+  if (entryMatches.length > 0) {
+    // 收集全部有效 token（按文档序）；cordis:* 核心包装不可隔离，跳过
+    for (const m of entryMatches) {
+      const token = (m[2] || m[1] || '').trim();
+      if (!token || /^cordis:/.test(token)) continue;
+      if (!names.includes(token)) names.push(token);
     }
   }
   // 去重（保序）
@@ -84,23 +102,34 @@ class Watchdog {
     this.log = opts.logger.appendLog.bind(opts.logger);
     this.workDir = opts.workDir;
     this.triggered = false;
-    this.profileDir = path.join(os.homedir(), '.dsh', 'profiles', 'web');
+    // R25（审计）：尊重 DSH_HOME（与 default-plugins/market 一致；旧版硬编码 homedir）
+    this.profileDir = path.join(
+      process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'profiles', 'web',
+    );
   }
 
   // 启动失败（未就绪即退出 / 或等待超时）时由 main 调用
   async tryRecover() {
-    if (this.triggered) return;
+    // R25（审计阻断修复）：旧版单发闸 `if (this.triggered) return` —— Level 1/2 重启后
+    // 若二次失败，这里直接 return，"安全模式也未能启动"分支成为死代码，UI 永久卡
+    // "正在重启…"。改为：已触发过**且已进入安全模式**才终止（safeMode 已持久化，
+    // 重入必然落入安全模式分支结束，不会死循环）；未进安全模式的重入允许再分析
+    // （例如非插件失败消耗了名额后，真正的插件故障仍能被隔离）。成功启动由
+    // main 的 onReady 复位 triggered。
+    if (this.triggered && this.settings.data.safeMode) return;
     this.triggered = true;
 
     const logPath = path.join(this.settings.dir, 'logs', 'web.log');
     let logText = '';
     try {
       if (fs.existsSync(logPath)) {
-        const full = fs.readFileSync(logPath, 'utf8');
-        // R22：只分析本次启动之后追加的输出（web.log 跨启动不清空，1MB 轮转前的历史
-        // 故障行若被误读，任何后续非插件启动失败都会被误判为插件故障 → 假安全模式）
+        // R25（审计修复）：基线是**字节**数（logger.webLogSize 用 stat.size），旧版用
+        // 字符串 length（字符数）切片——CJK 日志下错位，会把历史故障行当本次输出
+        // （假安全模式）或切掉本次输出（漏报）。改为 Buffer 字节切分；轮转后
+        // buf < base 时整文件即纯新内容，语义正确。
+        const buf = fs.readFileSync(logPath);
         const base = (this.launcher && this.launcher.webLogBaseline) || 0;
-        logText = base > 0 && full.length > base ? full.slice(base) : full;
+        logText = base > 0 && buf.length > base ? buf.slice(base).toString('utf8') : buf.toString('utf8');
       }
     } catch (_) { /* 忽略 */ }
     const names = parseFailedPlugins(logText);
@@ -175,6 +204,22 @@ class Watchdog {
     await this.launcher.stop();
     this.state.update({ service: 'starting' });
     this.launcher.start();
+    // R25（审计修复）：relaunch 后无就绪等待兜底——挂起时 UI 永久"正在重启"。
+    // 90 秒内未就绪 → 再次 tryRecover（triggered 闸已允许安全模式分支重入：
+    // Level 1 重启失败会进入"安全模式也未能启动"终止；非插件失败会置 failed）。
+    const deadline = Date.now() + 90 * 1000;
+    const poll = async () => {
+      while (Date.now() < deadline) {
+        if (this.launcher.ready) return;
+        if (await this.launcher.probeHealth(this.settings.data.port, 1500)) return;
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      if (!this.launcher.ready) {
+        this.log('安全模式重启后 90 秒未就绪，再次进入恢复流程。');
+        this.tryRecover().catch(() => { /* 忽略 */ });
+      }
+    };
+    poll().catch(() => { /* 忽略 */ });
   }
 
   // 退出安全模式：清状态/删补丁/还原备份 → 正常重启
@@ -198,8 +243,13 @@ class Watchdog {
       const node = this.launcher.nodePath || 'node';
       const bin = this.launcher.found ? this.launcher.found.bin : null;
       if (!bin || !fs.existsSync(bin)) return null;
+      // R25（审计阻断修复）：必须合并 nodeInfo.env——内嵌模式 nodePath 是 DSH-App.exe，
+      // 缺 ELECTRON_RUN_AS_NODE 时启动的是 GUI 本体 → 单实例锁令其秒退（status 0、
+      // stdout 空）→ Level 1 恒失败，一律升级 Level 2 剥离全部第三方插件。
+      const env = Object.assign({}, process.env,
+        this.launcher.nodeInfo && this.launcher.nodeInfo.env ? this.launcher.nodeInfo.env : {});
       const r = spawnSync(node, [bin, '--profile', 'web', '--dump-config'], {
-        cwd: this.workDir, encoding: 'utf8', timeout: 30000, windowsHide: true,
+        cwd: this.workDir, encoding: 'utf8', timeout: 30000, windowsHide: true, env,
       });
       return r.status === 0 ? r.stdout : null;
     } catch (_) { return null; }
