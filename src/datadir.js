@@ -127,6 +127,18 @@ function migrateGatewayConfig(portable, sources) {
         try { if (!fs.existsSync(bak)) fs.copyFileSync(target, bak); } catch (_) { /* 备份失败继续 */ }
       }
       fs.copyFileSync(from, target);
+      // R25（审计修复）：端口归一——桌面助手（3090）的真实配置迁入 dsh-app 时原样
+      // 保留 3090 会与桌面助手同跑时 EADDRINUSE，违背 R22「dsh-app=3091 / 助手=3090
+      // 不混占」约定。迁移/升级路径统一改写为 3091（目标已是 3091 则不动）。
+      try {
+        const cfg = JSON.parse(fs.readFileSync(target, 'utf8'));
+        if (cfg && Number(cfg.port) === 3090) {
+          cfg.port = 3091;
+          fs.writeFileSync(target, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+          // eslint-disable-next-line no-console
+          console.log('[datadir] 迁移配置端口 3090 → 3091（dsh-app 网关约定，避免与桌面助手冲突）');
+        }
+      } catch (_) { /* 解析失败保持原样 */ }
       // eslint-disable-next-line no-console
       console.log('[datadir] 网关配置已' + (targetExists ? '从模拟数据升级：' : '迁移：') + from + ' → ' + target);
       return { action: targetExists ? 'upgraded' : 'migrated', from };
