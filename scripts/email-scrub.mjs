@@ -25,9 +25,11 @@ import { spawnSync } from 'node:child_process';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 // ---------- 默认跳过：依赖/构建产物/官方参考源码副本 ----------
+// 注意：这里只跳过“子目录”。显式传入的扫描根即使名字命中跳过名单也会被扫描
+// （见 scanTree/scrubTree 的 roots 处理）——否则 `--scan out\_zip-stage` 会静默扫 0 个文件。
 export const SKIP_DIRS = new Set([
   'node_modules', '.git', 'out', 'dist', 'anywhere-lab-sdsh-desktop',
-  '.cache', '.vite', 'coverage', '_zip-stage',
+  '.cache', '.vite', 'coverage',
 ]);
 const TEXT_EXT = new Set([
   '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.json', '.yml', '.yaml', '.md', '.txt',
@@ -238,7 +240,14 @@ export function scanTree(targets, { rules, skipDirs = SKIP_DIRS, allow = DEFAULT
     const text = isText ? buf.toString('utf8') : buf.toString('latin1');
     findings.push(...scanText(text, rules, p, { binary: !isText }));
   };
-  for (const t of targets) walk(path.resolve(t));
+  // 显式传入的扫描根不做跳过判定（只对其子目录生效）
+  for (const t of targets) {
+    const abs = path.resolve(t);
+    let st;
+    try { st = fs.statSync(abs); } catch { continue; }
+    if (st.isDirectory()) { for (const e of fs.readdirSync(abs)) walk(path.join(abs, e)); }
+    else walk(abs);
+  }
   return { findings, files, skipped };
 }
 
@@ -265,7 +274,14 @@ export function scrubTree(targets, { rules, skipDirs = SKIP_DIRS, allow = DEFAUL
     }
     if (n > 0) { fs.writeFileSync(p, nextText, 'utf8'); changed++; hits.push({ where: p, count: n }); }
   };
-  for (const t of targets) walk(path.resolve(t));
+  // 与 scanTree 一致：显式传入的扫描根不做跳过判定
+  for (const t of targets) {
+    const abs = path.resolve(t);
+    let st;
+    try { st = fs.statSync(abs); } catch { continue; }
+    if (st.isDirectory()) { for (const e of fs.readdirSync(abs)) walk(path.join(abs, e)); }
+    else walk(abs);
+  }
   return { files, changed, hits };
 }
 
