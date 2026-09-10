@@ -175,6 +175,21 @@ cpSync(path.join(root, 'src', 'assets', 'electron-icon.ico'), path.join(appDir, 
   }
 }
 
+// —— 5.5) 默认插件（dsh-email-bridge）：out\_vendor → resources\vendor ————————
+// 来源由 scripts/vendor-email-bridge.mjs 生成（插件包 + 扁平第三方依赖，约 13MB）。
+// 安装到 dsh profile 的逻辑见 src/default-plugins.js（application 首次/每次启动幂等执行）。
+{
+  const vendorSrc = path.join(root, 'out', '_vendor');
+  if (existsSync(path.join(vendorSrc, 'dsh-email-bridge', 'package.json'))) {
+    const vendorDst = path.join(appDir, 'resources', 'vendor');
+    rmSync(vendorDst, { recursive: true, force: true });
+    cpSync(vendorSrc, vendorDst, { recursive: true });
+    console.log('[内嵌] 默认插件 vendor → resources\\vendor');
+  } else {
+    console.log('[警告] 未找到 out\\_vendor\\dsh-email-bridge（先运行 node scripts/vendor-email-bridge.mjs）');
+  }
+}
+
 // —— 6) 说明文件 ————————————————————————————————————
 writeFileSync(path.join(appDir, '使用说明.txt'),
   'DSH App（DeepSeek Harness 桌面壳）· 绿色免安装版\r\n'
