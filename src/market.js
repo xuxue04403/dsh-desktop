@@ -307,6 +307,14 @@ class MarketOps {
     const env = this._envWithPnpm(process.env);
     return new Promise((resolve) => {
       let child;
+      // 审计中-1：子进程超时兜底——挂死则 kill 并按失败返回（与 launcher/updater 的
+      // 5 分钟超时对齐取 10 分钟：插件安装含 pnpm 全新解析时可能较慢）
+      const TIMEOUT_MS = 10 * 60 * 1000;
+      const timer = setTimeout(() => {
+        try { child && child.kill(); } catch (_) { /* 忽略 */ }
+        resolve({ ok: false, error: 'timeout', output: '' });
+      }, TIMEOUT_MS);
+      const finish = (value) => { clearTimeout(timer); resolve(value); };
       if (process.platform === 'win32' && this.nodeInfo && this.nodeInfo.embedded && this.dshBin) {
         // cmd broker：隐藏控制台宿主（v1.5.17e 同款）——dsh plugin 的子进程不弹窗
         try {
@@ -334,14 +342,14 @@ class MarketOps {
           windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env,
         });
       } else {
-        resolve({ ok: false, error: 'dsh-not-found' });
+        finish({ ok: false, error: 'dsh-not-found' });
         return;
       }
       let out = '';
       if (child.stdout) child.stdout.on('data', (c) => { const t = c.toString('utf8'); out += t; if (onLine) onLine(t.trimEnd()); });
       if (child.stderr) child.stderr.on('data', (c) => { const t = c.toString('utf8'); out += t; if (onLine) onLine(t.trimEnd()); });
-      child.on('error', (e) => resolve({ ok: false, error: e.message, output: out }));
-      child.on('exit', (code) => resolve({ ok: code === 0, code, output: out }));
+      child.on('error', (e) => finish({ ok: false, error: e.message, output: out }));
+      child.on('exit', (code) => finish({ ok: code === 0, code, output: out }));
     });
   }
 
