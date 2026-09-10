@@ -30,6 +30,7 @@ function tokenFromHistory() {
 }
 const token = tokenArg || process.env.DSH_GH_TOKEN || tokenFromHistory() || '';
 const skipSource = args.includes('--skip-source');
+const skipAssets = args.includes('--skip-assets');   // 仅同步源码与 release（不重传数百 MB 资产）
 const doScrub = args.includes('--scrub');
 const zipFromArg = (() => { const i = args.indexOf('--zip-from'); return i >= 0 ? args[i + 1] : ''; })();
 
@@ -220,18 +221,22 @@ if (!rel) {
 }
 
 // 5) 上传资产（同名先删）
-const uploadUrl = rel.upload_url;
-const want = [
-  ['DSHApp-Setup-' + ver + '-x64.exe', path.join(root, 'dist', 'DSHApp-' + ver + '-x64.exe')],
-  ['DSHApp-Portable-' + ver + '-x64.exe', path.join(root, 'dist', 'DSHApp-' + ver + '-便携版.exe')],
-  ['DSHApp-Portable-' + ver + '.zip', zipPath],
-];
-const existing = rel.assets || [];
-for (const [name, file] of want) {
-  if (!fs.existsSync(file)) { console.log('[WARN] 资产缺失: ' + file); continue; }
-  const old = existing.find((a) => a.name === name);
-  if (old) await api('DELETE', `${API}/repos/${OWNER}/${REPO}/releases/assets/${old.id}`);
-  await uploadAsset(uploadUrl, name, file);
+if (skipAssets) {
+  console.log('[..] --skip-assets：跳过资产上传（源码与 release 已同步）');
+} else {
+  const uploadUrl = rel.upload_url;
+  const want = [
+    ['DSHApp-Setup-' + ver + '-x64.exe', path.join(root, 'dist', 'DSHApp-' + ver + '-x64.exe')],
+    ['DSHApp-Portable-' + ver + '-x64.exe', path.join(root, 'dist', 'DSHApp-' + ver + '-便携版.exe')],
+    ['DSHApp-Portable-' + ver + '.zip', zipPath],
+  ];
+  const existing = rel.assets || [];
+  for (const [name, file] of want) {
+    if (!fs.existsSync(file)) { console.log('[WARN] 资产缺失: ' + file); continue; }
+    const old = existing.find((a) => a.name === name);
+    if (old) await api('DELETE', `${API}/repos/${OWNER}/${REPO}/releases/assets/${old.id}`);
+    await uploadAsset(uploadUrl, name, file);
+  }
 }
 
 console.log('[DONE] ' + tag + ' published → https://github.com/' + OWNER + '/' + REPO + '/releases/tag/' + tag);
