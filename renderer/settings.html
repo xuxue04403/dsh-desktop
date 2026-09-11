@@ -103,6 +103,37 @@
     border: 1px solid #2c3546; border-radius: 6px; padding: 8px; font-family: Consolas, monospace;
     font-size: 11px; resize: vertical;
   }
+  /* —— 模型映射（本次改动）：编辑器内「模型列表」由逗号文本框改为 上游 ID ↔ 逻辑名 映射表 —— */
+  .gw-map { display: block; margin-bottom: 14px; font-size: 12px; }
+  .gw-map .map-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; }
+  .gw-map .map-head > span:first-child { width: 130px; flex: none; color: #9aa7bc; }
+  .gw-map .map-hd {
+    display: grid; grid-template-columns: 96px minmax(0, 1fr) minmax(0, 1fr) 52px;
+    gap: 6px; padding: 0 0 4px; color: #8a93a3; font-size: 11px;
+  }
+  .gw-map .map-row {
+    display: grid; grid-template-columns: 96px minmax(0, 1fr) minmax(0, 1fr) 52px;
+    gap: 6px; align-items: center; margin-bottom: 6px;
+  }
+  /* 行内输入框覆盖 .row input[type=text] 的 flex:1（表格里由网格轨道定宽） */
+  .gw-map .map-row input[type=text] {
+    flex: none; width: 100%; min-width: 0; padding: 6px 8px; font-size: 12px;
+    font-family: Consolas, monospace; background: #1b212c; border: 1px solid #2c3546;
+    color: #e8ecf2; border-radius: 6px; outline: none;
+  }
+  .gw-map .map-row button { padding: 5px 8px; font-size: 11px; width: 100%; }
+  .gw-map .map-empty { color: #8a93a3; font-size: 11px; padding: 6px 2px; }
+  .gw-map .map-foot { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+  .gw-paste { margin-top: 8px; }
+  .gw-paste summary { font-size: 11px; color: #7d8aa0; cursor: pointer; }
+  .gw-paste .paste-box { margin-top: 6px; }
+  .gw-paste textarea {
+    width: 100%; box-sizing: border-box; min-height: 84px; background: #161a21; color: #e8ecf2;
+    border: 1px solid #2c3546; border-radius: 6px; padding: 8px; font-family: Consolas, monospace;
+    font-size: 11px; resize: vertical; outline: none;
+  }
+  .gw-paste .paste-foot { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+
   /* —— 两栏布局（仿 dsh 模型配置页：左列表 + 右编辑面板）—— */
   .gw-wrap { display: flex; gap: 12px; align-items: flex-start; }
   .gw-left { flex: 1.15; min-width: 0; }
@@ -190,7 +221,8 @@
       <input type="text" id="gwProxyUrl" placeholder="http://127.0.0.1:7890" style="flex:1;" />
       <span style="color:#8a93a3;font-size:11px;">访问需代理的上游时启用；留空自动探测本机代理</span>
     </div>
-    <div class="hint">防屏蔽：仿真模式不透传任何 dsh 特征头；熔断（401/403 即断 30 分钟、网络/5xx 连续 3 次断 5 分钟）、catalog 探测 30s 冷却防风暴、上游错误日志自动脱敏。<b>协议联动</b>：「写入 dsh 配置」按此处的仿真选择写入 dsh 协议——Claude Code=Anthropic（/v1/messages），Codex/关闭=OpenAI（/v1/chat/completions）；修改仿真后需重新「写入 dsh 配置」并重启 dsh web。</div>
+    <div class="hint">防屏蔽：仿真模式不透传任何 dsh 特征头；熔断（401/403 即断 30 分钟、网络/5xx 连续 3 次断 5 分钟）、catalog 探测 30s 冷却防风暴、上游错误日志自动脱敏。<b>协议联动</b>：「写入 dsh 配置」按此处的仿真选择写入 dsh 协议——Claude Code=Anthropic（/v1/messages），Codex/关闭=OpenAI（/v1/chat/completions）；修改仿真后需重新「写入 dsh 配置」并重启 dsh web。
+      <br /><b>支持的协议</b>：OpenAI Chat Completions（/v1/chat/completions）、<b>OpenAI Responses</b>（/v1/responses，含 response.id 取回 / input_items / cancel / delete 子路由，多轮按 previous_response_id 回到原供应商）、Anthropic Messages（/v1/messages）、模型列表（/v1/models）。密钥打码、developer→system、reasoning 档位映射对三种协议一致生效。</div>
 
     <!-- 供应商可视化配置（仿 dsh 模型配置页：左列表 + 右编辑面板） -->
     <div class="gw-wrap">
@@ -208,7 +240,35 @@
             <div class="row"><label>ID</label><input type="text" id="eId" /></div>
             <div class="row"><label>Base URL</label><input type="text" id="eUrl" placeholder="https://api.example.com/v1" /></div>
             <div class="row"><label>API Key</label><input type="password" id="eKey" placeholder="sk-…" /></div>
-            <div class="row"><label>模型列表</label><input type="text" id="eModels" placeholder="deepseek-v4-flash, glm-5.2（逗号分隔）" /></div>
+            <!-- 模型映射（本次改动）：原「模型列表」逗号文本框 #eModels 已替换为映射表（上游真实 ID ↔ 逻辑模型名） -->
+            <div class="gw-map" id="gwModelMap">
+              <div class="map-head">
+                <span>模型映射</span>
+                <span style="color:#8a93a3;font-size:11px;">上游真实 ID ↔ 网关路由名（同一逻辑名可对应多条上游 ID）</span>
+              </div>
+              <div class="map-hd">
+                <span>上游模型 ID（真实）</span>
+                <span>映射为（网关路由名，留空=同名）</span>
+                <span>操作</span>
+                <span></span>
+              </div>
+              <div id="eModelRows"></div>
+              <div class="map-foot">
+                <button type="button" id="btnModelAddRow">＋ 添加一行</button>
+                <span style="color:#8a93a3;font-size:11px;">「映射为」留空 = 与上游同名（写回配置为字符串）</span>
+              </div>
+              <details class="gw-paste">
+                <summary>批量粘贴（每行一条：上游ID 或 上游ID =&gt; 逻辑名）</summary>
+                <div class="paste-box">
+                  <textarea id="eModelPaste" rows="4" spellcheck="false"
+                    placeholder="deepseek-ai/deepseek-v4-flash =&gt; deepseek-v4-flash&#10;glm-5.3"></textarea>
+                  <div class="paste-foot">
+                    <button type="button" id="btnModelPasteImport">导入（追加到上表）</button>
+                    <span style="color:#8a93a3;font-size:11px;">分隔符支持 =&gt; / -&gt; / =；空行与 # 开头的行忽略</span>
+                  </div>
+                </div>
+              </details>
+            </div>
             <div class="row"><label>优先级</label><input type="number" id="ePriority" min="1" value="1" style="width:90px;" /></div>
             <div class="row"><label>启用</label><input type="checkbox" id="eEnabled" /></div>
             <div class="row">
@@ -435,12 +495,16 @@
         // 审计修复（P1）：models 在高级 JSON 里常被写成字符串（"models":"glm-4.6"）——
         // 旧版直接 .join(', ') 会抛 TypeError：列表空白、加载管线中断、状态/日志永久冻结。
         const modelList = Array.isArray(p.models) ? p.models : (p.models == null ? [] : [p.models]);
-        const models = modelList.join(', ');
+        // 模型映射（本次改动）：条数语义不变（映射表每行=1 个模型），另标出其中的「映射」条数
+        // （as 与上游 ID 不同 —— 旧数据里就是对象写法），列表里一眼看出该供应商是否配了映射。
+        const mapped = gwCountMapped(modelList);
+        const cntText = modelList.length + ' 模型' + (mapped ? '（含 ' + mapped + ' 个映射）' : '');
+        const cntTitle = gwNormalizeModels(modelList).map((r) => r.as + ' ← ' + r.up).join('\n');
         row.innerHTML =
           '<span><input type="checkbox" ' + (p.enabled === false ? '' : 'checked') + ' title="启用"></span>' +
           '<span class="mono id" title="' + esc(p.id || '') + '">' + esc(p.id || '（未命名）') + '</span>' +
           '<span class="mono" title="' + esc(p.baseURL || '') + '">' + esc(p.baseURL || '—') + '</span>' +
-          '<span class="cnt" title="' + esc(models) + '">' + modelList.length + ' 模型</span>' +
+          '<span class="cnt" title="' + esc(cntTitle) + '">' + esc(cntText) + '</span>' +
           '<span class="cnt">P' + esc(String(p.priority || 1)) + '</span>' +
           '<span><button data-i="' + i + '" data-act="edit">编辑</button> <button data-i="' + i + '" data-act="del">删除</button></span>';
         row.querySelector('input[type=checkbox]').onchange = (e) => {
@@ -478,6 +542,165 @@
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
+    // ===== 模型映射（本次改动）：上游真实 ID ↔ 逻辑模型名 =====
+    // 配置形态（向后兼容，字符串写法继续支持）：
+    //   字符串          "glm-5.3"                        → 上游 ID 与逻辑名同名
+    //   对象            { "id": "vendor/real-id", "as": "logic-name" }
+    //                   id = 该供应商上游的真实模型 ID（请求发给上游时用这个），
+    //                   as = 逻辑模型名（dsh 请求时用这个，网关按它路由）。
+    //                   同一个 provider 允许出现多条 as 相同的映射（同一逻辑名的多个上游变体）。
+    //   同义字段        model / alias / name 均可作 as 的同义词；as 缺省时等于 id。
+
+    // 模型映射：取对象里第一个非空字符串字段（用于 as 及其同义字段）
+    function gwFirstStr(o, keys) {
+      for (let i = 0; i < keys.length; i++) {
+        const v = o[keys[i]];
+        if (typeof v === 'string' && v.trim()) return v.trim();
+      }
+      return '';
+    }
+
+    // 模型映射：读入归一化 → [{up, as}]；非法/空条目跳过，as 缺省时等于 up
+    function gwNormalizeModels(list) {
+      const arr = Array.isArray(list) ? list : (list == null ? [] : [list]);
+      const out = [];
+      arr.forEach((m) => {
+        if (typeof m === 'string') {
+          const id = m.trim();
+          if (id) out.push({ up: id, as: id });
+          return;
+        }
+        if (!m || typeof m !== 'object') return;   // 数字/布尔/null 等脏数据直接跳过，不让它中断渲染
+        // 字段解析优先级（**必须与网关 src/gateway/model-gateway.mjs 的 modelEntries 完全一致**，
+        // 否则"打开配置页再保存"会悄悄改变语义）：
+        //   上游 ID：id → up → upstream → model（末位兜底）；都为空 → 该条跳过（不凭空捏一个上游 ID）
+        //   逻辑名：显式 as → alias → name → model（末位兜底）→ up
+        const upRaw = gwFirstStr(m, ['id', 'up', 'upstream']);
+        const model = gwFirstStr(m, ['model']);
+        const asRaw = gwFirstStr(m, ['as', 'alias', 'name']);
+        const up = upRaw || model;
+        const as = asRaw || model || up;
+        if (up) out.push({ up, as: as || up });
+      });
+      return out;
+    }
+
+    // 模型映射：写出序列化 → as 为空或等于 up 写字符串，否则写对象 {id, as}
+    function gwSerializeModels(rows) {
+      const out = [];
+      (Array.isArray(rows) ? rows : []).forEach((r) => {
+        if (!r) return;
+        const up = String(r.up == null ? '' : r.up).trim();
+        const as = String(r.as == null ? '' : r.as).trim();
+        if (!up) return;
+        out.push((!as || as === up) ? up : { id: up, as: as });
+      });
+      return out;
+    }
+
+    // 模型映射：统计「真映射」条数（as 与上游 ID 不同）
+    function gwCountMapped(list) {
+      return gwNormalizeModels(list).filter((r) => r.as !== r.up).length;
+    }
+
+    // 模型映射：批量粘贴解析，每行一条：上游ID 或 上游ID => 逻辑名
+    // 分隔符 => / -> / = 任选其一（取最先出现者）；空行与 # 开头的行忽略；无分隔符时 as 留空（=同名）
+    function gwParseModelPaste(text) {
+      const out = [];
+      String(text == null ? '' : text).split(/\r?\n/).forEach((raw) => {
+        const line = raw.trim();
+        if (!line || line.charAt(0) === '#') return;
+        const seps = ['=>', '->', '='];
+        let idx = -1, sep = '';
+        for (let k = 0; k < seps.length; k++) {
+          const i = line.indexOf(seps[k]);
+          if (i >= 0 && (idx < 0 || i < idx)) { idx = i; sep = seps[k]; }
+        }
+        if (idx < 0) { out.push({ up: line, as: '' }); return; }
+        const up = line.slice(0, idx).trim();
+        const as = line.slice(idx + sep.length).trim();
+        if (up || as) out.push({ up: up || as, as: as || '' });
+      });
+      return out;
+    }
+
+    // 模型映射：创建一行（纯 DOM 创建，不拼用户数据，避免 XSS/转义遗漏）
+    function gwBuildModelRow(row) {
+      const r = (row && typeof row === 'object') ? row : {};
+      const wrap = document.createElement('div');
+      wrap.className = 'map-row';
+      const iUp = document.createElement('input');
+      iUp.type = 'text';
+      iUp.className = 'm-up';
+      iUp.placeholder = 'deepseek-ai/deepseek-v4-flash';
+      iUp.title = '该供应商上游的真实模型 ID（请求发给上游时用这个）';
+      iUp.value = r.up || '';
+      const iAs = document.createElement('input');
+      iAs.type = 'text';
+      iAs.className = 'm-as';
+      iAs.placeholder = 'deepseek-v4-flash（留空 = 同名）';
+      iAs.title = '逻辑模型名（dsh 请求时用这个，网关按它路由）';
+      // 读入约定：as === up 的行「映射为」显示为空（提示"留空 = 同名"）——写回时留空即写字符串
+      const up = (r.up || '').trim();
+      iAs.value = (r.as && r.as !== up) ? r.as : '';
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.textContent = '删除';
+      del.onclick = () => { wrap.remove(); gwSyncModelRowsHint(); };
+      const tail = document.createElement('span');
+      wrap.appendChild(iUp);
+      wrap.appendChild(iAs);
+      wrap.appendChild(del);
+      wrap.appendChild(tail);
+      return wrap;
+    }
+
+    // 模型映射：空表提示（仅 UI 提示，不参与写回）
+    function gwSyncModelRowsHint() {
+      const box = $('eModelRows');
+      if (!box) return;
+      const old = box.querySelector('.map-empty');
+      if (old) old.remove();
+      if (!box.querySelector('.map-row')) {
+        const d = document.createElement('div');
+        d.className = 'map-empty';
+        d.textContent = '暂无模型映射行——点「＋ 添加一行」或展开「批量粘贴」导入。';
+        box.appendChild(d);
+      }
+    }
+
+    // 模型映射：读入 —— 编辑器打开时用 provider.models 填充映射表
+    function gwFillModelRows(list) {
+      const box = $('eModelRows');
+      if (!box) return;
+      box.innerHTML = '';
+      gwNormalizeModels(list).forEach((row) => { box.appendChild(gwBuildModelRow(row)); });
+      gwSyncModelRowsHint();
+    }
+
+    // 模型映射：读表 —— 编辑器 → [{up, as}]（忽略上游 ID 为空的行）
+    function gwReadModelRows() {
+      const box = $('eModelRows');
+      if (!box) return [];
+      return Array.prototype.map.call(box.querySelectorAll('.map-row'), (row) => ({
+        up: (row.querySelector('.m-up').value || '').trim(),
+        as: (row.querySelector('.m-as').value || '').trim(),
+      })).filter((r) => r.up);
+    }
+
+    // 模型映射：批量粘贴「导入」——解析结果追加到映射表（空行已在解析里跳过）
+    function gwImportPastedModels() {
+      const ta = $('eModelPaste');
+      if (!ta) return;
+      const rows = gwParseModelPaste(ta.value);
+      if (!rows.length) { toast('没有可导入的行（每行一条：上游ID 或 上游ID => 逻辑名）'); return; }
+      const box = $('eModelRows');
+      rows.forEach((row) => { box.appendChild(gwBuildModelRow(row)); });
+      gwSyncModelRowsHint();
+      ta.value = '';
+      toast('已追加 ' + rows.length + ' 行，点「应用修改」后写入配置');
+    }
+
     function gwOpenEditor(i) {
       const p = gwCfg.providers[i];
       if (!p) return;
@@ -485,7 +708,8 @@
       $('eId').value = p.id || '';
       $('eUrl').value = p.baseURL || '';
       $('eKey').value = p.apiKey || '';
-      $('eModels').value = (Array.isArray(p.models) ? p.models : (p.models == null ? [] : [p.models])).join(', ');
+      // 模型映射（本次改动）：原 $('eModels').value = models.join(', ') 改为填充映射表
+      gwFillModelRows(p.models);
       $('ePriority').value = p.priority || 1;
       $('eEnabled').checked = p.enabled !== false;
       $('gwEditorEmpty').style.display = 'none';
@@ -508,7 +732,9 @@
       p.id = id;
       p.baseURL = url;
       p.apiKey = $('eKey').value.trim();
-      p.models = $('eModels').value.split(',').map((s) => s.trim()).filter(Boolean);
+      // 模型映射（本次改动）：原 read $('eModels').value.split(',') 改为读映射表并序列化
+      // （留空的「映射为」= 同名 → 写回字符串；不同名 → 写回 { id, as }）
+      p.models = gwSerializeModels(gwReadModelRows());
       p.priority = parseInt($('ePriority').value, 10) || 1;
       p.enabled = $('eEnabled').checked;
       gwSyncText();
@@ -567,6 +793,16 @@
       const isAnthropic = ($('gwProfile').value === 'claude');
       $('gwBaseUrl').textContent = 'http://127.0.0.1:' + p + (isAnthropic ? '' : '/v1');
     });
+
+    // 模型映射（本次改动）：「＋ 添加一行」/「批量粘贴导入」两个按钮
+    $('btnModelAddRow').onclick = () => {
+      $('eModelRows').appendChild(gwBuildModelRow({ up: '', as: '' }));
+      gwSyncModelRowsHint();
+      const rows = $('eModelRows').querySelectorAll('.map-row');
+      const last = rows[rows.length - 1];
+      if (last) last.querySelector('.m-up').focus();
+    };
+    $('btnModelPasteImport').onclick = gwImportPastedModels;
 
     async function gwLoad() {
       gwWireEvents();   // 订阅 gw:state（事件是状态/日志的主通道）
