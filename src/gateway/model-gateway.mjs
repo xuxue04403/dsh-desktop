@@ -50,13 +50,35 @@ let LOG_PATH = process.env.DSH_GATEWAY_LOG || path.join(APP_DIR, 'logs', 'gatewa
 /* ---------------- logging ---------------- */
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // 日志轮转上限 5MB（修复 G3：防止长期运行磁盘膨胀）
 
-// 本地时间戳（与宿主 app.log 的本地时间一致，避免 UTC 差 8 小时难对照）：
-// 格式 YYYY-MM-DD HH:mm:ss.SSS
+/* 日志时间口径（时区可移植性修复，2026-09-11）：
+ * 旧版 localStamp 用 getHours() 等**系统时区**字段；把绿色目录复制到一台时区为 UTC 的
+ * 电脑（镜像/克隆的 Windows 很常见）后，网关日志比北京时间早 8 小时，与宿主 app.log 的
+ * 口径也可能不一致，排查时序会误导。现在缺省固定北京时区（UTC+8），与机器设置无关；
+ * DSH_LOG_TZ 可覆盖：local|system（跟随系统）或 ±HH:MM。
+ * 注：网关是零依赖单文件（会被解包到 data\gateway\ 单独运行），故这里内联同一套逻辑
+ *（与 src/timestamp.js 语义一致，改动时两边必须同步）。 */
+function logTzOffsetMin() {
+  const v = String(process.env.DSH_LOG_TZ || '').trim().toLowerCase();
+  if (v === 'local' || v === 'system') return null;
+  const m = /^([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(v);
+  if (m) { const mins = Number(m[2]) * 60 + Number(m[3] || 0); return m[1] === '-' ? -mins : mins; }
+  return 480;   // 缺省：北京时间
+}
+const LOG_TZ_MIN = logTzOffsetMin();
+
+// 时间戳：YYYY-MM-DD HH:mm:ss.SSS（口径见上）
 function localStamp(d) {
-  const x = d || new Date();
+  const t = d || new Date();
   const p = (n, w) => String(n).padStart(w, '0');
-  return x.getFullYear() + '-' + p(x.getMonth() + 1, 2) + '-' + p(x.getDate(), 2) + ' '
-    + p(x.getHours(), 2) + ':' + p(x.getMinutes(), 2) + ':' + p(x.getSeconds(), 2) + '.' + p(x.getMilliseconds(), 3);
+  const x = LOG_TZ_MIN === null ? t : new Date(t.getTime() + LOG_TZ_MIN * 60000);
+  const Y = LOG_TZ_MIN === null ? x.getFullYear() : x.getUTCFullYear();
+  const Mo = (LOG_TZ_MIN === null ? x.getMonth() : x.getUTCMonth()) + 1;
+  const D = LOG_TZ_MIN === null ? x.getDate() : x.getUTCDate();
+  const H = LOG_TZ_MIN === null ? x.getHours() : x.getUTCHours();
+  const Mi = LOG_TZ_MIN === null ? x.getMinutes() : x.getUTCMinutes();
+  const S = LOG_TZ_MIN === null ? x.getSeconds() : x.getUTCSeconds();
+  const Ms = LOG_TZ_MIN === null ? x.getMilliseconds() : x.getUTCMilliseconds();
+  return Y + '-' + p(Mo, 2) + '-' + p(D, 2) + ' ' + p(H, 2) + ':' + p(Mi, 2) + ':' + p(S, 2) + '.' + p(Ms, 3);
 }
 
 function log(msg) {
@@ -126,6 +148,61 @@ const catalogCache = new Map(); // providerId -> { models:Set, ts }
 
 // S1 轮询计数器：model -> 下次起始偏移（round-robin 路由模式用）
 const rrCounters = new Map();
+
+/* ---------------- OpenAI Responses 协议：会话/资源亲和性 ----------------
+ * Responses 协议是**有状态**的：客户端拿到 response.id 后会用
+ *   GET    /v1/responses/{id}
+ *   DELETE /v1/responses/{id}
+ *   POST   /v1/responses/{id}/cancel
+ *   GET    /v1/responses/{id}/input_items
+ * 以及 POST /v1/responses 带 previous_response_id 继续多轮。
+ * 这些后续请求的 body 里**没有 model**（子路由连 body 都没有），无法按模型路由；
+ * 而 response 对象只存在于**创建它的那家上游**——发错家必然 404。
+ * 因此：创建成功后记下 id → providerId，后续请求优先回到原供应商；
+ * 同时 previous_response_id 也用于把多轮对话钉在同一家（缓存命中/上下文一致）。
+ * 容量有界（LRU 淘汰），避免客户端可控 id 造成无界增长。
+ */
+const RESPONSE_AFFINITY_MAX = 512;
+const responseAffinity = new Map();   // responseId -> providerId
+
+function affinitySet(id, providerId) {
+  if (!id || !providerId) return;
+  if (responseAffinity.has(id)) responseAffinity.delete(id);   // 重插 = 最近使用
+  responseAffinity.set(id, providerId);
+  while (responseAffinity.size > RESPONSE_AFFINITY_MAX) {
+    const oldest = responseAffinity.keys().next();
+    if (oldest.done) break;
+    responseAffinity.delete(oldest.value);
+  }
+}
+
+function affinityGet(id) {
+  if (!id) return null;
+  const pid = responseAffinity.get(id);
+  if (!pid) return null;
+  responseAffinity.delete(id);   // LRU 触碰
+  responseAffinity.set(id, pid);
+  return pid;
+}
+
+/** 从响应字节（JSON 或 SSE）里嗅探 Responses 的 response.id。
+ * 三种形态，按可信度取：
+ *   ① `"id":"resp_…"`（官方/new-api 惯例前缀，最可靠）
+ *   ② SSE 的 `event: response.created` → `"response":{"id":"…"`（前缀不规范也认）
+ *   ③ JSON 体里 `"id":"…","object":"response"`（明确声明 object 才认）
+ * 只认这三类，避免把 output item 的 msg_/item/函数调用 id 误当成 response id。取不到返回 null。 */
+const RESP_ID_RE = /"id"\s*:\s*"(resp[_-][A-Za-z0-9_-]{3,})"/;
+const RESP_NESTED_ID_RE = /"response"\s*:\s*\{\s*"id"\s*:\s*"([A-Za-z0-9_.:-]{4,})"/;
+const RESP_OBJECT_ID_RE = /"id"\s*:\s*"([A-Za-z0-9_.:-]{4,})"\s*,\s*"object"\s*:\s*"response"/;
+function sniffResponseId(text) {
+  if (!text || typeof text !== 'string') return null;
+  const direct = RESP_ID_RE.exec(text);
+  if (direct) return direct[1];
+  const nested = RESP_NESTED_ID_RE.exec(text);
+  if (nested) return nested[1];
+  const obj = RESP_OBJECT_ID_RE.exec(text);
+  return obj ? obj[1] : null;
+}
 
 const catalogInflight = new Map(); // providerId -> Promise（并发去重）
 
@@ -377,20 +454,73 @@ function providersForModel(cfg, model) {
     .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
 }
 
-/* ---------------- 候选收敛：catalog × 配置 models（审计修复 P1） ----------------
- * 旧版只按 catalog 分桶：catalog 不可用（null）时**任意**模型名都会被发给**所有**供应商
- *（烧额度，最后 503），而配置里每个 provider 的 `models` 声明完全不参与路由。
- * 规则（可信度从高到低，2026-09-10 复核修订）：
- *   catalog 命中该模型                       → 候选（排最前）
- *   **配置 models 显式声明了该模型**          → 候选（用户写在配置里的声明优先：
- *     上游 /models 常常滞后或不完整，不能因为快照没列出就否掉用户显式配好的模型——
- *     实测场景：agentrouter 的 catalog 不含 glm-5.3，但配置声明了，旧规则会 404
- *     "not offered by any configured provider"）
- *   catalog 未知(null) + models 空/未声明    → 候选（无法判断，保持宽容）
- *   catalog 已知但不含 且 配置未声明          → 不是候选（模型名写错/上游没这个模型）
- *   catalog 未知 + models 非空且不含该模型    → 不是候选（"模型没配上"的典型场景）
- * 返回 { eligible, reasons }：reasons 记录每个 provider 的判定原因（写日志 + 404 错误详情），
- * 便于用户排查"模型没配上"。
+/* ---------------- 模型映射（上游真实 ID ↔ 逻辑模型名） ----------------
+ * 背景（2026-09-11）：同一个逻辑模型在不同供应商的上游 ID 往往不同
+ *（如 `deepseek-ai/deepseek-v4-flash` 与 `deepseek-v4-flash0731` 都是 deepseek-v4-flash）。
+ * 旧配置只能写一串 ID，于是同一个模型被当成两个不同模型，按逻辑名路由就匹配不上。
+ *
+ * provider.models 每项支持两种形态（**向后兼容**）：
+ *   "glm-5.3"                                    —— 字符串：上游 ID 与逻辑名相同
+ *   { id: "deepseek-ai/deepseek-v4-flash",       —— 对象：id = 上游真实 ID（发给上游用）
+ *     as: "deepseek-v4-flash" }                     as = 逻辑模型名（dsh 请求用；网关按它路由）
+ * 同义字段：as / alias / model / name 任一都当逻辑名（手写配置容错）；as 缺省 = id。
+ * 同一 provider 允许多条 as 相同的映射（该逻辑模型在该家有多个上游 ID 变体，取第一条命中）。
+ */
+function modelEntries(provider) {
+  const out = [];
+  const list = provider && Array.isArray(provider.models) ? provider.models : [];
+  for (const m of list) {
+    if (typeof m === 'string') {
+      const s = m.trim();
+      if (s) out.push({ up: s, as: s });
+      continue;
+    }
+    if (m && typeof m === 'object' && !Array.isArray(m)) {
+      // 上游真实 ID：id（规范写法），同义键 up / upstream；都没有时兜底取 model
+      //（配置页对 `{model,as}` 这种手写形态也这么读，两侧语义必须一致）
+      const up = String(m.id ?? m.up ?? m.upstream ?? m.model ?? '').trim();
+      if (!up) continue;
+      const as = String(m.as ?? m.alias ?? m.model ?? m.name ?? up).trim();
+      out.push({ up, as: as || up });
+    }
+  }
+  return out;
+}
+
+/** 逻辑模型名 → 该 provider 的上游真实 ID（未声明该逻辑名 → null，表示原样透传请求里的 model） */
+function upstreamIdFor(provider, logical) {
+  const hit = modelEntries(provider).find((e) => e.as === logical);
+  return hit ? hit.up : null;
+}
+
+/** 该 provider 声明的逻辑模型名（去重，保序） */
+function logicalModelNames(provider) {
+  const seen = new Set();
+  const out = [];
+  for (const e of modelEntries(provider)) {
+    if (!seen.has(e.as)) { seen.add(e.as); out.push(e.as); }
+  }
+  return out;
+}
+
+/** 把一个逻辑模型名换成该 provider 的上游 ID（无需替换时原样返回传入对象） */
+function bodyForProvider(body, provider, logical) {
+  const up = upstreamIdFor(provider, logical);
+  if (!up || up === logical) return body;
+  return Object.assign({}, body, { model: up });
+}
+
+/* ---------------- 候选收敛：catalog × 配置声明（模型映射） ----------------
+ * 规则（可信度从高到低，2026-09-11 加入模型映射后修订）：
+ *   catalog 命中（目录含请求的逻辑名本身，或含某条映射的上游 ID 且该条映射的逻辑名匹配）
+ *                                            → 候选（排最前）
+ *   **配置声明了该逻辑名**（models 里某条的 as / 字符串本身等于请求名）
+ *                                            → 候选（用户显式声明优先：上游 /models 常滞后或不完整；
+ *                                               映射场景下上游 ID 与逻辑名不同，目录里根本不会出现逻辑名）
+ *   catalog 未知(null) 且该 provider 未声明任何模型 → 候选（无法判断，保持宽容）
+ *   catalog 已知但不含 且 配置未声明该逻辑名 → 不是候选（模型名写错/上游没这个模型）
+ *   catalog 未知 且 声明了其它模型但都不含该逻辑名 → 不是候选（"模型没配上"的典型场景）
+ * 返回 { eligible, reasons }：reasons 记录每个 provider 的判定原因（写日志 + 404 错误详情）。
  */
 function selectCandidates(candidates, catalogResults, model) {
   const hit = [];
@@ -398,16 +528,18 @@ function selectCandidates(candidates, catalogResults, model) {
   const reasons = [];
   candidates.forEach((p, i) => {
     const set = catalogResults ? catalogResults[i] : null;
-    const declared = Array.isArray(p.models) ? p.models.filter((m) => typeof m === 'string') : [];
-    const isDeclared = declared.includes(model);
+    const entries = modelEntries(p);
     const catalogKnown = set !== null && set !== undefined;
-    if (catalogKnown && set.has(model)) { hit.push(p); reasons.push({ id: p.id, reason: 'catalog-hit' }); return; }
-    if (isDeclared) {
+    const declared = entries.filter((e) => e.as === model);   // 声明承载该逻辑名的条目（可能多条）
+    // 目录命中：① 目录直接含请求名（供应商新增模型未改配置的老路径）；② 映射的上游 ID 在目录里
+    const catalogHit = catalogKnown && (set.has(model) || declared.some((e) => set.has(e.up)));
+    if (catalogHit) { hit.push(p); reasons.push({ id: p.id, reason: 'catalog-hit' }); return; }
+    if (declared.length) {
       lenient.push(p);
       reasons.push({ id: p.id, reason: catalogKnown ? 'models-declared(catalog-miss)' : 'catalog-unknown,models-match' });
       return;
     }
-    if (!catalogKnown && declared.length === 0) { lenient.push(p); reasons.push({ id: p.id, reason: 'catalog-unknown,models-undeclared' }); return; }
+    if (!catalogKnown && entries.length === 0) { lenient.push(p); reasons.push({ id: p.id, reason: 'catalog-unknown,models-undeclared' }); return; }
     reasons.push({ id: p.id, reason: catalogKnown ? 'catalog-miss' : 'catalog-unknown,models-miss' });
   });
   return { eligible: [...hit, ...lenient], reasons };
@@ -595,6 +727,96 @@ function translateBody(body, provider) {
   return out;
 }
 
+/* ---------------- OpenAI Responses 协议（POST /v1/responses）请求体处理 ----------------
+ * Responses 与 chat/completions 是同一家上游的两种协议，字段结构不同：
+ *   messages[]（chat）        → input（字符串 / item 数组）+ instructions（系统提示）
+ *   reasoning_effort/thinking → reasoning.effort
+ * 因此 chat 路径的 translateBody / desensitizeBodyMessages **在 Responses 上完全不生效**
+ *（它们只认 body.messages）——密钥打码、role 兼容、推理档位翻译在 Responses 路径等于全缺失。
+ * 这里补齐同一套语义（与 chat 路径共用 reasoningEffortMap 和 maskSecretTokens，
+ * 保证两种协议的网关行为一致）。
+ * @returns 翻译后的 body（无变化时返回原对象）
+ */
+function translateResponsesBody(body, provider) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  let out = body;
+  const detach = () => { if (out === body) out = { ...body }; return out; };
+
+  // 1) 推理档位（R4）：Responses 只认 reasoning.effort 字符串。
+  //    对象形态映射（chat 用 { thinking: 'disabled'|'enabled' }）在 Responses 里的等价物是
+  //    "有没有 reasoning 字段"：disabled → 整段移除；enabled → 保留原档位。
+  //    字符串形态中的 off 语义（off/none/disabled）同样按"移除 reasoning"处理：
+  //    Responses 协议没有"关闭"枚举值（官方就是靠不发该字段来关闭），照抄 chat 的
+  //    `effort: "disabled"` 会被严格校验的上游直接 400；其余档位照抄映射值。
+  const map = provider && provider.reasoningEffortMap && typeof provider.reasoningEffortMap === 'object'
+    ? provider.reasoningEffortMap : null;
+  const r = body.reasoning;
+  const OFF_LIKE_RE = /^(off|none|disabled|false)$/i;
+  if (map && r && typeof r === 'object' && !Array.isArray(r) && typeof r.effort === 'string') {
+    const want = r.effort;
+    const mapped = map[want];
+    if (typeof mapped === 'string') {
+      if (OFF_LIKE_RE.test(mapped) || OFF_LIKE_RE.test(want)) delete detach().reasoning;
+      else if (mapped !== want) detach().reasoning = { ...r, effort: mapped };
+    } else if (mapped && typeof mapped === 'object') {
+      if (typeof mapped.effort === 'string') {
+        if (OFF_LIKE_RE.test(mapped.effort)) delete detach().reasoning;
+        else if (mapped.effort !== want) detach().reasoning = { ...r, effort: mapped.effort };
+      } else if (mapped.thinking === 'disabled') {
+        // 关闭推理：上游收到未知的 thinking 字段会 400，直接不发 reasoning
+        delete detach().reasoning;
+      }
+    }
+  }
+
+  // 2) 打码（R9）：instructions（等价 chat 的 system 消息）与 input（等价 messages）
+  if (typeof out.instructions === 'string') {
+    const m = maskSecretTokens(out.instructions);
+    if (m !== out.instructions) detach().instructions = m;
+  }
+  if (typeof out.input === 'string') {
+    const m = maskSecretTokens(out.input);
+    if (m !== out.input) detach().input = m;
+  } else if (Array.isArray(out.input)) {
+    const items = maskResponsesItems(out.input);
+    if (items) detach().input = items;
+  }
+  return out;
+}
+
+/** Responses input item 数组：developer→system（R5 role 兼容）+ 文本打码（R9）。
+ * 覆盖 { role, content: '…' }、{ role, content: [{ type:'input_text', text }] }、
+ * { type:'function_call_output', output }（等价 chat 的 tool 消息 = 长串重灾区）。
+ * @returns 新数组；无改动返回 null */
+function maskResponsesItems(items) {
+  let changed = false;
+  const next = items.map((it) => {
+    if (!it || typeof it !== 'object' || Array.isArray(it)) return it;
+    let n = it;
+    const detach = () => { if (n === it) { n = { ...it }; changed = true; } return n; };
+    if (n.role === 'developer' && (!n.type || n.type === 'message')) detach().role = 'system';
+    if (typeof n.content === 'string') {
+      const m = maskSecretTokens(n.content);
+      if (m !== n.content) detach().content = m;
+    } else if (Array.isArray(n.content)) {
+      const parts = n.content.map((pt) => {
+        if (pt && typeof pt === 'object' && !Array.isArray(pt) && typeof pt.text === 'string') {
+          const m = maskSecretTokens(pt.text);
+          if (m !== pt.text) { changed = true; return { ...pt, text: m }; }
+        }
+        return pt;
+      });
+      if (parts.some((pt, i) => pt !== n.content[i])) detach().content = parts;
+    }
+    if (typeof n.output === 'string') {
+      const m = maskSecretTokens(n.output);
+      if (m !== n.output) detach().output = m;
+    }
+    return n;
+  });
+  return changed ? next : null;
+}
+
 /** 推理档位统一翻译（R4 新）：把 dsh 发来的统一推理档位，翻译成各上游自己的词汇。
  * 背景：上游 deepseek-v4-flash 的推理字段词汇各不相同——
  *   sensenova 接受 reasoning_effort: low|medium|high|xhigh|none（拒绝 max）；
@@ -686,6 +908,48 @@ function desensitizeBodyMessages(body) {
   return changed ? { ...body, messages: msgs } : body;
 }
 
+// R9c：Responses 协议的降敏重试（对应 desensitizeBodyMessages）——对 instructions / input
+// 的文本与文本块降敏；function_call 的 arguments（JSON 结构）不动，避免破坏工具调用。
+function desensitizeResponsesBody(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body;
+  let out = body;
+  const detach = () => { if (out === body) out = { ...body }; return out; };
+  if (typeof body.instructions === 'string') {
+    const d = desensitizeLongTokens(body.instructions);
+    if (d !== body.instructions) detach().instructions = d;
+  }
+  if (typeof body.input === 'string') {
+    const d = desensitizeLongTokens(body.input);
+    if (d !== body.input) detach().input = d;
+  } else if (Array.isArray(body.input)) {
+    let changed = false;
+    const next = body.input.map((it) => {
+      if (!it || typeof it !== 'object' || Array.isArray(it)) return it;
+      let n = it;
+      if (typeof n.content === 'string') {
+        const d = desensitizeLongTokens(n.content);
+        if (d !== n.content) { n = { ...n, content: d }; changed = true; }
+      } else if (Array.isArray(n.content)) {
+        const parts = n.content.map((pt) => {
+          if (pt && typeof pt === 'object' && !Array.isArray(pt) && typeof pt.text === 'string') {
+            const d = desensitizeLongTokens(pt.text);
+            if (d !== pt.text) return { ...pt, text: d };
+          }
+          return pt;
+        });
+        if (parts.some((pt, i) => pt !== n.content[i])) { n = { ...n, content: parts }; changed = true; }
+      }
+      if (typeof n.output === 'string') {
+        const d = desensitizeLongTokens(n.output);
+        if (d !== n.output) { n = { ...n, output: d }; changed = true; }
+      }
+      return n;
+    });
+    if (changed) detach().input = next;
+  }
+  return out;
+}
+
 /* ---------------- 上游错误分类（审计修复 P1，本次） ----------------
  * 上游内容拦截（new-api/one-api 的"疑似密钥泄露"过滤）：换一家供应商 + R9c 降敏重试**确实可能成功**，
  * 这是有意保留的 failover 行为。
@@ -699,6 +963,15 @@ const CONTENT_BLOCK_RE = /sensitive\s*words|content[-_]blocked|content_blocked/i
  * 的那家直接打死。判不出来时按"路由不存在"处理（保守，保持旧行为）。
  */
 const MODEL_MISSING_RE = /model[^.\n]{0,60}(not\s+found|does\s+not\s+exist|doesn'?t\s+exist|not\s+exist|unsupported|unknown|invalid|no\s+access|permission|不存在|不支持)/i;
+
+/**
+ * 404 的第二种细分（2026-09-11 实测补充）：**整条路由都没实现**。
+ * 实测证据：new-api / one-api 系上游只实现了 `POST /v1/responses`（生成），对 Responses
+ * 资源子路由一律回 `{"error":{"message":"Invalid URL (GET /v1/responses/resp_…)"}}`。
+ * 这与"资源确实不存在/已过期"是两件不同的事：前者重试、换供应商、等一会儿都不会好，
+ * 是供应商能力缺失。网关据此给出可操作的提示，而不是笼统地说"可能被删了"。
+ */
+const ROUTE_MISSING_RE = /invalid\s+url|not\s+implemented|unsupported\s+(method|route|endpoint|operation)|no\s+such\s+route|method\s+not\s+allowed|cannot\s+(get|post|delete|put)|unknown\s+(method|endpoint|route)/i;
 
 /** 确定性 4xx → 回给客户端的状态码（只映射到这几个"语义明确且不泄露上游信息"的状态码）。 */
 const DETERMINISTIC_4XX_STATUS = { 400: 400, 404: 404, 413: 413, 422: 422 };
@@ -803,7 +1076,12 @@ function writeBlockedDump(provider, status, body) {
  *                        按 status 回复客户端（旧版把 400/404 也当"可切换"，同一个错误请求被
  *                        原样重发给每一家供应商 = N 倍计费 + N 倍风控）。
  */
-async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
+async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts) {
+  const responsesMode = !!(opts && opts.responses);
+  // raw 模式（Responses 资源子路由 GET/DELETE/cancel）：无请求体、不做协议翻译、方法可变，
+  // 只把上游响应原样流回。有 body 的转发一律走 POST + 翻译路径。
+  const rawMode = !!(opts && opts.raw);
+  const method = (opts && opts.method) || 'POST';
   // 审计修复（P2，本次）：发请求前先占用熔断半开探测名额（唯一的状态转换点）。抢不到
   //（冷却未到点 / 已有探测在途）→ 本次不发任何上游请求，直接交给下一家。
   if (!breakerAcquire(provider.id)) {
@@ -824,21 +1102,22 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     // 导致"关闭推理"失效——上游收到非 Anthropic 字段而按默认开推理处理）。
     // Anthropic 请求的 R9 打码已在 handleMessages 完成，这里原样透传。
     const isAnthropicPath = upstreamPath === '/messages';
-    const outBody = isAnthropicPath ? body : translateBody(body, provider);   // R5：role 兼容 + 推理档位翻译
-    upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
-      method: 'POST',
-      headers: upstreamHeaders,
-      body: JSON.stringify(outBody),
-      signal: controller.signal,
-    });
+    const outBody = rawMode ? null
+      : (isAnthropicPath
+        ? body
+        : (responsesMode ? translateResponsesBody(body, provider) : translateBody(body, provider)));   // R5：role 兼容 + 推理档位翻译（Responses 走对应实现）
+    // raw 模式不带 body：显式传 undefined，避免 fetch 在没有 content-length 时挂起等待请求体
+    const init = { method, headers: upstreamHeaders, signal: controller.signal };
+    if (!rawMode) init.body = JSON.stringify(outBody);
+    upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, init);
     clearTimeout(timer);
     // R9c 自适应降敏：上游内容拦截（sensitive words / content-blocked）时，用降敏后的
     // 消息体**重试一次**（换新连接；历史里的 32+ 位技术串占位符化后不再命中平台
     // "疑似密钥"过滤）。重试成功则继续走正常流式转发；仍失败则按原逻辑处理。
-    if (!upstream.ok) {
+    if (!rawMode && !upstream.ok) {
       firstDetail = await readTextWithTimeout(upstream, 5000, 500);
       if (CONTENT_BLOCK_RE.test(firstDetail)) {
-        const deBody = desensitizeBodyMessages(outBody);
+        const deBody = responsesMode ? desensitizeResponsesBody(outBody) : desensitizeBodyMessages(outBody);
         if (deBody !== outBody) {
           log(`upstream ${provider.id} 内容拦截，已降敏重试一次…`);
           const c2 = new AbortController();
@@ -864,7 +1143,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
     breakerRecordFail(provider.id, 0);   // V2：网络错误 → 短熔断 5 分钟
     log(`upstream ${provider.id} request error: ${e.message}`);
-    return false;
+    return rawMode ? { retryable: 0 } : false;
   }
   clearTimeout(timer);
   if (!upstream.ok) {
@@ -879,13 +1158,15 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     // R8：上游内容拦截时，把触发请求的"结构摘要"落盘（不含明文 key、不含原文前缀），
     // 用于定位是什么特征触发了上游过滤（sensitive words / content-blocked）。
     // 审计修复（P3，本次）：受 env 开关控制（缺省不落盘）+ 目录保留上限，见 writeBlockedDump。
-    if (contentBlocked) writeBlockedDump(provider, upstream.status, body);
+    if (contentBlocked && !rawMode) writeBlockedDump(provider, upstream.status, body);
     if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429 || upstream.status >= 500) {
       // likely stale/misconfigured key, rate-limited, or dead endpoint —— 冷却缓存，防风暴（R3）
       // R25：429（限流）计入熔断——不熔断会加剧限流；短熔断（90s）已足够退避
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
       breakerRecordFail(provider.id, upstream.status);   // V2：按状态码分级熔断（401/403 → 30 分钟）
-      return false;
+      // raw 模式（资源子路由）：这不是"资源不存在"而是"这家上游暂时不可用"，
+      // 把状态码带回去让调用方回 502，避免误导客户端以为 response 已被删除
+      return rawMode ? { retryable: upstream.status } : false;
     }
     // 审计修复（P1，本次）：确定性 4xx（401/403/429 之外的 4xx）**立即终止该模型的 failover**。
     // 旧版把 400/404 也归入"可切换"分支（有意为之的注释），结果是同一个"请求本身有错"的 body
@@ -903,8 +1184,11 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
       //  · 上游**明确说模型不存在/不支持**：这是确定性错误，重发给每一家只是 N 倍计费。
       // 用响应体特征区分，判不出来时保守按"路由不存在"继续 failover。
       if (upstream.status === 404 && !MODEL_MISSING_RE.test(detail)) {
+        const routeMissing = ROUTE_MISSING_RE.test(detail);
         log(`upstream ${provider.id} HTTP 404（未见"模型不存在"特征，按路由不存在处理）→ 继续 failover`);
-        return false;
+        // raw 模式（Responses 资源子路由）：把"整条路由没实现"与"资源不存在"的区别带回调用方，
+        // 让它能给客户端一句能照着排查的提示（实测 new-api 对 GET/DELETE/cancel 回 Invalid URL）
+        return rawMode ? { notFound: true, routeMissing } : false;
       }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
       log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 终止 failover（回 ${status}，不回显上游原文）`);
@@ -947,6 +1231,10 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
     // 循环会一直读到上游结束：用户点"停止"后上游继续生成（重复计费/占额度），
     // 而且最终 return true → 日志与统计记成 status=ok。
     let clientGone = false;
+    // Responses 亲和性：从响应字节里嗅探 response.id（JSON 与 SSE 都含 "id":"resp_…"），
+    // 只嗅探头部有限字节，取到即停（回调返回 true）。绝不影响转发本身。
+    let sniff = (opts && typeof opts.onSniff === 'function') ? { fn: opts.onSniff, text: '' } : null;
+    const SNIFF_MAX = 8192;
     const onClientClose = () => {
       if (clientGone) return;
       clientGone = true;
@@ -964,6 +1252,12 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res) {
         const { done, value } = await reader.read();
         if (done) break;
         lastRead = Date.now();
+        if (sniff) {
+          try {
+            sniff.text += Buffer.from(value).toString('utf8');
+            if (sniff.fn(sniff.text) === true || sniff.text.length >= SNIFF_MAX) sniff = null;
+          } catch { sniff = null; }   // 嗅探失败绝不影响转发
+        }
         // 客户端可能随时断开（点停止/超时/关页）：write 抛 EPIPE 必须捕获，
         // 否则未处理异常会经 async 回调炸掉整个网关进程（C1）
         try {
@@ -1006,11 +1300,31 @@ function dumpBodyDigest(body, tag) {
     const dir = process.env.DSH_GATEWAY_DUMP_BODY;
     if (!dir) return;
     fs.mkdirSync(dir, { recursive: true });
+    // Responses 协议（tag='responses'）没有 messages：input 才是"消息"（字符串 / item 数组）
+    const items = Array.isArray(body && body.input) ? body.input
+      : (Array.isArray(body && body.messages) ? body.messages : null);
     // 完整请求体（脱敏后落盘，供逐字节对比/取证——明文 key/长串经 maskSecretTokens 打码）
-    if (process.env.DSH_GATEWAY_DUMP_FULL === '1' && body && body.messages) {
-      const sanitized = {
-        ...body,
-        messages: body.messages.map((m) => {
+    if (process.env.DSH_GATEWAY_DUMP_FULL === '1' && body && (body.messages || body.input)) {
+      const sanitized = { ...body };
+      if (typeof sanitized.instructions === 'string') sanitized.instructions = maskSecretTokens(sanitized.instructions);
+      if (typeof body.input === 'string') {
+        sanitized.input = maskSecretTokens(body.input);
+      } else if (Array.isArray(body.input)) {
+        sanitized.input = body.input.map((it) => {
+          if (!it || typeof it !== 'object' || Array.isArray(it)) return it;
+          const n = { ...it };
+          if (typeof n.content === 'string') n.content = maskSecretTokens(n.content);
+          if (Array.isArray(n.content)) {
+            n.content = n.content.map((b) =>
+              (b && typeof b.text === 'string') ? { ...b, text: maskSecretTokens(b.text) } : b);
+          }
+          if (typeof n.output === 'string') n.output = maskSecretTokens(n.output);
+          if (n.arguments) n.arguments = '<arguments>';   // 不落工具参数细节
+          return n;
+        });
+      }
+      if (Array.isArray(body.messages)) {
+        sanitized.messages = body.messages.map((m) => {
           if (!m) return m;
           const n = { ...m };
           if (typeof n.content === 'string') n.content = maskSecretTokens(n.content);
@@ -1021,30 +1335,32 @@ function dumpBodyDigest(body, tag) {
           }
           if (n.tool_calls) n.tool_calls = '<tool_calls>';   // 不落工具参数细节
           return n;
-        }),
-      };
+        });
+      }
       const fullF = path.join(dir, 'full-' + Date.now() + '-' + tag + '.json');
       fs.writeFileSync(fullF, JSON.stringify(sanitized), 'utf8');
-      log(`[dump] 完整请求体(脱敏) -> ${fullF} (${sanitized.messages.length} 条消息)`);
+      log(`[dump] 完整请求体(脱敏) -> ${fullF} (${(items || []).length} 条消息)`);
     }
     const digest = {
       at: localStamp(),
       tag,
       model: body && body.model,
       stream: !!(body && body.stream),
-      reasoning_effort: body && body.reasoning_effort,
+      // R4：Responses 用 reasoning.effort 表达推理档位（chat 用 reasoning_effort/thinking）
+      reasoning_effort: (body && body.reasoning_effort) ?? (body && body.reasoning && body.reasoning.effort),
       thinking: body && body.thinking,
+      previous_response_id: body && body.previous_response_id,
       hasTools: Array.isArray(body && body.tools) ? body.tools.length : 0,
-      msgCount: Array.isArray(body && body.messages) ? body.messages.length : 0,
+      msgCount: items ? items.length : 0,
       // R10：记录消息结构取证（roles 空说明 role 字段缺失/结构异常）
-      msg0Keys: (body && body.messages && body.messages[0]) ? Object.keys(body.messages[0]) : [],
-      msg0Role: (body && body.messages && body.messages[0]) ? body.messages[0].role : undefined,
-      msg0ContentType: (body && body.messages && body.messages[0] && body.messages[0].content) ? (Array.isArray(body.messages[0].content) ? 'array:' + body.messages[0].content.length : typeof body.messages[0].content) : undefined,
-      msg0Sample: (body && body.messages && body.messages[0] && typeof body.messages[0].content === 'string')
-        ? maskSecretTokens(body.messages[0].content).slice(0, 80)   // 审计修复：样本先打码（旧版可能落真密钥前缀）
+      msg0Keys: (items && items[0]) ? Object.keys(items[0]) : [],
+      msg0Role: (items && items[0]) ? items[0].role : undefined,
+      msg0ContentType: (items && items[0] && items[0].content) ? (Array.isArray(items[0].content) ? 'array:' + items[0].content.length : typeof items[0].content) : (items && items[0] && typeof items[0].output === 'string' ? 'output:string' : undefined),
+      msg0Sample: (items && items[0] && typeof items[0].content === 'string')
+        ? maskSecretTokens(items[0].content).slice(0, 80)   // 审计修复：样本先打码（旧版可能落真密钥前缀）
         : undefined,
-      roles: Array.isArray(body && body.messages)
-        ? body.messages.slice(0, 50).map((m) => (m && m.role) || '?').join(',')
+      roles: items
+        ? items.slice(0, 50).map((m) => (m && (m.role || m.type)) || '?').join(',')
         : '',
       tools: Array.isArray(body && body.tools)
         ? body.tools.map((t) => (t && t.function && t.function.name) || '?').join(',')
@@ -1057,15 +1373,17 @@ function dumpBodyDigest(body, tag) {
   } catch (_) { /* dump 失败不影响服务 */ }
 }
 
-async function handleCompletion(cfg, req, res, body, upstreamPath) {
-  dumpBodyDigest(body, 'chat');   // R8：诊断用（env 控制）
+async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
+  const responsesMode = !!(opts && opts.responses);          // POST /v1/responses
+  const search = (opts && opts.search) || '';                // 查询串原样带给上游（?api-version= 等）
+  dumpBodyDigest(body, responsesMode ? 'responses' : 'chat');   // R8：诊断用（env 控制）
   const model = body && body.model;
   if (!model) return json(res, 400, { error: { message: 'model is required' } });
   const reqStart = Date.now();   // 调用计时（T1 调用日志）
   const client = req.socket?.remoteAddress || 'local';
   const stream = !!(body && body.stream);
   const logCall = (via, status) =>
-    log(`[call] ${model} ${via} status=${status} stream=${stream ? 1 : 0} dur=${Date.now() - reqStart}ms from=${client}`);
+    log(`[call] ${model} ${via} status=${status} stream=${stream ? 1 : 0} dur=${Date.now() - reqStart}ms from=${client}${responsesMode ? ' proto=responses' : ''}`);
 
   const candidates = providersForModel(cfg, model);
   if (candidates.length === 0) {
@@ -1118,10 +1436,41 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
     const start = n % ordered.length;
     if (start > 0) tryOrder = [...ordered.slice(start), ...ordered.slice(0, start)];
   }
+  // Responses 有状态：多轮请求（previous_response_id）必须回到持有该上下文的原供应商，
+  // 否则上游不认识这个 id（404）或上下文丢失。命中亲和表 → 提到尝试序列最前（其余仍可 failover）。
+  if (responsesMode && typeof body.previous_response_id === 'string' && body.previous_response_id) {
+    const owner = affinityGet(body.previous_response_id);
+    if (owner) {
+      const i = tryOrder.findIndex((x) => x.id === owner);
+      if (i > 0) {
+        tryOrder = [tryOrder[i], ...tryOrder.slice(0, i), ...tryOrder.slice(i + 1)];
+        log(`responses affinity: previous_response_id ${body.previous_response_id} → ${owner} 优先`);
+      } else if (i < 0) {
+        log(`responses affinity: previous_response_id 属于 ${owner}，但它不是 "${model}" 的候选 → 忽略`);
+      }
+    }
+  }
   for (const p of tryOrder) {
-    log(`try ${p.id} for ${model}`);
+    // 模型映射：把逻辑名换成该供应商的上游真实 ID（未声明映射 → 原样透传）
+    const attemptBody = bodyForProvider(body, p, model);
+    const upModel = attemptBody.model;
+    log(`try ${p.id} for ${model}${upModel !== model ? ' → ' + upModel : ''}`);
     // 透传 dsh 原始请求标识（K1 防屏蔽）/ 仿真模式（V2: clientProfile）：clientHeaders = req.headers
-    const out = await forward(p, upstreamPath.replace(/^\/v1/, ''), passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, cfg.clientProfile), body, res);
+    // Responses：记录 response.id → provider 亲和（后续 GET/DELETE/cancel/input_items 与多轮都靠它）
+    let sniffed = false;
+    const fwdOpts = responsesMode ? {
+      responses: true,
+      onSniff: (text) => {
+        if (sniffed) return true;
+        const id = sniffResponseId(text);
+        if (!id) return false;
+        sniffed = true;
+        affinitySet(id, p.id);
+        log(`responses affinity: ${id} → ${p.id}`);
+        return true;
+      },
+    } : undefined;
+    const out = await forward(p, upstreamPath.replace(/^\/v1/, '') + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, cfg.clientProfile), attemptBody, res, fwdOpts);
     if (out === true) {
       log(`served ${model} via ${p.id}`);
       logCall(`via=${p.id}`, 'ok');
@@ -1142,6 +1491,131 @@ async function handleCompletion(cfg, req, res, body, upstreamPath) {
   }
   logCall('all-providers', 'fail');
   json(res, 503, { error: { message: `all providers for model "${model}" are unavailable` } });
+}
+
+/* ---------------- OpenAI Responses 协议：资源子路由（GET/DELETE/cancel/input_items） ----------------
+ * Responses 是**有状态**协议：response 对象只存在于创建它的那家上游。客户端（Codex、OpenAI
+ * SDK、dsh 的 responses 模式）在 POST 之后会用 response.id 继续操作：
+ *   GET    /v1/responses/{id}               取回响应对象
+ *   GET    /v1/responses/{id}/input_items   取回输入条目（分页 ?limit=&after=&order=）
+ *   DELETE /v1/responses/{id}               删除
+ *   POST   /v1/responses/{id}/cancel        取消进行中的响应
+ * 旧版这些路径全部落到 `404 unsupported route`（网关只认 POST /v1/responses）——
+ * 客户端表现为"会话无法恢复/取消无效"，而 Codex 这类客户端会真的用到它们。
+ *
+ * 路由规则：
+ *   ① 亲和表命中（本进程创建过）→ 只发原供应商（唯一持有该资源的家）；失败不再猜别家；
+ *   ② 未知 id（网关重启后、或别的实例创建）→ **只读**操作（GET/input_items）按 priority
+ *      逐家试探：每家对不属于自己的 id 都回 404，换家无副作用；**写**操作（DELETE/cancel）
+ *      不猜，直接 404——避免把删除/取消误发给无关供应商；
+ *   ③ 查询串原样透传；上游 JSON 响应原样回传（含状态码）。
+ */
+async function handleResponsesResource(cfg, req, res, url, tail) {
+  const segs = String(tail || '').split('/').filter((s) => s !== '');
+  const rawId = segs[0] || '';
+  const action = segs[1] || '';
+  if (!rawId) return json(res, 404, { error: { message: `unsupported route ${url.pathname}` } });
+  let id;
+  try { id = decodeURIComponent(rawId); } catch { id = rawId; }   // 畸形百分号编码 → 原样
+  const method = req.method;
+  const base = '/responses/' + encodeURIComponent(id);
+  let upstreamPath = null;
+  if (method === 'GET' && !action) upstreamPath = base;
+  else if (method === 'GET' && action === 'input_items') upstreamPath = base + '/input_items';
+  else if (method === 'DELETE' && !action) upstreamPath = base;
+  else if (method === 'POST' && action === 'cancel') upstreamPath = base + '/cancel';
+  if (!upstreamPath) {
+    return json(res, 404, { error: { message: `unsupported route ${url.pathname}` } });
+  }
+  // cancel 可能带 body（通常为空）：读完丢弃，避免 keep-alive 下未消费的请求体影响连接
+  if (method === 'POST') {
+    try { await bodyOf(req); } catch (e) { return replyBodyError(res, req, e, false); }
+  }
+
+  const readOnly = method === 'GET';
+  // 候选供应商：与模型路由一致按 priority 排序（priority 缺省 99）
+  const enabled = (cfg.providers || [])
+    .filter((p) => p && p.enabled !== false)
+    .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
+  let targets = null;
+  const owner = affinityGet(id);
+  if (owner) {
+    const p = enabled.find((x) => x.id === owner);
+    if (p) targets = [p];
+    else log(`responses ${method} ${id}: 亲和供应商 ${owner} 已不在配置中，改走探测`);
+  }
+  if (!targets) {
+    if (!readOnly) {
+      log(`responses ${method} ${id}: 未知 id 且为写操作 → 不试探供应商（避免误删/误取消别家资源）`);
+      return json(res, 404, { error: {
+        message: `response "${id}" is not known to this gateway instance; `
+          + `refusing to guess which provider owns it for ${method} (re-create it via POST /v1/responses)`,
+      } });
+    }
+    targets = enabled;
+  }
+  if (targets.length === 0) {
+    return json(res, 404, { error: { message: 'no providers configured' } });
+  }
+
+  const reqStart = Date.now();
+  const client = req.socket?.remoteAddress || 'local';
+  const callLog = (via, status) =>
+    log(`[call] responses ${method} ${id} ${via} status=${status} dur=${Date.now() - reqStart}ms from=${client} proto=responses`);
+  const upPath = upstreamPath + (url.search || '');
+  // 上游"故障"（≠ 资源不存在）：502=上游不可用/报错，503=熔断冷却中。
+  // 关键点：不能回 404 —— 那等于告诉客户端"response 已被删除"（客户端会丢弃上下文）。
+  let failStatus = 0;
+  let upstreamNote = '';
+  let sawNotFound = false;      // 上游确实回了 404（资源/路由不存在）
+  let sawRouteMissing = false;  // 其中至少一家是"整条子路由没实现"（供应商能力缺失）
+  for (const p of targets) {
+    if (breakerIsOpen(p.id)) {
+      log(`skip ${p.id} (breaker open)`);
+      if (owner) { failStatus = 503; upstreamNote = 'provider in breaker cooldown'; }
+      continue;
+    }
+    const out = await forward(p, upPath, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, cfg.clientProfile), null, res, { raw: true, method });
+    if (out === true) {
+      callLog(`via=${p.id}`, 'ok');
+      return;
+    }
+    if (out && out.stop) {   // 确定性 4xx（400/413/422/404…）：请求本身有问题，不再换家
+      callLog(`via=${p.id}`, 'fail:' + out.stop.status);
+      // 注意：不能复用 stopFailoverMessage——那句文案是"模型"语境（model "…"），
+      // 而这里的主语是 response 资源，照抄会把 response id 说成模型名，越看越糊涂。
+      return json(res, out.stop.status, { error: {
+        message: `provider "${p.id}" rejected ${method} /v1/responses/{id} with HTTP ${out.stop.upstreamStatus} — `
+          + 'the request itself was rejected upstream (e.g. the response already completed / is not cancellable, '
+          + 'or the provider validates this endpoint differently); see the gateway log for the upstream detail.',
+      } });
+    }
+    if (out && out.notFound) {
+      sawNotFound = true;
+      if (out.routeMissing) sawRouteMissing = true;
+    }
+    if (out && out.retryable !== undefined) {
+      failStatus = 502;
+      upstreamNote = out.retryable ? 'upstream HTTP ' + out.retryable : 'upstream request failed';
+    }
+    if (res.headersSent || res.destroyed) { callLog('stream-broken', 'fail'); return; }
+  }
+  if (failStatus) {
+    callLog(owner ? 'owner-unavailable' : 'probe-unavailable', 'fail:' + failStatus);
+    return json(res, failStatus, { error: {
+      message: `provider unavailable while handling response "${id}" (${upstreamNote}); the resource is not necessarily gone — retry shortly`,
+    } });
+  }
+  callLog((owner ? 'owner-miss' : 'probe-miss') + (sawRouteMissing ? '/route-missing' : ''), 'fail');
+  const ep = `${method} /v1/responses/{id}${upstreamPath.endsWith('/input_items') ? '/input_items' : (upstreamPath.endsWith('/cancel') ? '/cancel' : '')}`;
+  const routeHint = sawRouteMissing
+    ? ` — the provider does not implement the Responses resource endpoint "${ep}" `
+      + '(many new-api/one-api style gateways only support response creation via POST /v1/responses); '
+      + 'this is a provider capability limit, not a deletion'
+    : (owner ? ` (owner ${owner} returned no such resource — it may have expired or been deleted)` : '');
+  json(res, 404, { error: {
+    message: `response "${id}" was not found on any configured provider` + routeHint,
+  } });
 }
 
 /**
@@ -1246,8 +1720,11 @@ async function handleMessages(cfg, req, res, body) {
   }
 
   for (const p of tryOrder) {
-    log(`try ${p.id} for ${model} (anthropic)`);
-    const out = await forward(p, '/messages', upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, true, cfg.clientProfile), outBody, res);
+    // 模型映射：逻辑名 → 该供应商的上游真实 ID（Anthropic 路径同样处理）
+    const attemptBody = bodyForProvider(outBody, p, model);
+    const upModel = attemptBody.model;
+    log(`try ${p.id} for ${model} (anthropic)${upModel !== model ? ' → ' + upModel : ''}`);
+    const out = await forward(p, '/messages', upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, true, cfg.clientProfile), attemptBody, res);
     if (out === true) {
       log(`served ${model} via ${p.id} (anthropic)`);
       logCall(`via=${p.id}`, 'ok');
@@ -1274,23 +1751,27 @@ async function handleMessages(cfg, req, res, body) {
 }
 
 async function handleModels(cfg, req, res) {
-  const byId = new Map();
+  const seen = new Set();
   const rows = [];
-  const results = await Promise.all(
-    providersForModel(cfg).map((p) => fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)),
-  );
-  for (const p of providersForModel(cfg)) {
+  const push = (id, owner) => {
+    const name = String(id || '').trim();
+    if (!name || seen.has(name)) return;
+    seen.add(name);
+    // T5：同时携带 Anthropic 模型发现字段（display_name/type）——Claude Code 等
+    // Anthropic 客户端可读；OpenAI 客户端忽略多余字段，互不影响
+    rows.push({ id: name, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: owner, type: 'model', display_name: name, created_at: new Date().toISOString() });
+  };
+  const providers = providersForModel(cfg);
+  // 1) 先列**配置里声明的逻辑模型名**（模型映射后，dsh 请求的是逻辑名，目录里可能根本没有它）
+  for (const p of providers) for (const as of logicalModelNames(p)) push(as, p.id);
+  // 2) 再补目录里的模型：已被映射覆盖的上游 ID 归到它的逻辑名下，其余按上游 ID 原样列出
+  await Promise.all(providers.map((p) => fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)));
+  for (const p of providers) {
     const entry = catalogCache.get(p.id);
     // 失败冷却期（models=null）或无缓存：跳过（R10：不能对 null models 迭代）
     if (!entry || !entry.models) continue;
-    for (const id of entry.models) {
-      if (!byId.has(id)) {
-        byId.set(id, rows.length);
-        // T5：同时携带 Anthropic 模型发现字段（display_name/type）——Claude Code 等
-        // Anthropic 客户端可读；OpenAI 客户端忽略多余字段，互不影响
-        rows.push({ id, object: 'model', created: Math.floor(Date.now() / 1000), owned_by: p.id, type: 'model', display_name: id, created_at: new Date().toISOString() });
-      }
-    }
+    const alias = new Map(modelEntries(p).map((e) => [e.up, e.as]));
+    for (const id of entry.models) push(alias.get(id) || id, p.id);
   }
   json(res, 200, { object: 'list', data: rows });
 }
@@ -1407,10 +1888,19 @@ async function routeRequest(cfg, req, res) {
       if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/v1/responses')) {
         try {
           const body = await bodyOf(req);
-          return await handleCompletion(cfg, req, res, body, p);
+          // Responses 与 chat/completions 共用同一个处理器（同一家上游的两种协议）：
+          // Responses 走自己的体翻译（instructions/input/reasoning.effort）与亲和路由
+          return await handleCompletion(cfg, req, res, body, p, {
+            responses: p === '/v1/responses',
+            search: url.search || '',
+          });
         } catch (e) {
           return replyBodyError(res, req, e, false);
         }
+      }
+      // Responses 资源子路由（有状态协议：客户端用 response.id 取回/删除/取消/取输入）
+      if (p.startsWith('/v1/responses/')) {
+        return await handleResponsesResource(cfg, req, res, url, p.slice('/v1/responses/'.length));
       }
       return json(res, 404, { error: { message: `unsupported route ${p}` } });
     }
@@ -1555,10 +2045,12 @@ function writeDshConfig(args) {
   console.log(`[write-dsh] clientProfile="${clientProfile}" → api=${wireApi} baseURL=${baseURL}`);
 
   // merge models across enabled providers, dedup, keep order
+  // 模型映射（2026-09-11）：写进 dsh 的必须是**逻辑模型名**（dsh 请求用它，网关按它路由并改写为
+  // 各供应商的上游真实 ID）；配置里 `{id, as}` 时取 as，字符串则取本身。
   const modelMap = new Map();
   for (const p of cfg.providers || []) {
     if (p.enabled === false) continue;
-    for (const m of p.models || []) if (typeof m === 'string' && !modelMap.has(m)) modelMap.set(m, m);
+    for (const as of logicalModelNames(p)) if (!modelMap.has(as)) modelMap.set(as, as);
   }
   const models = [...modelMap.values()];
   if (models.length === 0) {
