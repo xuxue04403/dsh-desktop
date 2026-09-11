@@ -172,8 +172,15 @@ t('网关：forward 对 Anthropic 路径跳过 OpenAI 专用翻译（R14）', ()
   const mjs = fs.readFileSync(path.join(__dirname, '..', 'src', 'gateway', 'model-gateway.mjs'), 'utf8');
   assert.ok(mjs.includes("const isAnthropicPath = upstreamPath === '/messages';"),
     'forward 应按路径识别 Anthropic 协议');
-  assert.ok(mjs.includes('isAnthropicPath ? body : translateBody(body, provider)'),
-    'Anthropic 路径应原样透传（不 translateBody）');
+  // 协议分支（2026-09-11 起含 Responses 与 raw 资源子路由）：Anthropic 必须原样透传
+  const m = /const outBody = ([\s\S]*?);\s*\/\/ R5/.exec(mjs);
+  assert.ok(m, '应能定位 forward 里的 outBody 协议分支');
+  const expr = m[1];
+  assert.ok(/isAnthropicPath[\s\S]*?\?\s*body/.test(expr), 'Anthropic 路径应原样透传（不 translateBody）');
+  assert.ok(/translateBody\(body, provider\)/.test(expr), 'OpenAI chat 路径仍应走 translateBody');
+  assert.ok(/responsesMode\s*\?\s*translateResponsesBody\(body, provider\)/.test(expr),
+    'Responses 路径应走 translateResponsesBody（chat 的翻译只看 messages，对 Responses 无效）');
+  assert.ok(/rawMode\s*\?\s*null/.test(expr), 'raw 模式（资源子路由 GET/DELETE）不得构造请求体');
 });
 
 t('网关：model-gateway.mjs 主流程支持 --config/--log 覆盖（防误读 %APPDATA% 旧配置）', () => {
