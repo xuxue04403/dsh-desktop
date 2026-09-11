@@ -16,6 +16,15 @@ contextBridge.exposeInMainWorld('dshApp', {
   gwState: () => ipcRenderer.invoke('gw:state'),
   gwAction: (name, payload) => ipcRenderer.invoke('gw:action', name, payload),
 
+  // 订阅网关状态推送（main.js broadcastGw() → 'gw:state'，载荷含状态与日志尾部）
+  // 审计修复（P2）：主进程本来就推送该事件，桥里却漏了这条订阅 → 设置页只能 2 秒轮询，
+  // 且每次都重置日志框。返回取消函数，供不再需要时解绑。
+  onGwState: (cb) => {
+    const listener = (_e, snap) => cb(snap);
+    ipcRenderer.on('gw:state', listener);
+    return () => ipcRenderer.removeListener('gw:state', listener);
+  },
+
   // 插件市场（v1.5.18）：发现 / 安装预览 / 已安装 / 安装卸载
   mkDiscover: (payload) => ipcRenderer.invoke('mk:discover', payload),
   mkPreview: (pkgName) => ipcRenderer.invoke('mk:preview', pkgName),
@@ -40,5 +49,17 @@ contextBridge.exposeInMainWorld('dshApp', {
     const listener = (_e, section) => cb(section);
     ipcRenderer.on('dsh:focus-section', listener);
     return () => ipcRenderer.removeListener('dsh:focus-section', listener);
+  },
+});
+
+// —— 主窗口（dsh web 页面）用的**单向、无权限**通道 ——
+// 主窗口先加载本地状态页、再导航到 dsh web 页面，preload 对两者都可见（因此上面的
+// dshApp 桥必须由主进程按来源帧拒绝，见 main.js fromLocalPage）。这里额外提供的
+// __dshAppIh 只用于把「输入框当前值/光标是否在文首」上报给主进程，供 ↑↓ 历史做
+// **同步**决策（Electron 的 before-input-event 必须同步 preventDefault）。
+// 它不返回任何数据、不能触发任何动作，故即使被 dsh 页面内的第三方插件脚本调用也无风险。
+contextBridge.exposeInMainWorld('__dshAppIh', {
+  report: (state) => {
+    try { ipcRenderer.send('dsh:ih-state', state || null); } catch (_) { /* 忽略 */ }
   },
 });
