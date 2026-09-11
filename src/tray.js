@@ -21,14 +21,16 @@ function trayImage() {
 
 class TrayController {
   /**
-   * @param {object} opts { getState, actions }
+   * @param {object} opts { getState, actions, shouldBalloon?, onBalloon? }
    *   actions: { showMain, start, stop, openBrowser, openSettings, openLogs, quit }
    */
   constructor(opts) {
     this.actions = opts.actions;
     this.getState = opts.getState;
+    this.shouldBalloon = opts.shouldBalloon || (() => false);
+    this.onBalloon = opts.onBalloon || (() => {});
     this.tray = null;
-    this.badged = false;   // 首次气泡提示已展示
+    this.badged = false;   // 气泡提示已展示（配合 shouldBalloon 做"仅首次"）
   }
 
   create() {
@@ -53,12 +55,16 @@ class TrayController {
     this.tray.on('double-click', () => this.actions.showMain());
 
     // 首次运行气泡提示：帮助发现托盘图标（Windows 可能默认收起新图标到溢出区）
+    // 审计修复（P3）：旧版只在内存里置 badged 且从不判断 → 每次启动都弹一次。
     try {
-      this.tray.displayBalloon({
-        title: 'DSH App 已启动',
-        content: '程序驻留在系统托盘。若此处看不到图标，点击任务栏「^」展开隐藏图标即可找到。',
-      });
-      this.badged = true;
+      if (this.shouldBalloon()) {
+        this.tray.displayBalloon({
+          title: 'DSH App 已启动',
+          content: '程序驻留在系统托盘。若此处看不到图标，点击任务栏「^」展开隐藏图标即可找到。',
+        });
+        this.badged = true;
+        this.onBalloon();
+      }
     } catch (_) { /* 部分平台不支持气泡 */ }
   }
 
