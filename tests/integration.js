@@ -2,6 +2,12 @@
 // 运行：node tests/integration.js（全部在临时目录内操作，不触碰真实用户数据）
 'use strict';
 
+// 审计修复（P2）：本机没有独立 Node.js 时 `node` 会解析到随应用分发的
+// DSH-App.exe（ELECTRON_RUN_AS_NODE 模式）。Electron 会给 fs 打 asar 补丁——
+// 一旦路径里出现 `app.asar` 段，mkdirSync 直接 ENOTDIR，下面的「asar 解包」用例
+// 会抛错并**中断整个集成套件**（后面的用例一个都不跑）。关掉 asar 补丁即可。
+process.noAsar = true;
+
 const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
@@ -275,8 +281,15 @@ t('launcher：findNode 返回 {exe,env,embedded} 且 findNodeStr 为字符串', 
   assert.ok(n && typeof n.exe === 'string' && n.exe.length > 0, 'exe 应为非空字符串');
   assert.ok(n.env && typeof n.env === 'object', 'env 应为对象');
   assert.ok(typeof n.embedded === 'boolean', 'embedded 应为布尔');
-  // 开发模式（测试环境）：embedded=false，exe 指向系统 node
-  assert.strictEqual(n.embedded, false, '开发模式下应为系统 node');
+  // 审计修复：这里原本硬断言 embedded===false（"开发模式"）。本机没有独立 Node.js 时
+  // `node` 就是随应用分发的 DSH-App.exe（ELECTRON_RUN_AS_NODE），其 resourcesPath 使
+  // findNode 正确判定为内嵌模式 → 该断言与"被测代码正确"相矛盾。改为断言**契约**：
+  // 内嵌模式必须带 ELECTRON_RUN_AS_NODE=1，否则必须不是 Electron 可执行文件。
+  if (n.embedded) {
+    assert.strictEqual(n.env.ELECTRON_RUN_AS_NODE, '1', '内嵌运行时必须注入 ELECTRON_RUN_AS_NODE=1');
+  } else {
+    assert.ok(!/electron/i.test(path.basename(n.exe)), '非内嵌模式的 exe 不应是 Electron 本体');
+  }
   const s = findNodeStr();
   assert.ok(typeof s === 'string' && s.length > 0, 'findNodeStr 应返回字符串');
 });
@@ -530,11 +543,22 @@ t('默认插件 v2 (R26)：vendor 内容更新 → 已装副本自动刷新（�
   const vroot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-vendor8-'));
   const prevHome = process.env.DSH_HOME;
   const prevRes = process.resourcesPath;
+  const prevHadRes = Object.prototype.hasOwnProperty.call(process, 'resourcesPath');
+  // 审计修复：Electron 运行时（随应用分发的 DSH-App.exe = 本机唯一的 node）把
+  // process.resourcesPath 定义为**只读 getter**，`process.resourcesPath = vroot` 在严格
+  // 模式下抛 TypeError → 该用例直接失败。改为 defineProperty 定义可写自有属性（遮蔽
+  // 原 getter），结束后 delete 还原。
+  const setResourcesPath = (v, had) => {
+    try {
+      if (had === false && v === undefined) delete process.resourcesPath;
+      else Object.defineProperty(process, 'resourcesPath', { value: v, configurable: true, writable: true });
+    } catch (_) { /* 忽略 */ }
+  };
   const mk = (p, s) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, s, 'utf8'); };
   const vname = 'dsh-email-bridge';
   try {
     process.env.DSH_HOME = home;
-    process.resourcesPath = vroot;               // vendorDir() 优先取 resourcesPath（测试隔离，不碰真实 out\_vendor）
+    setResourcesPath(vroot, true);               // vendorDir() 优先取 resourcesPath（测试隔离，不碰真实 out\_vendor）
     const vdir = path.join(vroot, 'vendor', vname);
     mk(path.join(vdir, 'package.json'), JSON.stringify({ name: vname, version: '9.9.9', main: 'lib/index.js' }));
     mk(path.join(vdir, 'lib', 'client.js'), 'OLD-BUNDLE');
@@ -572,7 +596,7 @@ t('默认插件 v2 (R26)：vendor 内容更新 → 已装副本自动刷新（�
     assert.strictEqual(JSON.parse(fs.readFileSync(path.join(installed, 'package.json'), 'utf8')).version, '9.9.9', '包元数据应随之刷新');
   } finally {
     if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome;
-    if (prevRes === undefined) delete process.resourcesPath; else process.resourcesPath = prevRes;
+    setResourcesPath(prevRes, prevHadRes);
     fs.rmSync(home, { recursive: true, force: true });
     fs.rmSync(vroot, { recursive: true, force: true });
   }
