@@ -73,7 +73,10 @@ function isMockLikeConfig(text) {
   try {
     const cfg = JSON.parse(text);
     const ps = Array.isArray(cfg.providers) ? cfg.providers : [];
-    if (ps.length === 0) return true;
+    // 审计修复（P2）：空 providers 不能一律判为"模拟配置"。若文件里已有看起来是真实的
+    // 统一网关 Key（程序/用户写入的半成品），就不该被其它来源覆盖——否则刚配好的 key
+    // 会被一次性迁移逻辑悄悄换掉。
+    if (ps.length === 0) return !/"apiKey"\s*:\s*"(?!dsh-gateway-change-me)[^"]{16,}"/.test(text);
     return ps.every((p) => {
       const id = String(p.id || '');
       const url = String(p.baseURL || '');
