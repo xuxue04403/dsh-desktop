@@ -47,21 +47,28 @@ const BUILTIN_SOURCES = [
 // 需要开启（fetch 的 env 代理在进程内即时生效）；代理地址跟随网关配置或默认 7890。
 function ensureProxyEnv() {
   if (process.env.DSH_MARKET_NO_PROXY) return;   // 显式禁用开关
-  if (!process.env.NODE_USE_ENV_PROXY) process.env.NODE_USE_ENV_PROXY = '1';
-  if (!process.env.HTTPS_PROXY) {
-    // 跟随网关的代理配置（data\gateway.config.json 的 proxy 或 7890 默认）
-    try {
-      const cfgPath = process.env.DSH_GATEWAY_CONFIG
-        || path.join(path.dirname(process.execPath), 'data', 'gateway.config.json');
-      if (fs.existsSync(cfgPath)) {
-        const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
-        if (cfg.proxy && cfg.proxy.enabled && cfg.proxy.url) {
-          process.env.HTTPS_PROXY = cfg.proxy.url.includes('://') ? cfg.proxy.url : 'http://' + cfg.proxy.url;
-        }
-      }
-    } catch (_) { /* 忽略 */ }
-    if (!process.env.HTTPS_PROXY) process.env.HTTPS_PROXY = 'http://127.0.0.1:7890';
+  // 已有代理环境变量 → 直接启用 env 代理链路
+  if (process.env.HTTPS_PROXY || process.env.https_proxy) {
+    if (!process.env.NODE_USE_ENV_PROXY) process.env.NODE_USE_ENV_PROXY = '1';
+    return;
   }
+  // 审计修复（P2）：只跟随网关配置里**显式启用**的代理；未配置就直连。
+  // 旧版在没有配置时无条件兜底 http://127.0.0.1:7890——未运行 clash 的机器上所有 fetch
+  // 都变成 ECONNREFUSED（表现为"市场一直加载失败"），而且该变量是**主进程全局**，
+  // 会连带影响壳内其他 fetch。与网关侧 R25「不再无条件注入 7890」保持一致。
+  try {
+    const cfgPath = process.env.DSH_GATEWAY_CONFIG
+      || path.join(path.dirname(process.execPath), 'data', 'gateway.config.json');
+    if (fs.existsSync(cfgPath)) {
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+      if (cfg.proxy && cfg.proxy.enabled && cfg.proxy.url) {
+        const url = String(cfg.proxy.url);
+        process.env.HTTPS_PROXY = url.includes('://') ? url : 'http://' + url;
+        process.env.HTTP_PROXY = process.env.HTTPS_PROXY;
+        process.env.NODE_USE_ENV_PROXY = '1';
+      }
+    }
+  } catch (_) { /* 忽略：直连 */ }
 }
 
 async function httpsGetJson(url, timeoutMs = 15000) {
@@ -353,12 +360,28 @@ class MarketOps {
     });
   }
 
-  install(pkgName, onLine) {
-    return this._run(['plugin', '--profile', 'web', 'add', pkgName], onLine);
+  // 审计修复（P1，安全）：包名在写进 broker .cmd 之前必须校验。旧版直接把渲染层传来的
+  // 字符串引号包裹后拼进 cmd 脚本——含 `"`/`&` 的名字可越出引号执行任意命令
+  // （市场条目路径虽已校验，但 IPC 是公共入口：主窗口/被注入脚本可直接调用）。
+  // 内部默认插件走的是 `file:vendor/...` 规格，仅当调用方显式 allowFile 时放行，
+  // 且同样限制在无引号/空格/元字符的字符集内。
+  install(pkgName, onLine, opts) {
+    const name = String(pkgName == null ? '' : pkgName).trim();
+    const fileOk = !!(opts && opts.allowFile) && /^file:[A-Za-z0-9._/-]+$/.test(name);
+    if (!isValidNpmName(name) && !fileOk) {
+      this.log('已拒绝安装：非法包规格 ' + JSON.stringify(String(pkgName)));
+      return Promise.resolve({ ok: false, error: 'invalid-name', output: '' });
+    }
+    return this._run(['plugin', '--profile', 'web', 'add', name], onLine);
   }
 
   remove(pkgName, onLine) {
-    return this._run(['plugin', '--profile', 'web', 'remove', pkgName], onLine);
+    const name = String(pkgName == null ? '' : pkgName).trim();
+    if (!isValidNpmName(name)) {
+      this.log('已拒绝卸载：非法 npm 包名 ' + JSON.stringify(String(pkgName)));
+      return Promise.resolve({ ok: false, error: 'invalid-name', output: '' });
+    }
+    return this._run(['plugin', '--profile', 'web', 'remove', name], onLine);
   }
 }
 
