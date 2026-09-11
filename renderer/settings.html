@@ -32,20 +32,24 @@
     border-radius: 10px; padding: 16px 18px; margin-bottom: 16px;
   }
   .card h2 { font-size: 13px; color: #9aa7bc; font-weight: 600; margin-bottom: 12px; }
-  .hint { font-size: 11px; color: #5f6b7d; margin-top: 4px; line-height: 1.6; }
+  /* 审计修复（P3 无障碍）：原 #5f6b7d 对深底对比度仅 ≈3.4:1，未达 WCAG AA → 提亮到 #8a93a3（≈6:1） */
+  .hint { font-size: 11px; color: #8a93a3; margin-top: 4px; line-height: 1.6; }
   .warn {
     background: #241d0e; border: 1px solid #5a4718; color: #ffcf6e;
     border-radius: 8px; padding: 10px 14px; font-size: 12px; line-height: 1.7; margin-bottom: 16px;
   }
   .warn.hidden { display: none; }
   .foot { margin-top: 8px; display: flex; justify-content: flex-end; gap: 10px; }
+  /* 审计修复（P3 无障碍）：toast 隐藏时用 visibility:hidden 从无障碍树移除（否则读屏会播报过期提示）；
+     显示/隐藏改由 .show 类控制 */
   #toast { position: fixed; right: 24px; bottom: 20px; background: #1f2a1d; border: 1px solid #3a5a35;
     color: #9fe08a; border-radius: 6px; padding: 8px 16px; font-size: 12px; opacity: 0;
-    transition: opacity .25s; pointer-events: none; }
+    visibility: hidden; transition: opacity .25s, visibility .25s; pointer-events: none; }
+  #toast.show { opacity: 1; visibility: visible; }
   /* —— 模型网关：供应商卡片列表（仿 dsh 模型配置页风格）—— */
   .gw-tbl { border: 1px solid #2c3546; border-radius: 8px; overflow: hidden; margin-bottom: 10px; }
   /* 供应商列表：超高时内部滚动（右侧滚动条常显，细窄深色），「＋添加」按钮不被顶走 */
-  #gwRows { max-height: 300px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #3d4a60 transparent; }
+  #gwRows { max-height: 300px; overflow-y: auto; overflow-x: hidden; scrollbar-width: thin; scrollbar-color: #3d4a60 transparent; }
   #gwRows::-webkit-scrollbar { width: 8px; }
   #gwRows::-webkit-scrollbar-track { background: transparent; }
   #gwRows::-webkit-scrollbar-thumb { background: #3d4a60; border-radius: 4px; }
@@ -55,18 +59,26 @@
   #gwLog::-webkit-scrollbar-track { background: transparent; }
   #gwLog::-webkit-scrollbar-thumb { background: #3d4a60; border-radius: 4px; }
   #gwLog::-webkit-scrollbar-thumb:hover { background: #4f5f7a; }
+  /* 审计修复（P3 窄窗溢出）：原 6 列固定轨道（40/130/1fr/56/44/92）在 920px 窗口下
+     URL 列被压到 0 宽、编辑/删除需横向滚动 → 改可收缩网格：可伸缩列用 minmax(0,Nfr)，
+     关键列（ID/URL/模型数/优先级/按钮）保留最小宽度，行与单元格一律 overflow:hidden，
+     文本靠 .mono 的省略号收尾，因此窄窗下只会省略内容、不会撑出横向滚动条。 */
   .gw-row {
-    display: grid; grid-template-columns: 40px 130px minmax(0,1fr) 56px 44px 92px;
+    display: grid;
+    grid-template-columns: 26px minmax(56px, .9fr) minmax(60px, 1.25fr) 44px 28px minmax(84px, auto);
     align-items: center; gap: 8px; padding: 9px 10px; font-size: 12px;
     border-bottom: 1px solid #232b39; cursor: pointer; color: #cdd6e4;
+    overflow: hidden;
   }
+  .gw-row > * { min-width: 0; }   /* 网格子项默认 min-width:auto 会拒绝收缩，必须显式归零 */
   .gw-row:last-child { border-bottom: none; }
   .gw-row:hover { background: #202a3a; }
   .gw-row.sel { background: #22304a; box-shadow: inset 2px 0 0 #4f8cff; }
   .gw-row .mono { font-family: Consolas, monospace; font-size: 11px; color: #9fb2cc; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
   .gw-row .id { font-weight: 600; color: #e8ecf2; }
-  .gw-row .cnt { color: #8b93a3; text-align: center; white-space: nowrap; }
+  .gw-row .cnt { color: #8b93a3; text-align: center; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
   .gw-row input[type=checkbox] { width: 14px; height: 14px; accent-color: #2b5bd7; cursor: pointer; }
   .gw-row button {
     border: 1px solid rgba(110,130,160,.35); background: rgba(40,48,62,.9); color: #cdd6e4;
@@ -97,9 +109,16 @@
   .gw-right { flex: 1; min-width: 0; }
   .gw-ed { border: 1px solid #2c3546; border-radius: 8px; padding: 12px 14px 4px;
     background: rgba(24,30,40,.55); }
-  .gw-ed .hint-empty { color: #5f6b7d; font-size: 12px; padding: 14px 4px 18px; }
+  .gw-ed .hint-empty { color: #8a93a3; font-size: 12px; padding: 14px 4px 18px; }
   .gw-ed .fields { display: block; }
   .gw-ed .fields.hidden { display: none; }
+  /* 审计修复（P3 窄窗溢出）：≤940px（含 minWidth:920 的最小窗口）时左右两栏改为上下堆叠，
+     供应商表格独占整宽——URL 与「编辑/删除」不再被挤压。必须放在 .gw-wrap/.gw-left 之后，
+     否则被后面的 flex 声明覆盖。 */
+  @media (max-width: 940px) {
+    .gw-wrap { flex-direction: column; }
+    .gw-left, .gw-right { width: 100%; flex: none; }
+  }
 </style>
 </head>
 <body>
@@ -135,7 +154,7 @@
     </div>
     <div class="row">
       <label>端口</label><input type="text" id="gwPort" style="width:90px;" />
-      <span style="color:#5f6b7d;font-size:11px;">改端口后点「保存并重启网关」生效</span>
+      <span style="color:#8a93a3;font-size:11px;">改端口后点「保存并重启网关」生效</span>
     </div>
     <div class="row">
       <label>对外地址</label>
@@ -152,7 +171,7 @@
         <option value="failover">主备（按优先级，故障切换）</option>
         <option value="round-robin">负载均衡（轮询分摊流量）</option>
       </select>
-      <span style="color:#5f6b7d;font-size:11px;">多供应商同模型时生效</span>
+      <span style="color:#8a93a3;font-size:11px;">多供应商同模型时生效</span>
     </div>
     <div class="row">
       <label>客户端仿真</label>
@@ -169,7 +188,7 @@
       <label>网络代理</label>
       <input type="checkbox" id="gwProxyEnabled" title="启用后网关访问上游（如 agentrouter/air-outer 等需代理的供应商）走该代理" />
       <input type="text" id="gwProxyUrl" placeholder="http://127.0.0.1:7890" style="flex:1;" />
-      <span style="color:#5f6b7d;font-size:11px;">访问需代理的上游时启用；留空自动探测本机代理</span>
+      <span style="color:#8a93a3;font-size:11px;">访问需代理的上游时启用；留空自动探测本机代理</span>
     </div>
     <div class="hint">防屏蔽：仿真模式不透传任何 dsh 特征头；熔断（401/403 即断 30 分钟、网络/5xx 连续 3 次断 5 分钟）、catalog 探测 30s 冷却防风暴、上游错误日志自动脱敏。<b>协议联动</b>：「写入 dsh 配置」按此处的仿真选择写入 dsh 协议——Claude Code=Anthropic（/v1/messages），Codex/关闭=OpenAI（/v1/chat/completions）；修改仿真后需重新「写入 dsh 配置」并重启 dsh web。</div>
 
@@ -236,12 +255,12 @@
       <span id="mkStatus" style="color:#8b93a3;font-size:12px;">空闲</span>
     </div>
     <div id="mkList" style="max-height:360px;overflow-y:auto;border:1px solid #2c3546;border-radius:8px;padding:4px;scrollbar-width:thin;scrollbar-color:#3d4a60 transparent;">
-      <div style="color:#5f6b7d;font-size:12px;padding:14px 8px;">点击「搜索/刷新」浏览插件市场。</div>
+      <div style="color:#8a93a3;font-size:12px;padding:14px 8px;">点击「搜索/刷新」浏览插件市场。</div>
     </div>
     <div class="row" style="margin-top:8px;">
       <label>已安装</label>
       <button id="mkInstalledBtn">查看已安装插件</button>
-      <span style="color:#5f6b7d;font-size:11px;">来自 dsh 真实 profile（市场/命令行/手工安装互通）</span>
+      <span style="color:#8a93a3;font-size:11px;">来自 dsh 真实 profile（市场/命令行/手工安装互通）</span>
     </div>
     <div class="hint">安全边界（参考官方 DSH Community Market）：目录源数据仅用于发现——<b>源提供的版本不作为安装目标</b>；一键安装前经 npm registry 校验（同名 + 稳定版本 + 有效 <code>dsh.bundle.patch</code>）；安装/卸载执行标准 <code>dsh plugin add/remove</code> 命令（与手工完全一致，<b>不影响自行安装的插件</b>）；仅浏览型条目（无 npm 包身份）只展示详情。插件改动后需重启 dsh 服务生效。</div>
   </div>
@@ -255,7 +274,7 @@
       <button id="btnCopy">复制命令</button>
     </div>
     <div class="row"><label>启动时检查更新</label><input type="checkbox" id="checkUpdates" />
-      <span style="color:#5f6b7d;font-size:11px;">开启后检测到新版将<b>自动升级</b>（自动停服→npm 全局安装→重启服务）</span></div>
+      <span style="color:#8a93a3;font-size:11px;">开启后检测到新版将<b>自动升级</b>（自动停服→npm 全局安装→重启服务）</span></div>
     <div class="row"><label>安全模式</label>
       <button id="btnExitSafe">退出安全模式并重启</button>
     </div>
@@ -265,40 +284,76 @@
   <div class="foot">
     <button id="btnSave" class="primary">保存设置</button>
   </div>
-  <div id="toast"></div>
+  <!-- 审计修复（P3 无障碍）：role=status + aria-live=polite，提示可被读屏播报 -->
+  <div id="toast" role="status" aria-live="polite"></div>
 
   <script>
     const $ = (id) => document.getElementById(id);
     let current = null;
 
+    // 审计修复（P3 无障碍）：提示原先只改 opacity，元素仍在无障碍树里（读屏会重复播报）；
+    // 改为切 .show 类（CSS 里隐藏态是 visibility:hidden），并复用同一个定时器避免抖动。
     function toast(msg) {
       const t = $('toast');
       t.textContent = msg;
-      t.style.opacity = 1;
-      setTimeout(() => { t.style.opacity = 0; }, 1800);
+      t.classList.add('show');
+      clearTimeout(toast._timer);
+      toast._timer = setTimeout(() => { t.classList.remove('show'); }, 1800);
     }
 
     async function load() {
-      const s = await window.dshApp.getSettings();
-      current = s;
-      $('port').value = s.port;
-      $('workdir').value = s.workDir || '';
-      $('autoStartService').checked = !!s.autoStartService;
-      $('autoStart').checked = !!s.autoStart;
-      $('minimizeToTray').checked = !!s.minimizeToTray;
-      $('autoOpenBrowser').checked = !!s.autoOpenBrowser;
-      $('checkUpdates').checked = !!s.checkUpdates;
-      $('safeWarn').classList.toggle('hidden', !s.safeMode);
-      $('btnExitSafe').style.display = s.safeMode ? '' : 'none';
-
-      const v = await window.dshApp.getVersions();
-      $('versions').textContent = v.local ? ('v' + v.local) : '未检测到本机 dsh';
-      if (v.update) {
-        $('upgradeRow').style.display = '';
-        $('upgradeCmd').textContent = v.update.command;
+      // 审计修复（P1）：整段入口加 try/catch——旧版任一 IPC 抛错（如离线时 getVersions
+      // 走 registry 超时/失败）都会让后面的语句全部不执行，界面停在半初始化状态且无提示。
+      try {
+        const s = await window.dshApp.getSettings();
+        current = s;
+        $('port').value = s.port;
+        $('workdir').value = s.workDir || '';
+        $('autoStartService').checked = !!s.autoStartService;
+        $('autoStart').checked = !!s.autoStart;
+        $('minimizeToTray').checked = !!s.minimizeToTray;
+        $('autoOpenBrowser').checked = !!s.autoOpenBrowser;
+        $('checkUpdates').checked = !!s.checkUpdates;
+        $('safeWarn').classList.toggle('hidden', !s.safeMode);
+        $('btnExitSafe').style.display = s.safeMode ? '' : 'none';
+      } catch (e) {
+        toast('读取设置失败：' + (e && e.message ? e.message : e));
+      }
+      try {
+        const v = await window.dshApp.getVersions();
+        $('versions').textContent = v.local ? ('v' + v.local) : '未检测到本机 dsh';
+        if (v.update) {
+          $('upgradeRow').style.display = '';
+          $('upgradeCmd').textContent = v.update.command;
+        }
+      } catch (e) {
+        $('versions').textContent = '版本检查失败（可稍后重试）';
       }
       gwLoad();
     }
+
+    // 审计修复（P2）：「退出安全模式」完成后只刷新安全模式横幅与按钮（轻量刷新，
+    // 不重跑版本检查/网关加载）。
+    async function refreshSafeMode() {
+      try {
+        const s = await window.dshApp.getSettings();
+        if (!s || s.ok === false) throw new Error((s && s.error) || '未知错误');
+        current = s;
+        $('safeWarn').classList.toggle('hidden', !s.safeMode);
+        $('btnExitSafe').style.display = s.safeMode ? '' : 'none';
+      } catch (e) {
+        toast('读取设置失败：' + (e && e.message ? e.message : e));
+      }
+    }
+
+    // 安全模式横幅跟随主进程状态推送（其它入口进入/退出安全模式时也能同步）
+    try {
+      window.dshApp.onState((snap) => {
+        if (!snap || typeof snap.safeMode !== 'boolean') return;
+        $('safeWarn').classList.toggle('hidden', !snap.safeMode);
+        $('btnExitSafe').style.display = snap.safeMode ? '' : 'none';
+      });
+    } catch (_) { /* 旧桥无 onState 时忽略：load() 已会读取一次 */ }
 
     // —— 模型网关 ——
     // 状态（真/假状态）+ 配置数据（表格与 JSON 双向）
@@ -306,13 +361,48 @@
     let gwSel = -1;           // 选中供应商下标
     let gwUpdating = false;   // 表格→JSON 同步防回环
 
+    // 审计修复（P2）：日志框「上次写入的文本」——旧版每 2 秒无条件写 value + 滚到底，
+    // 日志无法阅读/复制/向上滚动。
+    let gwLogText = null;
+
+    // 写日志框：① 内容真的变化才写（未变化不碰 DOM，保留用户的选区与滚动位置）；
+    //           ② 仅当用户本来就在底部时才自动跟随到底（正在向上翻阅时不打断）。
+    function gwSetLog(text) {
+      const t = text || '';
+      if (t === gwLogText) return;
+      const el = $('gwLog');
+      const atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) <= 24;
+      gwLogText = t;
+      el.value = t;
+      if (atBottom) el.scrollTop = el.scrollHeight;
+    }
+
     function gwRender(gs) {
+      gs = gs || {};   // 审计修复：gateway 状态读取失败时旧版会在此抛错，整个加载管线中断
+      gwRenderStatus(gs);
+      gwSetLog(gs.log);
+    }
+
+    // 只刷新状态与按钮（兜底轮询用：不写日志框，避免覆盖用户正在阅读的内容）
+    function gwRenderStatus(gs) {
+      gs = gs || {};
       $('gwStatus').textContent = gs.running ? '● 运行中（:' + gs.port + '）' : '● 已停止';
       $('gwStatus').style.color = gs.running ? '#3ecf8e' : '#8a93a3';
-      $('gwLog').value = gs.log || '';
-      $('gwLog').scrollTop = $('gwLog').scrollHeight;
       $('btnGwStart').disabled = !!gs.running;
       $('btnGwStop').disabled = !gs.running;
+    }
+
+    // 审计修复（P2）：主进程本来就会推送 gw:state（main.js broadcastGw），旧版 preload 桥
+    // 漏了这条订阅，设置页只能 2 秒轮询并反复重置日志框。改为事件驱动状态/日志刷新，
+    // 轮询降级为 10 秒兜底。桥未更新时静默跳过（轮询仍可用）。
+    let gwWired = false;
+    function gwWireEvents() {
+      if (gwWired) return;
+      if (!window.dshApp || typeof window.dshApp.onGwState !== 'function') return;
+      gwWired = true;
+      window.dshApp.onGwState((gs) => {
+        try { gwRender(gs); } catch (_) { /* 单次渲染失败不影响后续推送 */ }
+      });
     }
 
     // 解析配置文本 → gwCfg；失败返回 false
@@ -342,12 +432,15 @@
       (gwCfg ? gwCfg.providers : []).forEach((p, i) => {
         const row = document.createElement('div');
         row.className = 'gw-row' + (i === gwSel ? ' sel' : '');
-        const models = (p.models || []).join(', ');
+        // 审计修复（P1）：models 在高级 JSON 里常被写成字符串（"models":"glm-4.6"）——
+        // 旧版直接 .join(', ') 会抛 TypeError：列表空白、加载管线中断、状态/日志永久冻结。
+        const modelList = Array.isArray(p.models) ? p.models : (p.models == null ? [] : [p.models]);
+        const models = modelList.join(', ');
         row.innerHTML =
           '<span><input type="checkbox" ' + (p.enabled === false ? '' : 'checked') + ' title="启用"></span>' +
           '<span class="mono id" title="' + esc(p.id || '') + '">' + esc(p.id || '（未命名）') + '</span>' +
           '<span class="mono" title="' + esc(p.baseURL || '') + '">' + esc(p.baseURL || '—') + '</span>' +
-          '<span class="cnt" title="' + esc(models) + '">' + (p.models || []).length + ' 模型</span>' +
+          '<span class="cnt" title="' + esc(models) + '">' + modelList.length + ' 模型</span>' +
           '<span class="cnt">P' + esc(String(p.priority || 1)) + '</span>' +
           '<span><button data-i="' + i + '" data-act="edit">编辑</button> <button data-i="' + i + '" data-act="del">删除</button></span>';
         row.querySelector('input[type=checkbox]').onchange = (e) => {
@@ -378,8 +471,11 @@
     }
 
     function esc(s) {
+      // 审计修复（P3）：补单引号转义——现有调用点都安全，但属性值里若改用单引号包裹
+      // （或将来拼接进 onclick 等）就会越出属性，转义后从根上免疫。
       return String(s == null ? '' : s)
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
     function gwOpenEditor(i) {
@@ -389,7 +485,7 @@
       $('eId').value = p.id || '';
       $('eUrl').value = p.baseURL || '';
       $('eKey').value = p.apiKey || '';
-      $('eModels').value = (p.models || []).join(', ');
+      $('eModels').value = (Array.isArray(p.models) ? p.models : (p.models == null ? [] : [p.models])).join(', ');
       $('ePriority').value = p.priority || 1;
       $('eEnabled').checked = p.enabled !== false;
       $('gwEditorEmpty').style.display = 'none';
@@ -473,27 +569,39 @@
     });
 
     async function gwLoad() {
-      const gs = await window.dshApp.gwState();
-      // 端口兜底：后端未返回时用 3091（dsh-app 网关约定端口），避免显示 undefined
-      $('gwPort').value = (gs && gs.port > 0) ? gs.port : 3091;
-      gwRender(gs);
-      const c = await window.dshApp.gwAction('get-config');
-      if (c && c.text) {
-        $('gwConfig').value = c.text;
-        if (gwParse()) { gwRenderRows(); gwFillOverview(); }
+      gwWireEvents();   // 订阅 gw:state（事件是状态/日志的主通道）
+      try {
+        const gs = await window.dshApp.gwState();
+        // 端口兜底：后端未返回时用 3091（dsh-app 网关约定端口），避免显示 undefined
+        $('gwPort').value = (gs && gs.port > 0) ? gs.port : 3091;
+        gwRender(gs);
+        const c = await window.dshApp.gwAction('get-config');
+        if (c && c.text) {
+          $('gwConfig').value = c.text;
+          if (gwParse()) { gwRenderRows(); gwFillOverview(); }
+        }
+      } catch (e) {
+        // 审计修复（P2）：旧版此处无兜底，IPC 抛错会中断调用方（如保存后的刷新）
+        toast('读取网关状态失败：' + (e && e.message ? e.message : e));
       }
-      // 轮询日志与状态（设置窗口打开期间）
+      // 兜底轮询（审计修复 P2）：间隔由 2 秒放宽到 10 秒，且只刷状态——日志框由
+      // gw:state 事件与上面的 gwLoad 更新，轮询不再覆盖用户正在阅读的日志。
       clearInterval(window.__gwTimer);
       window.__gwTimer = setInterval(async () => {
-        const s = await window.dshApp.gwState();
-        gwRender(s);
-      }, 2000);
+        try {
+          const s = await window.dshApp.gwState();
+          gwRenderStatus(s);
+        } catch (_) { /* 忽略：事件推送仍是主通道 */ }
+      }, 10000);
     }
 
-    // 高级 JSON 区手工编辑 → 同步表格（防回环）
+    // 高级 JSON 区手工编辑 → 同步表格 + **回填总览控件**
+    // 审计修复（P1）：旧版只重画表格，而保存时用总览控件的值覆盖 port/apiKey/routing/
+    // clientProfile/clientUA/proxy —— 用户按页面提示改的 JSON 会被静默回滚
+    // （复现：JSON 里把 port 改成 4000 → 保存 → 落盘仍是原值）。
     $('gwConfig').addEventListener('input', () => {
       if (gwUpdating) return;
-      if (gwParse()) { gwSel = -1; gwRenderRows(); }
+      if (gwParse()) { gwSel = -1; gwRenderRows(); gwFillOverview(); }
     });
 
     $('btnGwStart').onclick = async () => { await window.dshApp.gwAction('start'); await gwLoad(); };
@@ -606,10 +714,10 @@
       info.style.cssText = 'flex:1;min-width:0;';
       info.innerHTML =
         '<div style="font-weight:600;color:#e8ecf2;">' + esc(item.displayName || item.name) +
-        (item.version ? ' <span style="color:#5f6b7d;font-weight:400;">v' + esc(item.version) + '（源版本，仅供参考）</span>' : '') +
+        (item.version ? ' <span style="color:#8a93a3;font-weight:400;">v' + esc(item.version) + '（源版本，仅供参考）</span>' : '') +
         (installed ? ' <span style="color:#3ecf8e;">✓ 已安装</span>' : '') + '</div>' +
         '<div style="color:#9aa7bc;margin:2px 0;">' + esc(item.summary || '（无描述）') + '</div>' +
-        '<div style="color:#5f6b7d;font-size:11px;">' +
+        '<div style="color:#8a93a3;font-size:11px;">' +
         (item.pkg ? 'npm: <span style="font-family:Consolas;color:#9fb2cc;">' + esc(item.pkg) + '</span>' : '仅浏览（无 npm 包身份）') +
         (item.author ? ' · ' + esc(item.author) : '') +
         (item.homepage ? ' · <a href="#" class="mk-home" style="color:#4f8cff;">主页</a>' : '') + '</div>';
@@ -621,12 +729,19 @@
         btn.onclick = () => mkInstall(item.pkg, item.displayName || item.name);
         row.appendChild(btn);
       }
-      if (item.pkg && installed) {
+      if (item.pkg && installed && !item.core) {
         const btn = document.createElement('button');
         btn.textContent = '卸载';
         btn.style.cssText = 'white-space:nowrap;';
         btn.onclick = () => mkRemove(item.pkg);
         row.appendChild(btn);
+      } else if (item.core) {
+        // 审计修复（P2）：核心 bundle（@deepseek-ai/dsh-base 等）不得从 UI 卸载——
+        // 旧版对全部 dependencies 都渲染「卸载」，误点会让 dsh 直接起不来。
+        const tag = document.createElement('span');
+        tag.textContent = '核心组件';
+        tag.style.cssText = 'color:#8a93a3;font-size:11px;white-space:nowrap;';
+        row.appendChild(tag);
       }
       const home = info.querySelector('.mk-home');
       if (home) home.onclick = (e) => { e.preventDefault(); window.open(item.homepage, '_blank'); };
@@ -638,6 +753,11 @@
       mkLoading = true;
       $('mkStatus').textContent = '加载中…';
       const list = $('mkList');
+      // 审计修复（P1）：清空判断必须基于**请求前**的游标（是否首页）。
+      // 旧版在拿到响应、把 mkCursor 覆盖成 nextCursor 之后才判断 `mkCursor === ''`，
+      // 该条件对默认源（必返回 nextCursor）永远不成立 → 首屏静态占位文案不消失，
+      // 「刷新 / 搜索 / 安装卸载后重载」都会把整页结果重复追加一份。
+      const isFirstPage = mkCursor === '';
       const inst = await window.dshApp.mkInstalled().catch(() => null);
       const installedSet = new Set((inst && inst.plugins || []).map((p) => p.name));
       const r = await window.dshApp.mkDiscover({ q: q || '', cursor: mkCursor, limit: 50 }).catch(() => null);
@@ -648,11 +768,9 @@
       }
       mkCursor = r.nextCursor || '';
       $('mkStatus').textContent = '已加载 ' + r.items.length + ' 个插件' + (mkCursor ? '（可再次搜索加载更多）' : '（已到末页）');
-      if (!q && mkCursor === '' && list.dataset.fresh !== '1') list.innerHTML = '';
-      else if (q) list.innerHTML = '';
-      list.dataset.fresh = '1';
+      if (isFirstPage) list.innerHTML = '';
       for (const item of r.items) list.appendChild(mkRow(item, installedSet));
-      if (!r.items.length) list.innerHTML = '<div style="color:#5f6b7d;font-size:12px;padding:14px 8px;">无匹配结果。</div>';
+      if (!r.items.length) list.innerHTML = '<div style="color:#8a93a3;font-size:12px;padding:14px 8px;">无匹配结果。</div>';
     }
 
     async function mkInstall(pkg, label) {
@@ -704,10 +822,12 @@
       list.innerHTML = '';
       const set = new Set((r.plugins || []).map((p) => p.name));
       for (const p of r.plugins) {
-        const item = { pkg: p.name, name: p.name, displayName: p.name, summary: (p.isBundle ? 'dsh bundle 插件' : '直接依赖') + ' @ ' + (p.version || '?'), version: p.version };
+        const item = { pkg: p.name, name: p.name, displayName: p.name, summary: (p.isBundle ? 'dsh bundle 插件' : '直接依赖') + ' @ ' + (p.version || '?'), version: p.version,
+          // 核心包（@deepseek-ai/*）只读展示：卸掉 dsh 本体 = 服务起不来
+          core: /^@deepseek-ai\//.test(p.name) };
         list.appendChild(mkRow(item, set));
       }
-      if (!r.plugins.length) list.innerHTML = '<div style="color:#5f6b7d;font-size:12px;padding:14px 8px;">profile（' + esc(r.profile) + '）暂无已安装插件。</div>';
+      if (!r.plugins.length) list.innerHTML = '<div style="color:#8a93a3;font-size:12px;padding:14px 8px;">profile（' + esc(r.profile) + '）暂无已安装插件。</div>';
       $('mkStatus').textContent = '已安装视图：profile ' + r.profile + '（' + r.plugins.length + ' 个）';
     };
 
@@ -721,9 +841,21 @@
       setTimeout(() => { el.style.boxShadow = old; }, 1600);
     });
 
+    // 审计修复（P2）：端口校验助手——只有 1..65535 的纯数字才返回数字，否则 null。
+    // 旧版 `parseInt(...) || 3080` 会把 0/abc 静默落成 3080，而输入框仍显示用户原文，
+    // UI 与实际落盘值不一致。
+    function readPortInput() {
+      const raw = $('port').value.trim();
+      const n = /^\d+$/.test(raw) ? parseInt(raw, 10) : NaN;
+      return (n >= 1 && n <= 65535) ? n : null;
+    }
+
     $('btnSave').onclick = async () => {
+      const btn = $('btnSave');
+      if (btn.disabled) return;   // 防连点重复保存
+      btn.disabled = true;
+      const port = readPortInput();
       const patch = {
-        port: parseInt($('port').value, 10) || 3080,
         workDir: $('workdir').value.trim(),
         autoStartService: $('autoStartService').checked,
         autoStart: $('autoStart').checked,
@@ -731,8 +863,23 @@
         autoOpenBrowser: $('autoOpenBrowser').checked,
         checkUpdates: $('checkUpdates').checked,
       };
-      await window.dshApp.saveSettings(patch);
-      toast('设置已保存');
+      // 端口合法才提交；非法时不提交 port（保留已生效端口），改用返回值回写输入框
+      if (port !== null) patch.port = port;
+      try {
+        const saved = await window.dshApp.saveSettings(patch);
+        // 来源守卫拒绝时返回 {ok:false,error}（不是抛错）→ 显式当失败处理，避免"假成功"
+        if (saved && saved.ok === false) throw new Error(saved.error || '未知错误');
+        if (saved) current = saved;
+        // 审计修复（P2）：用**实际生效值**回写输入框（saveSettings 返回 settings.data）
+        const eff = (saved && saved.port) || (current && current.port) || 3080;
+        $('port').value = eff;
+        toast(port === null
+          ? '端口需为 1–65535 的整数，已按实际生效值 ' + eff + ' 处理'
+          : '设置已保存');
+      } catch (e) {
+        toast('保存失败：' + (e && e.message ? e.message : e));
+      }
+      btn.disabled = false;
     };
 
     $('btnBrowse').onclick = async () => {
@@ -764,7 +911,29 @@
       btn.textContent = '立即升级';
       load();   // 刷新版本显示
     };
-    $('btnExitSafe').onclick = () => window.dshApp.action('exit-safe');
+    // 审计修复（P2）：退出安全模式——旧版不 await/不禁用/无结果提示，连点会触发两次重启。
+    // 现在：执行中禁用并改文案；成功/失败都给 toast；完成后刷新安全模式横幅（安全模式已清）。
+    $('btnExitSafe').onclick = async () => {
+      const btn = $('btnExitSafe');
+      if (btn.disabled) return;
+      const old = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '退出中…';
+      try {
+        const r = await window.dshApp.action('exit-safe');
+        if (r && r.ok === false) {
+          // 主进程来源守卫等拒绝：给出可见原因（旧版会被当成成功静默吞掉）
+          toast('退出安全模式失败：' + (r.error || '未知原因'));
+        } else {
+          toast('已退出安全模式，正在重启 dsh 服务…');
+        }
+      } catch (e) {
+        toast('退出安全模式失败：' + (e && e.message ? e.message : e));
+      }
+      btn.textContent = old;
+      btn.disabled = false;
+      refreshSafeMode();   // 重新读取设置，刷新横幅与按钮显隐
+    };
 
     load();
   </script>
