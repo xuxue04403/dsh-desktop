@@ -9,7 +9,7 @@
 //   默认：node_modules/electron/dist/electron.exe → src/assets/electron-icon.ico + .png
 'use strict';
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -98,11 +98,16 @@ export function extractExeIcon(buf) {
       const l2 = parseResourceTree(buf, sections, childRva(resRva, typeEntry.data));
       if (!l2) continue;
       for (const idEntry of l2.entries) {
+        // 审计修复（P2）：命名资源项的 name 字段**最高位为 1**（指向字符串表），
+        // 直接拿 idEntry.name 去和组条目里的 16 位 iconId 比较永远匹配不上
+        // （RT_ICON 常见为纯数字 id，但 electron.exe 等 PE 里可能是命名项）。
+        // 这里统一规范成「数值 id（清掉 0x80000000 高位）+ named 标记」。
+        const resId = idEntry.isNamed ? null : (idEntry.name & 0x7fffffff);
         const l3 = parseResourceTree(buf, sections, childRva(resRva, idEntry.data));
         if (!l3) continue;
         for (const lang of l3.entries) {
           const payload = dataEntryPayload(buf, sections, resRva, lang.data);
-          if (payload) groups.push({ kind, id: idEntry.isNamed ? idEntry.name : idEntry.name, payload });
+          if (payload) groups.push({ kind, id: resId, named: idEntry.isNamed, payload });
         }
       }
     }
@@ -122,7 +127,7 @@ export function extractExeIcon(buf) {
     const bitCount = grp.payload.readUInt16LE(m + 6);
     const byteSize = grp.payload.readUInt32LE(m + 8);
     const iconId = grp.payload.readUInt16LE(m + 12);
-    const blob = groups.find((g) => g.kind === 'icon' && g.id === iconId);
+    const blob = groups.find((g) => g.kind === 'icon' && !g.named && g.id === iconId);
     if (!blob || blob.payload.length < byteSize) continue;
     members.push({ width, height, colors, planes, bitCount, data: blob.payload.subarray(0, byteSize) });
   }
@@ -153,8 +158,23 @@ export function extractExeIcon(buf) {
   return { ico: icoBuf, png: pngMember ? pngMember.data : null, members };
 }
 
+// CLI 入口判定（审计修复 P2）：必须大小写不敏感 + realpath 归一。
+// Windows 路径大小写不敏感，以小写盘符调用（node d:\ide\dsh\dsh-app\scripts\extract-exe-icon.mjs）
+// 时旧比较为 false → 脚本什么都不做却 exit 0（静默失败）。extract-exe-icon.mjs 与
+// email-scrub.mjs 各自内联这份判定：email-scrub.mjs 会被单独复制到隔离目录跑
+// fail-closed 用例，保持自包含（不引入共享模块依赖）。
+function isCliEntry(argv1, moduleUrl) {
+  if (!argv1) return false;
+  const canon = (p) => {
+    let r = p;
+    try { r = realpathSync(p); } catch { /* 路径不存在时退回原值 */ }
+    return path.resolve(r).toLowerCase();
+  };
+  try { return canon(argv1) === canon(fileURLToPath(moduleUrl)); } catch { return false; }
+}
+
 // 直接运行：提取并把结果写入目标
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isCliEntry(process.argv[1], import.meta.url)) {
   const buf = readFileSync(exePath);
   const { ico, png } = extractExeIcon(buf);
   mkdirSync(path.dirname(outIco), { recursive: true });
