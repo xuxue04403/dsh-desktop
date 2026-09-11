@@ -18,6 +18,8 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+// 可移植性修复（2026-09-11）：cmd.exe 解析不再依赖 process.env.ComSpec（克隆机上常失效）
+const { resolveCmdExe } = require('./winutil');
 
 // ---------------- 源 ----------------
 // 默认源：dshfind（官方 market 的合作源；标准 provider page 契约 /market/v1/plugins，
@@ -322,41 +324,66 @@ class MarketOps {
         resolve({ ok: false, error: 'timeout', output: '' });
       }, TIMEOUT_MS);
       const finish = (value) => { clearTimeout(timer); resolve(value); };
+      // 直接执行（无 cmd 宿主）：broker 不可用/失败时回退——功能等价，见 launcher 同名逻辑
+      const spawnDirect = () => spawn(nodePath, ['--expose-internals', this.dshBin].concat(argv), {
+        windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env,
+      });
       if (process.platform === 'win32' && this.nodeInfo && this.nodeInfo.embedded && this.dshBin) {
         // cmd broker：隐藏控制台宿主（v1.5.17e 同款）——dsh plugin 的子进程不弹窗
-        try {
-          const dir = this._brokerDir();
-          fs.mkdirSync(dir, { recursive: true });
-          const broker = path.join(dir, 'plugin-op.cmd');
-          fs.writeFileSync(broker, [
-            '@echo off',
-            'setlocal DisableDelayedExpansion',
-            'set "ELECTRON_RUN_AS_NODE=1"',
-            `"${process.execPath}" --expose-internals "${this.dshBin}" ${argv.map((a) => '"' + a + '"').join(' ')}`,
-            'exit /b %errorlevel%',
-            '',
-          ].join('\r\n'), 'utf8');
-          child = spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', broker], {
-            windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env,
-          });
-        } catch (_) {
-          child = spawn(nodePath, ['--expose-internals', this.dshBin].concat(argv), {
-            windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env,
-          });
+        // 可移植性修复（2026-09-11）：cmd 路径须经 resolveCmdExe（ComSpec 在克隆机上常失效）
+        const cmdExe = resolveCmdExe();
+        if (!cmdExe) {
+          this.log('未找到可用的 cmd.exe（ComSpec/SystemRoot 均无效）→ 跳过隐藏控制台宿主，直接执行');
+          child = spawnDirect();
+        } else {
+          try {
+            const dir = this._brokerDir();
+            fs.mkdirSync(dir, { recursive: true });
+            const broker = path.join(dir, 'plugin-op.cmd');
+            fs.writeFileSync(broker, [
+              '@echo off',
+              'setlocal DisableDelayedExpansion',
+              'set "ELECTRON_RUN_AS_NODE=1"',
+              `"${process.execPath}" --expose-internals "${this.dshBin}" ${argv.map((a) => '"' + a + '"').join(' ')}`,
+              'exit /b %errorlevel%',
+              '',
+            ].join('\r\n'), 'utf8');
+            child = spawn(cmdExe, ['/d', '/s', '/c', broker], {
+              windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env,
+            });
+            child.__viaBroker = true;
+          } catch (_) {
+            child = spawnDirect();
+          }
         }
       } else if (this.dshBin) {
-        child = spawn(nodePath, ['--expose-internals', this.dshBin].concat(argv), {
-          windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env,
-        });
+        child = spawnDirect();
       } else {
         finish({ ok: false, error: 'dsh-not-found' });
         return;
       }
       let out = '';
-      if (child.stdout) child.stdout.on('data', (c) => { const t = c.toString('utf8'); out += t; if (onLine) onLine(t.trimEnd()); });
-      if (child.stderr) child.stderr.on('data', (c) => { const t = c.toString('utf8'); out += t; if (onLine) onLine(t.trimEnd()); });
-      child.on('error', (e) => finish({ ok: false, error: e.message, output: out }));
-      child.on('exit', (code) => finish({ ok: code === 0, code, output: out }));
+      let fellBack = false;   // broker 失败只回退一次，避免死循环
+      const wire = (c) => {
+        if (c.stdout) c.stdout.on('data', (d) => { const t = d.toString('utf8'); out += t; if (onLine) onLine(t.trimEnd()); });
+        if (c.stderr) c.stderr.on('data', (d) => { const t = d.toString('utf8'); out += t; if (onLine) onLine(t.trimEnd()); });
+        c.on('exit', (code) => finish({ ok: code === 0, code, output: out }));
+        c.on('error', (e) => {
+          // 可移植性修复（2026-09-11）：spawn ENOENT 是异步 error（try/catch 抓不到）。
+          // broker 拉不起来时必须回退直接执行，否则插件安装/卸载在这类机器上永远失败。
+          if (c.__viaBroker && !fellBack) {
+            fellBack = true;
+            this.log('cmd broker 启动失败（' + e.message + '），回退为直接执行');
+            try { c.removeAllListeners('error'); c.removeAllListeners('exit'); } catch (_) { /* 忽略 */ }
+            const d = spawnDirect();
+            child = d;
+            wire(d);
+            return;
+          }
+          finish({ ok: false, error: e.message, output: out });
+        });
+      };
+      wire(child);
     });
   }
 
