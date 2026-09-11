@@ -12,6 +12,11 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const { EventEmitter } = require('events');
+// 可移植性修复（2026-09-11）：cmd.exe 解析不再依赖 process.env.ComSpec（克隆机的该变量
+// 常残留旧系统盘路径 → spawn ENOENT → dsh 起不来）
+const { resolveCmdExe, comSpecIsStale } = require('./winutil');
+// 同上：workDir 可能来自另一台电脑（settings.json 随目录复制）→ cwd 无效同样 ENOENT
+const { workDirOrHome } = require('./paths');
 
 // dsh web 的 stdout 就绪行
 const REGEX_URL_LINE = /dsh web:\s*(https?:\/\/[^\s\)]+)/;
@@ -339,6 +344,15 @@ class Launcher extends EventEmitter {
     }
   }
 
+  // 可移植性修复（2026-09-11）：spawn 用的 cwd 必须是**本机真实存在**的目录。
+  // settings.json 随绿色目录复制过来时 workDir 可能是旧机器的绝对路径
+  // （C:\Users\旧用户名）——cwd 无效会让 spawn 异步报 ENOENT，用户只看到空白窗口。
+  safeWorkDir() {
+    return workDirOrHome(this.workDir, (bad, home) => {
+      this.log('工作目录不可用（' + bad + '，可能来自其它电脑）→ 改用 ' + home);
+    });
+  }
+
   // dsh 便携安装前缀（内嵌运行时方案）：<data>\node-global —— npm --prefix 安装位置，
   // 绿色随程序目录走，升级即同前缀重装。dsh 配置/会话在 ~/.dsh 不受影响。
   portablePrefix() {
@@ -533,6 +547,18 @@ class Launcher extends EventEmitter {
     // node 模式）与系统 node 均支持该参数，固定带上。
     const nodeArgs = ['--expose-internals', target.bin].concat(args);
 
+    // 直接启动（无 cmd 宿主）：broker 不可用/失败时走这里——功能等价，只是少了
+    // "隐藏控制台宿主"这一层（dsh 内部的 pwsh/cmd 工具在极端情况下可能自行弹窗）。
+    const spawnDirect = () => {
+      this.log('启动 dsh ' + target.version + ' → ' + this.nodePath + ' ' + nodeArgs.join(' '));
+      this.proc = spawn(this.nodePath, nodeArgs, {
+        cwd: this.safeWorkDir(), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: spawnEnv,
+      });
+      this.running = true;
+      this._wireProc();
+      return true;
+    };
+
     // v1.5.17e（学官方 dsh-desktop 的 launch broker）：Windows 内嵌模式下，DSH-App.exe
     // 是 GUI 子系统——它直接 spawn 的控制台程序（dsh 内部的 pwsh/cmd 工具）会各自新建
     // 可见控制台窗口（"执行脚本弹黑窗"）。解法：经 cmd.exe（控制台子系统）作宿主——
@@ -540,6 +566,17 @@ class Launcher extends EventEmitter {
     // 隐藏控制台（孙进程继承，不再弹窗）。broker 是生成的 cmd 脚本（路径全部引号包裹，
     // 无转义问题），stdout 仍走 pipe 供 URL 行解析。
     if (process.platform === 'win32' && this.nodeInfo && this.nodeInfo.embedded) {
+      // 可移植性修复（2026-09-11，真实故障）：旧版直接用 process.env.ComSpec——克隆/迁移过的
+      // Windows 上该变量常残留旧系统盘路径（系统装在 D:\Windows，ComSpec 仍指向
+      // C:\WINDOWS\system32\cmd.exe）→ spawn ENOENT，dsh 永远起不来（表现为双击后只有空白窗口）。
+      const cmdExe = resolveCmdExe();
+      if (!cmdExe) {
+        this.log('未找到可用的 cmd.exe（ComSpec/SystemRoot 均无效）→ 跳过隐藏控制台宿主，直接启动 dsh');
+        return spawnDirect();
+      }
+      if (comSpecIsStale()) {
+        this.log('注意：环境变量 ComSpec 指向不存在的路径（' + process.env.ComSpec + '），已改用 ' + cmdExe);
+      }
       try {
         const dataDir = path.dirname(this.portablePrefix());
         const brokerDir = path.join(dataDir, 'broker');
@@ -560,10 +597,29 @@ class Launcher extends EventEmitter {
         this.log('启动 dsh ' + target.version + '（cmd broker 隐藏控制台）→ ' + nodeArgs.join(' '));
         // cmd /d/s/c：禁用 AutoRun、按字符串解析、执行后退出。
         // 注意 broker 内已含 exe/参数（无转义问题），此处 args 不再传。
-        this.proc = spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', broker], {
-          cwd: this.workDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: spawnEnv,
+        this.proc = spawn(cmdExe, ['/d', '/s', '/c', broker], {
+          cwd: this.safeWorkDir(), windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: spawnEnv,
         });
         this.running = true;
+        // 可移植性修复（2026-09-11，真实故障根因）：spawn 的 ENOENT **不会同步抛错**，
+        // 只能异步收到 'error' 事件——旧版的 try/catch 是死代码，于是"回退直接 spawn"永远
+        // 不执行，用户看到的就是"双击只弹空白窗口、日志里一句 ENOENT"。
+        // 这里显式监听首个 error：只要 broker 没能真正跑起来，就立刻改走直接启动。
+        const p = this.proc;
+        let recovered = false;
+        p.once('error', (err) => {
+          if (recovered || this.proc !== p) return;
+          recovered = true;
+          this.log('cmd broker 启动失败（' + (err && err.message ? err.message : err) + '），回退为直接启动 dsh…');
+          try { p.removeAllListeners('error'); p.removeAllListeners('exit'); } catch (_) { /* 忽略 */ }
+          this.proc = null;
+          this.running = false;
+          try {
+            spawnDirect();
+          } catch (e2) {
+            this.emit('error', e2);
+          }
+        });
         this._wireProc();
         return true;
       } catch (e) {
@@ -571,13 +627,7 @@ class Launcher extends EventEmitter {
         // 落到下方常规路径
       }
     }
-    this.log('启动 dsh ' + target.version + ' → ' + this.nodePath + ' ' + nodeArgs.join(' '));
-    this.proc = spawn(this.nodePath, nodeArgs, {
-      cwd: this.workDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: spawnEnv,
-    });
-    this.running = true;
-    this._wireProc();
-    return true;
+    return spawnDirect();
   }
 
   _wireProc() {
@@ -646,7 +696,7 @@ class Launcher extends EventEmitter {
     if (!this.proc) {
       this.log('未发现本机 dsh，使用 npx 自动下载安装并启动…');
       this.proc = spawn('npx', ['--yes', '@deepseek-ai/dsh'].concat(args), {
-        cwd: this.workDir, windowsHide: true, shell: true, stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: this.safeWorkDir(), windowsHide: true, shell: true, stdio: ['ignore', 'pipe', 'pipe'],
       });
       this.running = true;
       this._wireProc();
