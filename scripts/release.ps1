@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Build and publish DSH App to github.com/xuxue04403/dsh-desktop
   (source upload + installer/portable release assets). No git client required.
@@ -123,28 +123,80 @@ if ($LASTEXITCODE -ne 0) { Write-Host '[FAIL] dist.mirror.mjs (NSIS build)'; exi
 
 # portable zip for release asset（从 build 输出的实际绿色目录打包；文件名用 ASCII，避免 PS5.1 编码问题）
 # 安全（R15）：发布 zip 必须剔除 data\（用户运行数据含真实供应商 key——绝不外发）。
-# 做法先把 data\ 移到临时位置，打包后还原（build-portable 的 R13 数据保留在本机不受影响）。
+# 审计修复（P2）：排除名单补齐**运行期生成物**——node.exe（launcher 在 exe 旁做的内嵌
+# 运行时硬链接，最大 246MB）、logs\、*.log、*.tmp。
+# 做法：根级 data\/logs\ 用「临时移出 + 打包后还原」精确排除——tar 的 --exclude 按
+# basename 匹配任意层级（实测：--exclude data 会连 resources\...\node-gyp\gyp\data 一起
+# 剔掉），移出根目录既精确又不动第三方包的 data\；node.exe / *.log / *.tmp 交给 tar
+# --exclude（按名字匹配任意层级正是我们要的）。无 tar 时回退 Compress-Archive（排除
+# 仅覆盖顶层条目，嵌套 *.log 会被打进包）。
 $zipOut = Join-Path $root 'dist'
 $zipPath = Join-Path $zipOut ("DSHApp-" + $Version.Substring(1) + "-Portable.zip")
+if (-not (Test-Path $zipOut)) { New-Item -ItemType Directory -Path $zipOut -Force | Out-Null }
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 if (-not (Test-Path (Join-Path $greenDir 'DSH-App.exe'))) {
     Write-Host "[FAIL] green dir missing exe: $greenDir"
     exit 1
 }
-$dataDir = Join-Path $greenDir 'data'
+
+# tar 解析顺序（审计修复：不再硬编码 C:\Windows\System32\tar.exe）：DSH_TAR → PATH → System32
+$tarExe = $null
+if ($env:DSH_TAR -and (Test-Path $env:DSH_TAR)) { $tarExe = $env:DSH_TAR }
+if (-not $tarExe) {
+    $tarCmd = Get-Command tar -ErrorAction SilentlyContinue
+    if ($tarCmd) { $tarExe = $tarCmd.Source }
+}
+if (-not $tarExe) {
+    $tarSys = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (Test-Path $tarSys) { $tarExe = $tarSys }
+}
+
+# 根级 data\/logs\ 临时移出（打包后**一定**还原：finally 覆盖失败路径；
+# 注意不能在 try 内 exit——PowerShell 的 exit 不展开 finally，数据会留在 stash）
 $dataStash = Join-Path $root ('out\_data-stash-' + (Get-Date -Format 'yyyyMMddHHmmss'))
-$moved = $false
-if (Test-Path $dataDir) {
-    New-Item -ItemType Directory -Path (Split-Path $dataStash -Parent) -Force | Out-Null
-    Move-Item $dataDir $dataStash -Force
-    $moved = $true
-    Write-Host '[安全] 发布 zip 已剔除 data\（不含任何 key/配置/日志）'
+$stashed = @()
+foreach ($name in @('data', 'logs')) {
+    $p = Join-Path $greenDir $name
+    if (Test-Path $p) {
+        New-Item -ItemType Directory -Path $dataStash -Force | Out-Null
+        $dst = Join-Path $dataStash $name
+        Move-Item $p $dst -Force
+        $stashed += , @($p, $dst)
+    }
 }
+$zipFailed = $false
 try {
-    Compress-Archive -Path (Join-Path $greenDir '*') -DestinationPath $zipPath -CompressionLevel Optimal
+    if ($tarExe) {
+        Write-Host "[..] packing zip (tar: $tarExe; 已移出 data\ logs\，另排除 node.exe *.log *.tmp) ..."
+        $tarArgs = @('-a', '-cf', $zipPath, '-C', $greenDir)
+        foreach ($x in @('node.exe', '*.log', '*.tmp')) { $tarArgs += @('--exclude', $x) }
+        $tarArgs += '.'
+        & $tarExe @tarArgs
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[FAIL] zip packing failed (tar exit=$LASTEXITCODE)"
+            $zipFailed = $true
+        }
+    } else {
+        Write-Host '[警告] 未找到 tar，回退 Compress-Archive（排除仅覆盖顶层条目）' -ForegroundColor Yellow
+        $items = Get-ChildItem $greenDir -Force |
+            Where-Object { $_.Name -notlike '*.log' -and $_.Name -notlike '*.tmp' -and $_.Name -ine 'node.exe' } |
+            ForEach-Object { $_.FullName }
+        if ($items.Count -gt 0) {
+            Compress-Archive -Path $items -DestinationPath $zipPath -CompressionLevel Optimal
+        }
+    }
 } finally {
-    if ($moved) { Move-Item $dataStash $dataDir -Force; Write-Host '[安全] data\ 已还原到绿色目录（本机数据保留）' }
+    foreach ($pair in $stashed) {
+        if (Test-Path $pair[1]) { Move-Item $pair[1] $pair[0] -Force }
+    }
+    if ($stashed.Count -gt 0) { Write-Host '[安全] data\/logs\ 已还原到绿色目录（本机数据保留）' }
+    if (Test-Path $dataStash) { Remove-Item $dataStash -Recurse -Force -ErrorAction SilentlyContinue }
 }
+if ($zipFailed -or -not (Test-Path $zipPath)) {
+    Write-Host "[FAIL] 发布 zip 未生成（tar exit/异常），已中止发布。"
+    exit 1
+}
+Write-Host '[安全] 发布 zip 已剔除 data\ logs\ node.exe *.log *.tmp'
 
 # R27 安全闸门（产物侧）：解包扫描 zip 内容，确认没有真实邮箱信息/密钥被夹带
 if (Test-Path $zipPath) {
@@ -237,7 +289,13 @@ $assets = @{}
 $setupExe = Join-Path $root ("dist\DSHApp-" + $ver + "-x64.exe")
 if (Test-Path $setupExe) { $assets["DSHApp-Setup-" + $ver + "-x64.exe"] = $setupExe } else { Write-Host '[WARN] NSIS setup missing' -ForegroundColor Yellow }
 
-$portableExe = Get-ChildItem (Join-Path $root 'dist') -Filter ("DSHApp-" + $ver + "-便携版.exe") -ErrorAction SilentlyContinue | Select-Object -First 1
+# 便携版产物名已改为纯 ASCII（package.json 的 build.portable.artifactName）：旧名含中文，
+# 在 PS5.1（ACP=936）下 -Filter 会因编码差异静默匹配失败 → 114MB 资产漏传。仍兼容旧名。
+$portableExe = Get-ChildItem (Join-Path $root 'dist') -Filter ("DSHApp-Portable-" + $ver + "-x64.exe") -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $portableExe) {
+    $portableExe = Get-ChildItem (Join-Path $root 'dist') -Filter ("DSHApp-" + $ver + "-*.exe") -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne ("DSHApp-" + $ver + "-x64.exe") } | Select-Object -First 1
+}
 if ($portableExe) { $assets["DSHApp-Portable-" + $ver + "-x64.exe"] = $portableExe.FullName } else { Write-Host '[WARN] portable exe missing' -ForegroundColor Yellow }
 
 if (Test-Path $zipPath) { $assets["DSHApp-Portable-" + $ver + ".zip"] = $zipPath }
