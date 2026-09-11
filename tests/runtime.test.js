@@ -38,6 +38,9 @@ function report(line) {
 const cp = require('child_process');
 const spawnCalls = [];
 const killCalls = [];
+// 失败注入开关（可移植性用例用）：为 true 时，任何以 cmd 启动的"broker"桩进程都会异步
+// 抛出 ENOENT——复现"克隆机 ComSpec 指向不存在的 cmd.exe"这一真实故障。
+let cmdSpawnFails = false;
 function fakeProc(cmd, args) {
   const p = new EventEmitter();
   p.pid = 50000 + spawnCalls.length;
@@ -52,7 +55,14 @@ function fakeProc(cmd, args) {
   p.__args = args || [];
   return p;
 }
-cp.spawn = (cmd, args) => { spawnCalls.push({ cmd, args: args || [] }); return fakeProc(cmd, args); };
+cp.spawn = (cmd, args) => {
+  spawnCalls.push({ cmd, args: args || [] });
+  const p = fakeProc(cmd, args);
+  if (cmdSpawnFails && /cmd(\.exe)?$/i.test(String(cmd))) {
+    setImmediate(() => p.emit('error', Object.assign(new Error('spawn ' + cmd + ' ENOENT'), { code: 'ENOENT' })));
+  }
+  return p;
+};
 cp.spawnSync = () => ({ status: 0, stdout: '', stderr: '' });
 
 const { Launcher } = require(path.join(SRC, 'launcher.js'));
@@ -559,6 +569,337 @@ t('main.js：会话 id 提取有优先级，且用会话库校验、旧历史一
   // vm 里的数组来自另一个 realm，deepStrictEqual 会因原型不同而失败 → 比较 JSON
   assert.strictEqual(JSON.stringify(ctx.__out), JSON.stringify(['session-a', 'session-c', 'child-d', '']),
     'sessionId > agentId > childSessionId，无匹配返回空串；实际 ' + JSON.stringify(ctx.__out));
+});
+
+// ================= 8. 2026-09-11：模型映射（上游真实 ID ↔ 逻辑模型名） =================
+
+t('网关：模型映射解析（modelEntries/upstreamIdFor）覆盖同义字段与脏数据', () => {
+  const src = fs.readFileSync(path.join(SRC, 'gateway', 'model-gateway.mjs'), 'utf8');
+  const grab = (name) => {
+    const start = src.indexOf('function ' + name + '(');
+    assert.ok(start >= 0, '应能定位 ' + name);
+    let depth = 0;
+    for (let i = src.indexOf('{', start); i < src.length; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}') { depth--; if (depth === 0) return src.slice(start, i + 1); }
+    }
+    throw new Error('未闭合：' + name);
+  };
+  const vm = require('vm');
+  const ctx = {};
+  vm.createContext(ctx);
+  vm.runInContext(grab('modelEntries') + '\n' + grab('upstreamIdFor') + '\n' + grab('logicalModelNames')
+    + '\n__e = modelEntries; __u = upstreamIdFor; __n = logicalModelNames;', ctx);
+  const J = (v) => JSON.stringify(v);
+
+  // 字符串 / 对象 / 同义字段 / 脏数据
+  assert.strictEqual(J(ctx.__e({ models: ['a', ' b '] })), J([{ up: 'a', as: 'a' }, { up: 'b', as: 'b' }]),
+    '字符串项：上游 ID 与逻辑名相同（并 trim）');
+  assert.strictEqual(J(ctx.__e({ models: [{ id: 'u/v', as: 'l' }] })), J([{ up: 'u/v', as: 'l' }]), '{id,as}');
+  assert.strictEqual(J(ctx.__e({ models: [{ id: 'u/v', alias: 'l' }] })), J([{ up: 'u/v', as: 'l' }]), 'alias 同义');
+  assert.strictEqual(J(ctx.__e({ models: [{ id: 'u/v', model: 'l' }] })), J([{ up: 'u/v', as: 'l' }]), 'model 同义（逻辑名）');
+  assert.strictEqual(J(ctx.__e({ models: [{ up: 'u/v', name: 'l' }] })), J([{ up: 'u/v', as: 'l' }]), 'up / name 同义键');
+  // 两侧（网关 modelEntries 与配置页 gwNormalizeModels）语义必须一致：缺 id 时 model 兜底为上游 ID
+  assert.strictEqual(J(ctx.__e({ models: [{ model: 'x', as: 'y' }] })), J([{ up: 'x', as: 'y' }]), '仅 model+as：model 作上游 ID');
+  assert.strictEqual(J(ctx.__e({ models: [{ model: 'x' }] })), J([{ up: 'x', as: 'x' }]), '仅 model：等价于字符串写法');
+  assert.strictEqual(J(ctx.__e({ models: [{ id: 'u/v' }] })), J([{ up: 'u/v', as: 'u/v' }]), 'as 缺省 = id');
+  assert.strictEqual(J(ctx.__e({ models: [{ as: 'no-id' }, 123, null, '', {}] })), '[]', '无 id / 非字符串非对象一律忽略');
+  assert.strictEqual(J(ctx.__e({})), '[]', '无 models 字段 → 空');
+  assert.strictEqual(J(ctx.__e({ models: 'not-an-array' })), '[]', 'models 非数组 → 空（不抛错）');
+
+  // 路由解析：同一逻辑名在不同供应商对应不同上游 ID（本需求的核心场景）
+  const p1 = { models: [{ id: 'deepseek-ai/deepseek-v4-flash', as: 'deepseek-v4-flash' }] };
+  const p2 = { models: [{ id: 'deepseek-v4-flash0731', as: 'deepseek-v4-flash' }] };
+  assert.strictEqual(ctx.__u(p1, 'deepseek-v4-flash'), 'deepseek-ai/deepseek-v4-flash');
+  assert.strictEqual(ctx.__u(p2, 'deepseek-v4-flash'), 'deepseek-v4-flash0731');
+  assert.strictEqual(ctx.__u(p1, 'unknown-model'), null, '未声明 → null（原样透传）');
+  assert.strictEqual(ctx.__u({ models: [{ id: 'v1', as: 'm' }, { id: 'v2', as: 'm' }] }, 'm'), 'v1', '同一逻辑名多条映射取第一条');
+  assert.strictEqual(J(ctx.__n({ models: ['a', { id: 'x', as: 'a' }, { id: 'y', as: 'b' }] })), J(['a', 'b']), '逻辑名去重');
+});
+
+t('网关：配置校验接受映射条目、拒绝非法条目', () => {
+  const { validateConfigText } = require(path.join(SRC, 'gateway-manager.js'));
+  const ok = (models) => validateConfigText(JSON.stringify({ port: 3091, providers: [{ id: 'a', baseURL: 'https://a/v1', models }] })).ok;
+  assert.strictEqual(ok(undefined), true, '无 models 字段仍合法');
+  assert.strictEqual(ok([]), true);
+  assert.strictEqual(ok(['x', { id: 'u', as: 'l' }, { id: 'u2' }]), true, '映射条目合法');
+  assert.strictEqual(ok([123]), false, '数字条目非法');
+  assert.strictEqual(ok([{ as: 'l' }]), false, '缺少 id 的映射非法');
+  assert.strictEqual(ok('x'), false, 'models 非数组非法');
+});
+
+t('renderer：配置页的模型映射表读写与网关语义一致（真跑页面函数）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
+  // 结构：旧的一行式 models 输入已替换为映射表
+  assert.ok(/id="eModelRows"/.test(html), '应有映射表容器 #eModelRows');
+  assert.ok(/id="btnModelAddRow"/.test(html), '应有「添加一行」按钮');
+  assert.ok(/id="eModelPaste"/.test(html), '应有批量粘贴输入框');
+  assert.ok(!/id="eModels"/.test(html), '旧的一行式模型输入应已移除');
+  assert.ok(/gwFillModelRows\(p\.models\)/.test(html), 'gwOpenEditor 应把 models 填进映射表');
+  assert.ok(/gwSerializeModels\(gwReadModelRows\(\)\)/.test(html), 'gwApplyEditor 应从映射表写回 models');
+
+  // 行为：抽出页面里的三个纯函数，在 vm 里跑（读入/写出/批量解析）
+  const grab = (name) => {
+    const start = html.indexOf('function ' + name + '(');
+    assert.ok(start >= 0, '应能定位 ' + name);
+    let depth = 0;
+    for (let i = html.indexOf('{', start); i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}') { depth--; if (depth === 0) return html.slice(start, i + 1); }
+    }
+    throw new Error('未闭合：' + name);
+  };
+  const vm = require('vm');
+  const ctx = {};
+  vm.createContext(ctx);
+  vm.runInContext(grab('gwFirstStr') + '\n' + grab('gwNormalizeModels') + '\n'
+    + grab('gwSerializeModels') + '\n' + grab('gwParseModelPaste')
+    + '\n__n = gwNormalizeModels; __s = gwSerializeModels; __p = gwParseModelPaste;', ctx);
+  const J = (v) => JSON.stringify(v);
+
+  // 读入：字符串 + 映射对象
+  assert.strictEqual(J(ctx.__n(['glm-5.3', { id: 'a/b', as: 'c' }])),
+    J([{ up: 'glm-5.3', as: 'glm-5.3' }, { up: 'a/b', as: 'c' }]), '读入：字符串与映射对象');
+  assert.strictEqual(J(ctx.__n([{ model: 'x', as: 'y' }])), J([{ up: 'x', as: 'y' }]), '读入：仅 model+as（与网关一致）');
+  assert.strictEqual(J(ctx.__n([null, 1, '', { as: 'no-id' }, {}])), '[]', '读入：脏数据跳过且不抛错');
+  // 写出：同名写字符串、异名写对象、空 up 丢弃
+  assert.strictEqual(J(ctx.__s([{ up: 'x', as: 'x' }, { up: 'a/b', as: 'c' }, { up: '', as: 'z' }])),
+    J(['x', { id: 'a/b', as: 'c' }]), '写出：同名压缩为字符串、异名写 {id,as}、空 up 丢弃');
+  // 往返：读入 → 写出 保持原形态
+  assert.strictEqual(J(ctx.__s(ctx.__n(['x', { id: 'a/b', as: 'c' }]))), J(['x', { id: 'a/b', as: 'c' }]),
+    '往返幂等');
+  // 批量解析：支持 => / -> / =，跳过空行与注释
+  assert.strictEqual(J(ctx.__p('a=>b\nc -> d\n# 注释\n\ne=f\ng')),
+    J([{ up: 'a', as: 'b' }, { up: 'c', as: 'd' }, { up: 'e', as: 'f' }, { up: 'g', as: '' }]),
+    '批量粘贴解析');
+});
+
+// ================= 9. 2026-09-11：OpenAI Responses 协议（体翻译 + response.id 嗅探） =================
+
+t('网关：Responses 体翻译（打码 / developer→system / reasoning.effort）与 response.id 嗅探', () => {
+  const src = fs.readFileSync(path.join(SRC, 'gateway', 'model-gateway.mjs'), 'utf8');
+  const grab = (name) => {
+    const start = src.indexOf('function ' + name + '(');
+    assert.ok(start >= 0, '应能定位 ' + name);
+    let depth = 0;
+    for (let i = src.indexOf('{', start); i < src.length; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}') { depth--; if (depth === 0) return src.slice(start, i + 1); }
+    }
+    throw new Error('未闭合：' + name);
+  };
+  const grabConst = (name) => {
+    const m = new RegExp('^const ' + name + ' = .*;$', 'm').exec(src);
+    assert.ok(m, '应能定位常量 ' + name);
+    return m[0];
+  };
+  const vm = require('vm');
+  const ctx = {};
+  vm.createContext(ctx);
+  vm.runInContext([
+    grab('maskSecretTokens'),
+    grab('desensitizeLongTokens'),
+    grab('translateResponsesBody'),
+    grab('maskResponsesItems'),
+    grab('desensitizeResponsesBody'),
+    grabConst('RESP_ID_RE'),
+    grabConst('RESP_NESTED_ID_RE'),
+    grabConst('RESP_OBJECT_ID_RE'),
+    grab('sniffResponseId'),
+    '__t = translateResponsesBody; __d = desensitizeResponsesBody; __s = sniffResponseId;',
+  ].join('\n'), ctx);
+  const J = (v) => JSON.stringify(v);
+  const hex40 = 'a1b2c3d4'.repeat(5);
+  const skKey = 'sk-' + 'A1b2C3d4E5f6G7h8'.repeat(2);
+
+  // —— response.id 嗅探：三种形态认得，output item 的 id 不认 ——
+  assert.strictEqual(ctx.__s('{"id":"resp_ab12","object":"response"}'), 'resp_ab12', '① resp_ 前缀');
+  assert.strictEqual(ctx.__s('data: {"type":"response.created","response":{"id":"resp-9x"}}'), 'resp-9x', '② SSE response.created');
+  assert.strictEqual(ctx.__s('{"id":"legacyid1","object":"response","status":"completed"}'), 'legacyid1', '③ object:response');
+  assert.strictEqual(ctx.__s('{"type":"response.output_item.added","item":{"id":"msg_123456"}}'), null,
+    '不得把 output item 的 msg_ id 当成 response id');
+  assert.strictEqual(ctx.__s('{"id":"chatcmpl-1","object":"chat.completion"}'), null, 'chat 完成体不认');
+  assert.strictEqual(ctx.__s(''), null);
+  assert.strictEqual(ctx.__s(null), null);
+
+  // —— 体翻译：打码 + role + reasoning ——
+  const body = {
+    model: 'm',
+    instructions: 'sys ' + hex40,
+    input: [
+      { type: 'message', role: 'developer', content: 'dev text ' + hex40 },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'key ' + skKey }] },
+      { type: 'function_call_output', call_id: 'c1', output: 'out ' + hex40 },
+    ],
+    reasoning: { effort: 'max' },
+  };
+  const snapshot = J(body);
+  const out = ctx.__t(body, { reasoningEffortMap: { max: 'xhigh', off: 'disabled' } });
+  assert.strictEqual(out.instructions, 'sys [sha256:40]', 'instructions 应打码：' + out.instructions);
+  assert.strictEqual(out.input[0].role, 'system', 'developer → system：' + J(out.input[0]));
+  assert.strictEqual(out.input[1].content[0].text, 'key sk-***G7h8', 'input_text 应打码：' + J(out.input[1]));
+  assert.strictEqual(out.input[2].output, 'out [sha256:40]', 'function_call_output 应打码：' + out.input[2].output);
+  assert.strictEqual(out.reasoning.effort, 'xhigh', 'reasoning.effort 按 reasoningEffortMap 改写');
+  assert.strictEqual(J(body), snapshot, '翻译必须返回新对象，不得就地改动原请求体（failover 会重发原体）');
+  // off 档位：Responses 无"关闭"枚举 → 移除 reasoning 字段
+  assert.ok(!('reasoning' in ctx.__t({ reasoning: { effort: 'off' } }, { reasoningEffortMap: { off: 'disabled' } })),
+    'off → 移除 reasoning');
+  assert.ok(!('reasoning' in ctx.__t({ reasoning: { effort: 'high' } }, { reasoningEffortMap: { high: { thinking: 'disabled' } } })),
+    '对象映射 thinking:disabled → 移除 reasoning');
+  assert.strictEqual(ctx.__t({ reasoning: { effort: 'low' } }, { reasoningEffortMap: { low: { effort: 'medium' } } }).reasoning.effort,
+    'medium', '对象映射 effort 值应被采用');
+  const keep = { reasoning: { effort: 'high' } };
+  assert.strictEqual(ctx.__t(keep, {}), keep, '无 reasoningEffortMap → 原样返回（不复制、不加戏）');
+  assert.strictEqual(ctx.__t({ input: 'plain', instructions: 'plain' }, {}).input, 'plain', '无密钥/无映射时保持原值');
+
+  // —— 降敏重试（R9c 的 Responses 版）——
+  const de = ctx.__d({ instructions: hex40, input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: hex40 }] }] });
+  assert.strictEqual(de.instructions, '[sha256:40]');
+  assert.strictEqual(de.input[0].content[0].text, '[sha256:40]', '降敏应作用于 input 文本块：' + J(de.input));
+  assert.strictEqual(ctx.__d({ input: [{ type: 'function_call', arguments: '{"a":1}' }] }).input[0].arguments, '{"a":1}',
+    '工具调用 arguments 不得被降敏（会破坏 JSON）');
+});
+
+// ================= 9. 2026-09-11：可移植性（复制到其它电脑开箱即用）=================
+// 真实故障：out\DSH-App 整体复制到另一台电脑后双击只弹空白窗口，日志停在
+//   [启动进程失败: spawn C:\WINDOWS\system32\cmd.exe ENOENT]
+// 两个根因：① cmd 路径取自 process.env.ComSpec（克隆机残留旧系统盘路径）；
+//          ② spawn 的 ENOENT 是**异步** error，外层 try/catch 抓不到 → "回退直接启动"是死代码。
+
+t('可移植性：cmd.exe 解析不认坏掉的 ComSpec；workDir 不存在时回退主目录', () => {
+  const { resolveCmdExe, comSpecIsStale } = require(path.join(SRC, 'winutil.js'));
+  const { workDirOrHome, dirUsable } = require(path.join(SRC, 'paths.js'));
+  const saved = process.env.ComSpec;
+  try {
+    process.env.ComSpec = 'C:\\no\\such\\dir\\cmd.exe';
+    const r = resolveCmdExe();
+    assert.notStrictEqual(String(r).toLowerCase(), 'c:\\no\\such\\dir\\cmd.exe',
+      'ComSpec 指向不存在的文件时不得原样使用（克隆机的典型故障）：' + r);
+    assert.ok(r === 'cmd.exe' || fs.existsSync(r), '应回退到真实存在的 cmd 或 PATH 兜底：' + r);
+    assert.strictEqual(comSpecIsStale(), true, '应能识别出坏掉的 ComSpec（用于日志提示）');
+    const real = 'C:\\Windows\\system32\\cmd.exe';
+    if (fs.existsSync(real)) {
+      process.env.ComSpec = real;
+      assert.strictEqual(resolveCmdExe().toLowerCase(), real.toLowerCase(), 'ComSpec 有效时应优先使用');
+      assert.strictEqual(comSpecIsStale(), false, '有效的 ComSpec 不得被误判为失效');
+    }
+  } finally {
+    if (saved === undefined) delete process.env.ComSpec; else process.env.ComSpec = saved;
+  }
+  // workDir：来自另一台电脑的绝对路径必须回退
+  assert.strictEqual(workDirOrHome('C:\\definitely\\not\\here\\at\\all'), os.homedir(), '无效 workDir 应回退主目录');
+  assert.strictEqual(workDirOrHome(tmpRoot), tmpRoot, '有效目录应原样返回');
+  assert.strictEqual(dirUsable(tmpRoot), true);
+  assert.strictEqual(dirUsable('C:\\nope-not-here'), false);
+  let seen = null;
+  workDirOrHome('C:\\nope-not-here', (bad) => { seen = bad; });
+  assert.strictEqual(seen, 'C:\\nope-not-here', '回退时应回调（供写日志）');
+});
+
+t('可移植性：settings.json 里旧机器的 workDir → load 时回退并落盘（否则 spawn cwd 无效）', () => {
+  const { Settings } = require(path.join(SRC, 'settings.js'));
+  const dir = fs.mkdtempSync(path.join(tmpRoot, 'stale-'));
+  fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({ port: 3080, workDir: 'C:\\Users\\someone-else' }), 'utf8');
+  const d = new Settings(dir).load();
+  assert.strictEqual(d.workDir, os.homedir(), '不存在的 workDir 应回退主目录：' + d.workDir);
+  const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'));
+  assert.strictEqual(onDisk.workDir, os.homedir(), '应落盘修正（避免每次启动重复判定）');
+  // 有效目录不得被改写
+  const dir2 = fs.mkdtempSync(path.join(tmpRoot, 'keep-'));
+  fs.writeFileSync(path.join(dir2, 'settings.json'), JSON.stringify({ workDir: dir2 }), 'utf8');
+  assert.strictEqual(new Settings(dir2).load().workDir, dir2, '有效 workDir 必须原样保留');
+});
+
+t('可移植性：cmd broker 异步 ENOENT → 自动回退直接启动 dsh（旧版卡在空白窗口）', async () => {
+  const { L, dir } = mkLauncher();
+  // broker 脚本写到数据目录：portablePrefix() 认 DSH_DATA_DIR（真实运行时=应用目录\data）
+  const savedDataDir = process.env.DSH_DATA_DIR;
+  process.env.DSH_DATA_DIR = dir;
+  L.nodeInfo = { exe: 'node', env: {}, embedded: true };   // 内嵌模式才走 cmd broker 分支
+  L.nodePath = 'node';
+  L.found = { dir: tmpRoot, version: '9.9.9', bin: path.join(tmpRoot, 'bin.js') };
+  const before = spawnCalls.length;
+  cmdSpawnFails = true;
+  try {
+    L.start();
+    const first = spawnCalls[before];
+    assert.ok(first && /cmd/i.test(first.cmd), '应先尝试 cmd broker：' + (first && first.cmd));
+    await new Promise((r) => setTimeout(r, 50));           // 等异步 error 传播
+    const added = spawnCalls.slice(before);
+    assert.strictEqual(added.length, 2, 'broker 失败后必须再启动一次（直接 spawn node）：'
+      + JSON.stringify(added.map((c) => c.cmd)));
+    assert.ok(!/cmd/i.test(added[1].cmd), '第二次必须是直接启动 node（不经 cmd）：' + added[1].cmd);
+    assert.strictEqual(L.running, true, '回退成功后应处于 running（旧版会停在失败态）');
+    assert.ok(L.proc && L.proc.__cmd === added[1].cmd, 'this.proc 应指向回退后的子进程');
+  } finally {
+    cmdSpawnFails = false;
+    if (savedDataDir === undefined) delete process.env.DSH_DATA_DIR; else process.env.DSH_DATA_DIR = savedDataDir;
+    await L.stop();
+  }
+});
+
+t('可移植性：源码不得再直接使用 process.env.ComSpec 启动 cmd', () => {
+  for (const f of ['launcher.js', 'market.js']) {
+    const src = fs.readFileSync(path.join(SRC, f), 'utf8');
+    assert.ok(!/spawn\(\s*process\.env\.ComSpec/.test(src),
+      f + ' 不得直接用 process.env.ComSpec（克隆机上可能指向不存在的路径）');
+    assert.ok(/resolveCmdExe\(\)/.test(src), f + ' 应经 resolveCmdExe() 解析 cmd.exe');
+  }
+  assert.ok(/cmd broker 启动失败/.test(fs.readFileSync(path.join(SRC, 'launcher.js'), 'utf8')),
+    'launcher 必须有 broker 异步失败的显式回退');
+});
+
+// ================= 10. 2026-09-11：日志时间口径（缺省北京时间）=================
+
+t('日志时间戳：缺省北京时间（与机器时区无关），DSH_LOG_TZ 可覆盖', () => {
+  const tsPath = require.resolve(path.join(SRC, 'timestamp.js'));
+  const fresh = (env) => {
+    delete require.cache[tsPath];
+    if (env === undefined) delete process.env.DSH_LOG_TZ; else process.env.DSH_LOG_TZ = env;
+    return require(tsPath);
+  };
+  // 把时间戳字符串当作"钟面"解析成毫秒，再与期望的墙钟比较（容忍 1 分钟跨秒）
+  const wall = (s) => new Date(s.replace(' ', 'T') + 'Z').getTime();
+  const near = (s, expectMs, label) => {
+    const d = Math.abs(wall(s) - expectMs);
+    assert.ok(d <= 60000, label + '：实际 ' + s + '（偏差 ' + Math.round(d / 1000) + 's）');
+  };
+  try {
+    near(fresh(undefined).stamp(), Date.now() + 480 * 60000, '缺省应为北京时间 UTC+8');
+    assert.strictEqual(fresh(undefined).tzLabel(), 'UTC+08:00 (Asia/Shanghai)', '应能说明当前口径');
+    near(fresh('local').stamp(), Date.now() - new Date().getTimezoneOffset() * 60000, 'DSH_LOG_TZ=local 应跟随系统时区');
+    near(fresh('+09:00').stamp(), Date.now() + 540 * 60000, '+09:00 应生效');
+    near(fresh('-05:30').stamp(), Date.now() - 330 * 60000, '-05:30 应生效');
+    near(fresh('+0530').stamp(), Date.now() + 330 * 60000, '+0530（无冒号）应生效');
+    assert.strictEqual(fresh('乱填的值').tzOffsetMin(), 480, '非法取值应回退北京时间');
+    // 毫秒格式（网关日志）
+    assert.ok(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$/.test(fresh(undefined).stampMs()), 'stampMs 应带毫秒');
+  } finally {
+    delete process.env.DSH_LOG_TZ;
+    delete require.cache[tsPath];
+  }
+  // 网关（零依赖单文件）必须同一口径：抽出真实函数在 vm 里跑
+  const mjs = fs.readFileSync(path.join(SRC, 'gateway', 'model-gateway.mjs'), 'utf8');
+  const grab = (name) => {
+    const start = mjs.indexOf('function ' + name + '(');
+    assert.ok(start >= 0, '应能定位 ' + name);
+    let depth = 0;
+    for (let i = mjs.indexOf('{', start); i < mjs.length; i++) {
+      if (mjs[i] === '{') depth++;
+      else if (mjs[i] === '}') { depth--; if (depth === 0) return mjs.slice(start, i + 1); }
+    }
+    throw new Error('未闭合：' + name);
+  };
+  const vm = require('vm');
+  const ctx = { process: { env: {} } };
+  vm.createContext(ctx);
+  vm.runInContext(grab('logTzOffsetMin') + '\nconst LOG_TZ_MIN = logTzOffsetMin();\n' + grab('localStamp')
+    + '\n__s = localStamp; __tz = LOG_TZ_MIN;', ctx);
+  assert.strictEqual(ctx.__tz, 480, '网关缺省应为 UTC+8（旧版跟随系统时区 → 在 UTC 机器上差 8 小时）');
+  near(ctx.__s(), Date.now() + 480 * 60000, '网关时间戳应为北京时间');
+  ctx.process.env.DSH_LOG_TZ = 'local';
+  vm.runInContext('__tz2 = logTzOffsetMin();', ctx);
+  assert.strictEqual(ctx.__tz2, null, '网关 DSH_LOG_TZ=local 应跟随系统时区');
 });
 
 // ================= 执行 =================
