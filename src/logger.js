@@ -5,6 +5,8 @@
 
 const fs = require('fs');
 const path = require('path');
+// 时间戳口径（时区可移植性修复）：缺省北京时间，与机器时区无关；见 timestamp.js
+const { stamp, tzLabel } = require('./timestamp');
 
 const MAX_SIZE = 1024 * 1024;
 
@@ -23,6 +25,8 @@ function init(userDataDir) {
   try {
     fs.mkdirSync(logDir, { recursive: true });
   } catch (_) { /* 忽略 */ }
+  // 时间口径写在每次启动的第一行：事后核对"日志时间是什么时区"不必再猜
+  appendLog('日志时间口径：' + tzLabel() + (process.env.DSH_LOG_TZ ? '（DSH_LOG_TZ=' + process.env.DSH_LOG_TZ + '）' : '（缺省北京时间；DSH_LOG_TZ=local 可跟随系统时区）'));
 }
 
 // 轮转：**rename 到 .prev**（原子、不复制、不丢历史）。
@@ -50,10 +54,12 @@ function rotateIfNeeded(file, incoming) {
   } catch (_) { /* 轮转失败不影响写入 */ }
 }
 
-// 壳自身日志（带时间戳）
+// 壳自身日志（带时间戳）。
+// 审计/可移植性修复（2026-09-11）：旧版 `new Date().toISOString()` 是 **UTC**——在时区为
+// UTC 的机器（镜像/克隆的 Windows 很常见）上，日志比北京时间早 8 小时，排查时序会误导。
+// 现在统一走 timestamp.js：缺省北京时间（UTC+8），可用 DSH_LOG_TZ 覆盖。
 function appendLog(line) {
-  const ts = new Date().toISOString().replace('T', ' ').slice(0, 19);
-  write(logFile, '[' + ts + '] ' + line + '\r\n');
+  write(logFile, '[' + stamp() + '] ' + line + '\r\n');
 }
 
 // dsh web 输出日志（原样追加，无时间戳前缀）
