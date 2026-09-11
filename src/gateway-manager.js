@@ -114,6 +114,17 @@ function validateConfigText(text) {
     if (!p || typeof p !== 'object') return { ok: false, error: 'providers 中存在非对象条目' };
     if (!p.id || typeof p.id !== 'string') return { ok: false, error: '供应商缺少 id（字符串）' };
     if (!p.baseURL || typeof p.baseURL !== 'string') return { ok: false, error: '供应商 ' + (p.id || '?') + ' 缺少 baseURL' };
+    // 模型映射（2026-09-11）：models 每项是字符串（上游 ID = 逻辑名）或 {id, as} 映射对象
+    if (p.models !== undefined) {
+      const who = '供应商 ' + (p.id || '?') + ' 的 models';
+      if (!Array.isArray(p.models)) return { ok: false, error: who + ' 必须是数组' };
+      for (const m of p.models) {
+        if (typeof m === 'string') continue;
+        const up = (m && typeof m === 'object' && !Array.isArray(m)) ? (m.id ?? m.up ?? m.upstream) : undefined;
+        if (typeof up === 'string' && up.trim()) continue;
+        return { ok: false, error: who + ' 存在非法条目——每项应为字符串，或形如 { "id": "上游真实ID", "as": "逻辑模型名" } 的对象' };
+      }
+    }
   }
   return { ok: true, error: null };
 }
