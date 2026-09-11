@@ -15,6 +15,14 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const { compareVersions } = require('./launcher');
 
+// shell 命令行参数引用（审计修复）：含空格/特殊字符时用双引号包裹并转义内部引号。
+// 仅在 Windows shell 回退路径使用（真正的 npm-cli 路径走数组传参，不经过 shell）。
+function shellQuote(a) {
+  const s = String(a);
+  if (!/[\s"&|<>^%]/.test(s)) return s;
+  return '"' + s.replace(/"/g, '\\"') + '"';
+}
+
 function latestVersion(timeoutMs = 8000) {
   // v1.5.17c：默认 npmmirror（与安装源一致，国内网络稳定）；DSH_NPM_REGISTRY 可覆盖
   const registry = (process.env.DSH_NPM_REGISTRY || 'https://registry.npmmirror.com')
@@ -117,7 +125,12 @@ function performUpgrade(opts) {
     let output = '';
     const child = useNode
       ? spawn(nodePath, args, { windowsHide: true, shell: false, stdio: ['ignore', 'pipe', 'pipe'], env: envForNpm })
-      : spawn('npm', args, { windowsHide: true, shell: true, stdio: ['ignore', 'pipe', 'pipe'], env: envForNpm });
+      // 审计修复（P2）：系统 npm 回退路径走 shell 时参数必须逐个加引号——否则安装路径含
+      // 空格（如 D:\My Apps\DSH-App\data\node-global）时 `--prefix` 会被拆成两个参数，
+      // 升级静默装到错误位置。改为拼一条已转义的命令行（shell 分支）。" 
+      : spawn(['npm'].concat(args.map(shellQuote)).join(' '), {
+        windowsHide: true, shell: true, stdio: ['ignore', 'pipe', 'pipe'], env: envForNpm,
+      });
 
     const timer = setTimeout(() => {
       try { child.kill(); } catch (_) { /* 忽略 */ }
