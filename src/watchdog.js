@@ -11,6 +11,8 @@ const { spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+// 可移植性修复（2026-09-11）：workDir 可能来自另一台电脑 → cwd 无效会让 spawnSync 抛 ENOENT
+const { workDirOrHome } = require('./paths');
 
 // 0.1.x 启动失败报错形态：
 //   形态1: dsh: plugin(s) failed to load: a, b; Cordis startup failed because ...
@@ -250,6 +252,11 @@ class Watchdog {
 
   // `dsh --profile web --dump-config`：不启动应用，仅打印装配树
   runDumpConfig() {
+    // 可移植性修复（2026-09-11）：cwd 必须是本机存在的目录——workDir 可能来自另一台电脑
+    // （settings.json 随绿色目录复制），无效 cwd 会让 spawnSync 直接抛 ENOENT。
+    const safeCwd = () => (this.launcher && typeof this.launcher.safeWorkDir === 'function'
+      ? this.launcher.safeWorkDir()
+      : workDirOrHome(this.workDir));
     try {
       const node = this.launcher.nodePath || 'node';
       const bin = this.launcher.found ? this.launcher.found.bin : null;
@@ -260,7 +267,7 @@ class Watchdog {
       const env = Object.assign({}, process.env,
         this.launcher.nodeInfo && this.launcher.nodeInfo.env ? this.launcher.nodeInfo.env : {});
       const r = spawnSync(node, [bin, '--profile', 'web', '--dump-config'], {
-        cwd: this.workDir, encoding: 'utf8', timeout: 30000, windowsHide: true, env,
+        cwd: safeCwd(), encoding: 'utf8', timeout: 30000, windowsHide: true, env,
       });
       if (r.status !== 0) {
         // 不再静默：失败原因写进日志，便于判断是否走了下面的兜底索引
