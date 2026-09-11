@@ -60,7 +60,8 @@
     background: #2b5bd7; border-color: #2b5bd7; color: #fff; font-weight: 600;
   }
   button.primary:hover { background: #3a6cf5; }
-  .meta { margin-top: 26px; font-size: 11px; color: #5f6b7d; }
+  /* 审计修复（P3 无障碍）：#5f6b7d 对比度 ≈3.4:1 未达 WCAG AA → 提到 #8a93a3 */
+  .meta { margin-top: 26px; font-size: 11px; color: #8a93a3; }
   .meta b { color: #8b93a3; font-weight: 600; }
 </style>
 </head>
@@ -100,6 +101,11 @@
       $('btnStart').textContent =
         (s.service === 'starting') ? '启动中…' :
         (s.service === 'ready' || s.service === 'safe') ? '重新启动' : '启动 dsh 服务';
+      // 审计修复（P2）：starting 期间按钮可点会排队再次重启 → 启动中禁用并置灰
+      const starting = s.service === 'starting';
+      $('btnStart').disabled = starting;
+      $('btnStart').style.opacity = starting ? 0.45 : 1;
+      $('btnStart').title = starting ? '服务启动中，请稍候' : '';
       // 系统浏览器按钮：仅服务就绪（有真实地址）时可点，避免弹 401 明文页
       const canOpen = s.service === 'ready' || s.service === 'safe';
       $('btnBrowser').disabled = !canOpen;
@@ -110,7 +116,15 @@
     window.dshApp.onState(render);
     window.dshApp.getState().then(render);
 
-    $('btnStart').onclick = () => window.dshApp.action('start');
+    // 审计修复（P2）：点击后立即禁用——状态推送回来之前连点会排队再次重启（重复拉起服务）
+    $('btnStart').onclick = () => {
+      const btn = $('btnStart');
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = '启动中…';
+      btn.style.opacity = 0.45;
+      window.dshApp.action('start').catch(() => { /* 失败原因由状态推送/日志给出 */ });
+    };
     $('btnLogs').onclick = () => window.dshApp.action('open-logs');
     $('btnBrowser').onclick = () => window.dshApp.action('open-browser');
     $('btnSettings').onclick = () => window.dshApp.action('open-settings');
