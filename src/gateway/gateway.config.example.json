@@ -6,7 +6,7 @@
       "id": "provider-a",
       "baseURL": "https://api.example.com/v1",
       "apiKey": "sk-xxxxxxxx",
-      "models": ["deepseek-v4-flash", "glm-5.2"],
+      "models": ["glm-5.2"],
       "priority": 1,
       "enabled": true
     },
@@ -14,7 +14,11 @@
       "id": "provider-b",
       "baseURL": "https://api.example2.com/v1",
       "apiKey": "sk-yyyyyyyy",
-      "models": ["deepseek-v4-flash"],
+      "models": [
+        "glm-5.2",
+        { "id": "deepseek-ai/deepseek-v4-flash", "as": "deepseek-v4-flash" },
+        { "id": "deepseek-v4-flash0731", "as": "deepseek-v4-flash" }
+      ],
       "priority": 2,
       "enabled": true
     }
