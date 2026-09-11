@@ -52,8 +52,10 @@ try {
   rmSync(appDir, { recursive: true, force: true });
 } catch (err) {
   if (err.code === 'EBUSY' || err.code === 'EPERM') {
-    console.error('[错误] UAT 目录被占用（UAT 实例运行中？）。请退出 DSH-App-UAT 后重试。');
-    process.exit(1);
+    // 审计修复（P1）：这里原本 process.exit(1)——`process.exit` 不展开 JS 栈，下面的
+    // try/finally **不会执行**，UAT 目录会停在"无 exe 无 data、数据在备份目录"的半毁状态。
+    // 改为抛错，由 finally 的 restoreUatData() 还原用户数据。
+    throw new Error('UAT 目录被占用（UAT 实例运行中？）：' + appDir + '。请退出 DSH-App-UAT 后重试。');
   }
   throw err;
 }
@@ -73,8 +75,8 @@ await createPackage(staging, path.join(appDir, 'resources', 'app.asar'));
 
 // 3) electron 运行时
 if (!existsSync(electronDist)) {
-  console.error('[错误] 未找到 electron 运行时: ' + electronDist);
-  process.exit(1);
+  // 审计修复（P1）：同上——process.exit 会跳过 finally，使 data\ 停在备份目录。
+  throw new Error('未找到 electron 运行时: ' + electronDist + '（请先 npm install）');
 }
 for (const name of readdirSync(electronDist)) {
   cpSync(path.join(electronDist, name), path.join(appDir, name), { recursive: true });
@@ -128,11 +130,19 @@ if (existsSync(defaultAsar)) rmSync(defaultAsar, { force: true });
 }
 
 // 7) 图标 + 说明
-mkdirSync(path.join(root, 'assets'), { recursive: true });
+// 审计修复（P2）：图标只写构建目录（exe 旁），不再创建/写入源码树 assets\——
+// 源码树里的 assets\icon.* 会被当源码上传到 GitHub，并与 set-exe-icon.cjs 抢同一路径。
 cpSync(path.join(root, 'src', 'assets', 'electron-icon.png'), path.join(appDir, 'icon.png'));
 cpSync(path.join(root, 'src', 'assets', 'electron-icon.ico'), path.join(appDir, 'icon.ico'));
+} catch (err) {
+  console.error('[错误] UAT 构建失败：' + (err && err.message ? err.message : err));
+  process.exitCode = 1;   // 不用 process.exit：让 finally 先还原 data\（审计修复）
 } finally {
   restoreUatData();   // R24/R25：构建结束（含失败路径）还原 UAT 用户数据
+}
+if (process.exitCode) {
+  console.error('[中止] 构建未完成，UAT 目录可能不完整；用户数据已还原。');
+  process.exit(1);
 }
 
 console.log('[OK] UAT 构建完成: ' + appDir);
