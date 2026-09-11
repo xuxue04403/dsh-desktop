@@ -33,13 +33,29 @@ function prepareAppDir() {
   let hadData = false;
   // (a) 当前目标目录的数据备份
   const dataDir = path.join(appDir, 'data');
+  // (a0) 孤儿备份恢复（审计修复 P0）：上一次构建中途失败（进程被杀 / `process.exit`
+  //      跳过还原）会把用户数据留在 out\_data-backup，而目标目录此时**没有** data\。
+  //      必须先还原，否则紧接着的 rmSync(dataBackup) 会把唯一副本删掉——不可逆丢失
+  //      （data\gateway.config.json 里是明文 API Key，还有会话历史与已装 dsh）。
+  if (existsSync(dataBackup) && !existsSync(dataDir)) {
+    try {
+      cpSync(dataBackup, dataDir, { recursive: true });
+      console.log('[数据保留] 发现上次构建遗留的数据备份，已先行还原到 ' + dataDir);
+    } catch (err) {
+      throw new Error('无法还原上次构建遗留的 data 备份（' + (err && err.message ? err.message : err) + '），已中止构建以免丢数据。');
+    }
+  }
   try {
     if (existsSync(dataDir)) {
       rmSync(dataBackup, { recursive: true, force: true });
       cpSync(dataDir, dataBackup, { recursive: true });
       hadData = true;
     }
-  } catch (_) { /* 备份失败继续 */ }
+  } catch (err) {
+    // 审计修复（P0）：备份失败**必须中止构建**。旧版注释写"备份失败继续"，但随后仍然
+    // rmSync 整个 appDir → data\ 直接蒸发，且 hadData 保持 false 使还原逻辑成为空操作。
+    throw new Error('data\\ 备份失败（' + (err && err.message ? err.message : err) + '），已中止构建以免丢失用户数据（明文 Key/历史）。');
+  }
   try {
     rmSync(appDir, { recursive: true, force: true });
   } catch (err) {
@@ -50,6 +66,23 @@ function prepareAppDir() {
     }
     const alt = path.join(outDir, fallbackOut);
     console.log('[提示] ' + appDir + ' 被占用（可能有实例在运行），改用 ' + alt);
+    // (b) 回退目录的数据备份（审计修复 P0）：必须**先备份再删**。旧版先 rmSync(alt)
+    //     再检查 alt\data，备份分支永远不成立（死代码）——而回退目录恰恰是上一次
+    //     同样场景产生、用户接着使用过的目录，里面的 data\ 被无条件删除。
+    const altData = path.join(alt, 'data');
+    if (existsSync(altData)) {
+      if (hadData) {
+        console.log('[提示] 备用目录也有 data\\：保留主目录的数据备份作为还原来源（备用目录数据不动，仅备份）。');
+      } else {
+        try {
+          rmSync(dataBackup, { recursive: true, force: true });
+          cpSync(altData, dataBackup, { recursive: true });
+          hadData = true;
+        } catch (err) {
+          throw new Error('备用目录 data\\ 备份失败（' + (err && err.message ? err.message : err) + '），已中止构建以免丢失用户数据。');
+        }
+      }
+    }
     try {
       rmSync(alt, { recursive: true, force: true });
     } catch (err2) {
@@ -61,20 +94,21 @@ function prepareAppDir() {
     }
     outName = fallbackOut;
     appDir = alt;
-    // (b) 回退目录的数据备份（回退目标同样可能携带用户数据）
-    const altData = path.join(appDir, 'data');
-    try {
-      if (existsSync(altData)) {
-        rmSync(dataBackup, { recursive: true, force: true });
-        cpSync(altData, dataBackup, { recursive: true });
-        hadData = true;
-      }
-    } catch (_) { /* 忽略 */ }
   }
   if (hadData) dataBackupPath = dataBackup;   // 模块级保存（appDir 重赋值不影响）
 }
 
 // 构建完成后还原用户数据目录（R13）
+// 审计修复（P0）：`process.exit()` 不会展开 JS 栈，顶层抛错也不会执行后续语句——
+// 因此除了正常路径调用，还在 exit/uncaughtException/unhandledRejection/信号 上兜底，
+// 保证**任何结束方式**都把 data\ 还原回去（旧版唯一还原点在文件末尾，exit(1) 直接跳过，
+// 数据留在 out\_data-backup，再下一次构建会把它删掉）。
+let restoreDone = false;
+function restoreOnce() {
+  if (restoreDone) return;
+  restoreDone = true;
+  restoreDataDir();
+}
 function restoreDataDir() {
   const dataBackup = dataBackupPath;
   if (!dataBackup) return;
@@ -86,8 +120,27 @@ function restoreDataDir() {
     }
   } catch (err) {
     console.log('[警告] data\\ 还原失败（' + (err && err.message ? err.message : err) + '），可手动复制。');
+    console.log('        备份位置：' + dataBackup);
   }
 }
+process.on('exit', () => { try { restoreOnce(); } catch (_) { /* 忽略 */ } });
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) {
+  process.on(sig, () => {
+    console.log('\n[中断] 收到 ' + sig + '，先还原 data\\ 再退出…');
+    try { restoreOnce(); } catch (_) { /* 忽略 */ }
+    process.exit(1);
+  });
+}
+process.on('uncaughtException', (err) => {
+  console.error('[错误] ' + (err && err.stack ? err.stack : err));
+  try { restoreOnce(); } catch (_) { /* 忽略 */ }
+  process.exit(1);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[错误] ' + (err && err.stack ? err.stack : err));
+  try { restoreOnce(); } catch (_) { /* 忽略 */ }
+  process.exit(1);
+});
 
 // —— 1) 收集应用源码 ————————————————————————————————
 const staging = path.join(outDir, '_app-staging');
@@ -150,9 +203,9 @@ if (existsSync(defaultAsar)) rmSync(defaultAsar, { force: true });
 
 // —— 5) 品牌图标（与 DSH-App.exe 内嵌图标完全一致：src/assets/electron-icon.*
 //       是从 electron.exe 资源原样提取的官方图标，见 scripts/extract-exe-icon.mjs）——
-mkdirSync(path.join(root, 'assets'), { recursive: true });
-cpSync(path.join(root, 'src', 'assets', 'electron-icon.png'), path.join(root, 'assets', 'icon.png'));
-cpSync(path.join(root, 'src', 'assets', 'electron-icon.ico'), path.join(root, 'assets', 'icon.ico'));
+// 审计修复（P2）：只写**构建目录**（exe 旁那份作为唯一来源），不再写源码树
+// assets\icon.ico|icon.png——那会被当源码上传到 GitHub，且与 set-exe-icon.cjs
+// 抢同一路径，导致产物图标取决于最后跑的是哪个脚本。
 cpSync(path.join(root, 'src', 'assets', 'electron-icon.png'), path.join(appDir, 'icon.png'));
 cpSync(path.join(root, 'src', 'assets', 'electron-icon.ico'), path.join(appDir, 'icon.ico'));
 
@@ -191,21 +244,36 @@ cpSync(path.join(root, 'src', 'assets', 'electron-icon.ico'), path.join(appDir, 
 }
 
 // —— 6) 说明文件 ————————————————————————————————————
+// 审计修复（P3）：写入 BOM（\ufeff）——旧版是无 BOM 的 UTF-8，Windows 旧版记事本
+// 会按 ANSI/GBK 猜测编码，中文全是乱码。
 writeFileSync(path.join(appDir, '使用说明.txt'),
-  'DSH App（DeepSeek Harness 桌面壳）· 绿色免安装版\r\n'
+  '\ufeff'
+  + 'DSH App（DeepSeek Harness 桌面壳）· 绿色免安装版\r\n'
   + '\r\n'
   + '双击 DSH-App.exe 即可运行（无需安装，不写注册表）。\r\n'
+  + '无需预装 Node.js / npm / dsh：已内置 Electron 44 运行时与 npm，首次启动会把 dsh\r\n'
+  + '自动安装到本目录 data\\node-global（需联网，默认走 npmmirror 镜像）。\r\n'
   + '首次启动建议：点击「启动 dsh 服务」；服务就绪后窗口内嵌 Harness 界面。\r\n'
   + '\r\n'
-  + '运行数据（设置/日志/网关配置/安全模式）保存在本目录旁的 data\\ 文件夹，\r\n'
+  + '运行数据（设置/日志/网关配置/输入历史/已装 dsh）保存在本目录旁的 data\\ 文件夹，\r\n'
   + '随程序目录走（复制整个目录即随身携带）；目录不可写时才回退 %APPDATA%\\DSH-App\\。\r\n'
-  + '本机需已安装 Node.js 与 dsh（未安装 dsh 时应用会通过 npx 自动获取）。\r\n'
+  + '· 迁移/备份：复制整个目录即可（必须整目录，不能只拷 exe）。\r\n'
+  + '· data\\ 里的 gateway.config.json 含各供应商 API Key 明文；给他人使用前请先删除\r\n'
+  + '  data\\（或改用发布页的 Portable.zip，已剔除 data\\），避免带走自己的密钥与历史。\r\n'
+  + '· 请放在用户可写的目录（如 D:\\DSH-App、桌面）。放在 C:\\Program Files 等位置时\r\n'
+  + '  运行数据会回退到 %APPDATA%\\DSH-App\\，不再是"随身携带"。\r\n'
+  + '· 单文件便携 exe 会在临时目录解包运行，数据目录可能落在临时目录；长期使用请用本\r\n'
+  + '  绿色目录（或用环境变量 DSH_DATA_DIR 指定固定数据目录）。\r\n'
+  + '\r\n'
+  + '注意：dsh 自身的配置与凭据库在 %USERPROFILE%\\.dsh\\，**不在本目录、也不随目录复制**——\r\n'
+  + '换机后需在新机器的设置页重新填写邮箱桥接密码、模型网关统一 Key（插件本体随本目录\r\n'
+  + '自动安装，无需手工处理）；各供应商 API Key 在 data\\gateway.config.json 里随目录走。\r\n'
   + '\r\n'
   + '加载超时/插件故障时应用会自动进入安全模式（见应用内提示与日志）。\r\n',
   'utf8');
 
 console.log('[OK] 绿色免安装版已生成: ' + appDir);
-restoreDataDir();   // R13：构建后还原用户 data\（配置/日志不丢）
+restoreOnce();   // R13：构建后还原用户 data\（配置/日志不丢）；异常/中断路径由上面的钩子兜底
 console.log('OUTDIR=' + appDir);
 console.log('     启动方式：双击 ' + path.join(appDir, 'DSH-App.exe'));
 console.log('     分发方式：将 ' + outName + ' 目录压缩为 zip 即可（解压即用）。');
