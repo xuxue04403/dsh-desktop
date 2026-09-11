@@ -299,7 +299,16 @@ function ensurePatchEntry(profile, log, patchBlock) {
   // 有效内容 = 去掉注释行后的文本（profile 模板是「注释 + []」，不能按整段文本判列表）
   const effective = text.split(/\r?\n/).filter((line) => !/^\s*#/.test(line)).join('\n').trim();
   if (effective === '' || effective === '[]') {
-    next = text.includes('[]') ? text.replace('[]', block) : text.replace(/\s*$/, '\n') + block;
+    // 审计修复（P3）：按**整行**定位 `[]` 占位再替换，而不是 text.replace('[]', …) 的
+    // 首个出现位置——注释/字符串值里出现 `[]` 时会把挂载块插进注释中间，产出非法 YAML。
+    const lines = text.split(/\r?\n/);
+    const idx = lines.findIndex((l) => /^\s*\[\s*\]\s*$/.test(l) && !/^\s*#/.test(l));
+    if (idx >= 0) {
+      lines[idx] = block.replace(/\n$/, '');
+      next = lines.join('\n');
+    } else {
+      next = text.replace(/\s*$/, '\n') + block;
+    }
   } else if (/^-/m.test(effective)) {
     // 已有其他条目：作为新的列表项追加（顶层必须是 YAML 列表，loader 约定如此）
     next = text.replace(/\s*$/, '\n') + block;
@@ -444,7 +453,7 @@ async function doInstallDefaultPlugins(opts) {
             })
           : null);
         if (marketOps) {
-          const r = await marketOps.install(DEP_SPEC, (line) => { if (/error|ERR/i.test(line)) log('[pnpm] ' + line); });
+          const r = await marketOps.install(DEP_SPEC, (line) => { if (/error|ERR/i.test(line)) log('[pnpm] ' + line); }, { allowFile: true });
           pnpmOk = !!(r && r.ok);
         }
       } catch (err) {
