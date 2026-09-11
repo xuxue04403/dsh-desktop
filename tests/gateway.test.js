@@ -339,6 +339,79 @@ let upstreamPort = 0;
       status: opts.status === undefined ? 200 : opts.status,
       errorBody: opts.errorBody === undefined ? { error: { message: 'upstream error' } } : opts.errorBody,
       delayMs: opts.delayMs || 0,
+      // —— OpenAI Responses 协议仿真（见下方 handleResponses）——
+      respIdPrefix: opts.respIdPrefix || 'resp_test',
+      respSeq: 0,
+      respStore: new Map(),      // 只认自己创建的 id（真实上游即如此）
+      resourceStatus: opts.resourceStatus || 0,   // >0 时资源子路由强制返回该状态
+      noResourceRoutes: !!opts.noResourceRoutes,  // 模拟 new-api：只实现 POST 生成，子路由一律 Invalid URL
+      lastRespBody: null,        // 上游实际收到的 Responses 请求体
+      respUrls: [],              // 上游收到的原始 URL（含查询串，断言透传用）
+      lastModel: null,
+      models: [],
+    };
+    // Responses 协议：POST 创建（SSE 或 JSON）+ 资源子路由（GET/DELETE/cancel/input_items）
+    const handleResponses = (req, res) => {
+      const u = new URL(req.url, 'http://x');
+      const segs = u.pathname.slice('/v1/responses'.length).split('/').filter(Boolean);
+      const id = segs[0] || null;
+      const action = segs[1] || null;
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        st.calls++;
+        st.respUrls.push(req.method + ' ' + req.url);
+        const json = (status, obj) => {
+          res.writeHead(status, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(obj));
+        };
+        if (req.method === 'POST' && !id) {
+          let parsed = {};
+          try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch (_) { /* 忽略 */ }
+          st.lastRespBody = parsed;
+          st.lastModel = parsed.model;
+          st.models.push(parsed.model);
+          const newId = st.respIdPrefix + (++st.respSeq);
+          st.respStore.set(newId, { id: newId, object: 'response', status: 'completed', model: parsed.model });
+          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+          res.write('event: response.created\ndata: '
+            + JSON.stringify({ type: 'response.created', response: { id: newId, object: 'response', status: 'in_progress' } }) + '\n\n');
+          res.write('event: response.output_text.delta\ndata: '
+            + JSON.stringify({ type: 'response.output_text.delta', delta: 'hi' }) + '\n\n');
+          res.end('event: response.completed\ndata: '
+            + JSON.stringify({ type: 'response.completed', response: { id: newId, object: 'response', status: 'completed' } }) + '\n\n');
+          return;
+        }
+        // 模拟实测到的 new-api 行为：只实现 POST 生成，资源子路由一律 "Invalid URL (...)"（404）
+        if (st.noResourceRoutes) {
+          json(404, { error: { message: 'Invalid URL (' + req.method + ' ' + u.pathname + ')', type: 'invalid_request_error' } });
+          return;
+        }
+        // 资源子路由：不属于自己的 id → 404（换家探测因此是安全的）
+        if (!id || !st.respStore.has(id)) {
+          json(404, { error: { message: 'No response found with id ' + id } });
+          return;
+        }
+        if (st.resourceStatus && st.resourceStatus !== 200) {
+          json(st.resourceStatus, { error: { message: 'upstream temporarily unavailable' } });
+          return;
+        }
+        if (req.method === 'GET' && !action) { json(200, st.respStore.get(id)); return; }
+        if (req.method === 'GET' && action === 'input_items') {
+          json(200, { object: 'list', data: [{ role: 'user', content: 'hi' }] });
+          return;
+        }
+        if (req.method === 'DELETE' && !action) {
+          st.respStore.delete(id);
+          json(200, { id, object: 'response.deleted', deleted: true });
+          return;
+        }
+        if (req.method === 'POST' && action === 'cancel') {
+          json(200, { id, object: 'response', status: 'cancelled' });
+          return;
+        }
+        json(404, { error: { message: 'unsupported' } });
+      });
     };
     const server = http.createServer((req, res) => {
       if (req.url.startsWith('/v1/models')) {
@@ -352,9 +425,18 @@ let upstreamPort = 0;
         res.end(JSON.stringify({ data: st.catalog }));
         return;
       }
+      if (req.url.startsWith('/v1/responses')) { handleResponses(req, res); return; }
       req.resume();                       // 消费请求体（本假上游不解析内容）
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
         st.calls++;
+        // 记录上游实际收到的 model（模型映射用例断言用：必须是该供应商的上游真实 ID）
+        try {
+          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+          st.lastModel = parsed.model;
+          st.models.push(parsed.model);
+        } catch (_) { /* 忽略 */ }
         const send = () => {
           if (st.status !== 200) {
             res.writeHead(st.status, { 'content-type': 'application/json' });
@@ -372,7 +454,7 @@ let upstreamPort = 0;
   }
 
   function providerOf(id, up, opts = {}) {
-    return {
+    const p = {
       id,
       baseURL: 'http://127.0.0.1:' + up.port + '/v1',
       apiKey: UPSTREAM_KEY,
@@ -380,15 +462,18 @@ let upstreamPort = 0;
       priority: opts.priority === undefined ? 1 : opts.priority,
       enabled: true,
     };
+    if (opts.reasoningEffortMap) p.reasoningEffortMap = opts.reasoningEffortMap;
+    return p;
   }
 
   // 独立网关实例：独立端口/配置/日志目录 + 可选 env（如熔断时长、dump 开关）
-  async function startGatewayWith(providers, tag, env) {
+  // cfgExtra：额外顶层配置（如 routing: 'round-robin'）
+  async function startGatewayWith(providers, tag, env, cfgExtra) {
     const port = await freePort();
     const dir = fs.mkdtempSync(path.join(tmp, 'gw-' + tag + '-'));
     const cfgPath = path.join(dir, 'gateway.config.json');
     const logPath = path.join(dir, 'gateway.log');
-    fs.writeFileSync(cfgPath, JSON.stringify({ port, apiKey: GATEWAY_KEY, providers }, null, 2), 'utf8');
+    fs.writeFileSync(cfgPath, JSON.stringify(Object.assign({ port, apiKey: GATEWAY_KEY, providers }, cfgExtra || {}), null, 2), 'utf8');
     const proc = spawn(process.execPath, [MJS, '--config', cfgPath, '--log', logPath, '--port', String(port)], {
       stdio: 'ignore', windowsHide: true,
       env: env ? Object.assign({}, process.env, env) : process.env,
@@ -559,6 +644,273 @@ let upstreamPort = 0;
       const r = await call({ port: gw.port });
       assert.strictEqual(r.status, 200, '配置显式声明即候选，实际 ' + r.status + ' ' + r.text.slice(0, 200));
       assert.strictEqual(up.st.calls, 1, '应转发一次，实际 ' + up.st.calls);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：模型映射——逻辑名路由到各家的上游真实 ID（含 failover 后改写）', async () => {
+    // 两家供应商用**不同的上游 ID** 承载同一个逻辑模型 deepseek-v4-flash：
+    //   p1: deepseek-ai/deepseek-v4-flash（挂：500 → 触发 failover）
+    //   p2: deepseek-v4-flash0731（正常）
+    // 客户端只请求逻辑名；网关必须按优先级切换，并把 body.model 改写为**该家**的真实 ID。
+    const up1 = await startFakeUpstream({ status: 500, errorBody: { error: { message: 'boom' } } });
+    const up2 = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('m1', up1, { priority: 1, models: [{ id: 'deepseek-ai/deepseek-v4-flash', as: 'deepseek-v4-flash' }] }),
+      providerOf('m2', up2, { priority: 2, models: [{ id: 'deepseek-v4-flash0731', as: 'deepseek-v4-flash' }] }),
+    ], 'maproute');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, body: { model: 'deepseek-v4-flash', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '应 failover 到第二家，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      assert.strictEqual(up1.st.lastModel, 'deepseek-ai/deepseek-v4-flash', 'p1 收到的应是它自己的上游 ID');
+      assert.strictEqual(up2.st.lastModel, 'deepseek-v4-flash0731', 'p2 收到的应是它自己的上游 ID');
+      assert.ok(!up1.st.models.includes('deepseek-v4-flash'), '不得把逻辑名原样发给上游');
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('网关：模型映射——同一逻辑名有多条映射时取第一条命中；未声明映射则原样透传', async () => {
+    const upA = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('multi', upA, {
+        models: [
+          { id: 'variant-one-x', as: 'same-logical' },
+          { id: 'variant-two-x', as: 'same-logical' },
+        ],
+      }),
+    ], 'mapmulti');
+    try {
+      assert.ok(gw.ready);
+      const r1 = await call({ port: gw.port, body: { model: 'same-logical', messages: [] } });
+      assert.strictEqual(r1.status, 200, '实际 ' + r1.status);
+      assert.strictEqual(upA.st.lastModel, 'variant-one-x', '同一逻辑名的多条映射应取第一条');
+      // 未声明的模型：目录也不含 → 404（不发给上游）
+      const before = upA.st.calls;
+      const r2 = await call({ port: gw.port, body: { model: 'not-declared-anywhere', messages: [] } });
+      assert.strictEqual(r2.status, 404, '未声明且目录不含 → 404，实际 ' + r2.status);
+      assert.strictEqual(upA.st.calls, before, '不得把未声明的模型发给上游');
+    } finally { killGw(gw); closeUp(upA); }
+  });
+
+  t('网关：/v1/models 列逻辑模型名（映射后的名字），不暴露各家上游 ID', async () => {
+    const up = await startFakeUpstream({ catalog: [{ id: 'vendor-raw-id-1' }, { id: 'plain-catalog-model' }] });
+    const gw = await startGatewayWith([
+      providerOf('lst', up, {
+        models: [
+          { id: 'vendor-raw-id-1', as: 'nice-logical-name' },
+          'plain-declared-model',
+        ],
+      }),
+    ], 'maplist');
+    try {
+      assert.ok(gw.ready);
+      const r = await call({ port: gw.port, method: 'GET', p: '/v1/models', body: null });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      const ids = (JSON.parse(r.text).data || []).map((m) => m.id);
+      assert.ok(ids.includes('nice-logical-name'), '应列出逻辑名：' + ids.join(','));
+      assert.ok(ids.includes('plain-declared-model'), '应列出未映射的声明：' + ids.join(','));
+      assert.ok(ids.includes('plain-catalog-model'), '目录里未被映射覆盖的模型应原样列出：' + ids.join(','));
+      assert.ok(!ids.includes('vendor-raw-id-1'), '被映射覆盖的上游 ID 不应单独出现：' + ids.join(','));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // ================= OpenAI Responses 协议支持（2026-09-11） =================
+  // 背景：Responses 是**有状态**协议，客户端（Codex / OpenAI SDK / dsh 的 responses 模式）
+  // 会在 POST /v1/responses 之后用 response.id 继续 GET/DELETE/cancel/input_items。
+  // 旧版网关只认 POST，其余路径全部 404 unsupported route；且体翻译（打码/role/推理档位）
+  // 在 Responses 上是死代码（translateBody 只看 body.messages）。
+
+  t('网关：POST /v1/responses 透传 + Responses 体翻译（打码 / developer→system / reasoning.effort）', async () => {
+    const up = await startFakeUpstream({ responses: true });
+    const fakeHex = 'a1b2c3d4'.repeat(5);                       // 40 位 hex 形态假串（非真实密钥）
+    const fakeKey = 'sk-' + 'A1b2C3d4E5f6G7h8'.repeat(2);       // sk- + 32 位 → R9 打码
+    const gw = await startGatewayWith([
+      providerOf('resp', up, { models: ['test-model'], reasoningEffortMap: { max: 'xhigh', off: 'disabled' } }),
+    ], 'resp1');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/responses?api-version=2025-04-01-preview',
+        body: {
+          model: 'test-model', stream: true,
+          instructions: 'system prompt with hash ' + fakeHex,
+          input: [
+            { type: 'message', role: 'developer', content: 'dev says hi' },
+            { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'key ' + fakeKey }] },
+          ],
+          reasoning: { effort: 'max' },
+        },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(/response\.created/.test(r.text) && /response\.completed/.test(r.text),
+        'SSE 应原样回传：' + r.text.slice(0, 200));
+      const sent = up.st.lastRespBody;
+      const sentText = JSON.stringify(sent);
+      assert.ok(sent && sent.model === 'test-model', '上游应收到 Responses 请求体：' + sentText.slice(0, 200));
+      assert.ok(!sentText.includes(fakeHex), 'instructions 里的长串必须打码：' + sentText.slice(0, 300));
+      assert.ok(sentText.includes('[sha256:40]'), '应出现长串占位符 [sha256:40]：' + sentText.slice(0, 300));
+      assert.ok(!sentText.includes('A1b2C3d4E5f6G7h8'), 'input 里的 sk- 密钥必须打码：' + sentText.slice(0, 300));
+      assert.ok(/sk-\*\*\*/.test(sentText), '应保留 sk- 前缀样式的打码：' + sentText.slice(0, 300));
+      assert.strictEqual(sent.input[0].role, 'system', 'developer 角色应改写为 system：' + sentText.slice(0, 300));
+      assert.strictEqual(sent.reasoning.effort, 'xhigh', 'reasoning.effort 应按 reasoningEffortMap 改写：' + sentText.slice(0, 300));
+      assert.ok(up.st.respUrls.some((u) => u.includes('api-version=2025-04-01-preview')),
+        '查询串应原样传给上游：' + up.st.respUrls.join(' | '));
+      // off 档位：Responses 没有"关闭"枚举值 → 应整段移除 reasoning（照抄 effort:"disabled" 会被严格上游 400）
+      const off = await call({
+        port: gw.port, p: '/v1/responses',
+        body: { model: 'test-model', input: 'hi', reasoning: { effort: 'off' } },
+      });
+      assert.strictEqual(off.status, 200, '实际 ' + off.status);
+      assert.ok(!('reasoning' in up.st.lastRespBody),
+        'reasoning.effort=off（映射为 disabled）应移除 reasoning 字段：' + JSON.stringify(up.st.lastRespBody).slice(0, 200));
+      assert.strictEqual(up.st.lastRespBody.model, 'test-model', '移除了 reasoning 不应影响其它字段');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：Responses 子路由回原供应商（GET/DELETE/cancel/input_items 不猜别家）', async () => {
+    const up1 = await startFakeUpstream({ responses: true });
+    const up2 = await startFakeUpstream({ responses: true });
+    const gw = await startGatewayWith([
+      providerOf('r1', up1, { priority: 1 }),
+      providerOf('r2', up2, { priority: 2 }),
+    ], 'resp2');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const created = await call({ port: gw.port, p: '/v1/responses', body: { model: 'test-model', input: 'one' } });
+      assert.strictEqual(created.status, 200, '实际 ' + created.status);
+      const m = /"id":"(resp_test\d+)"/.exec(created.text);
+      assert.ok(m, 'SSE 里应含 response.id：' + created.text.slice(0, 200));
+      const id = m[1];
+      assert.strictEqual(up1.st.calls, 1, 'priority 1 应创建该 response，实际 ' + up1.st.calls);
+      const up2Before = up2.st.calls;
+
+      const got = await call({ port: gw.port, method: 'GET', p: '/v1/responses/' + id, body: null });
+      assert.strictEqual(got.status, 200, 'GET 应命中创建它的那家，实际 ' + got.status + ' ' + got.text.slice(0, 160));
+      assert.ok(/"object":"response"/.test(got.text), '应回响应对象：' + got.text.slice(0, 160));
+
+      const items = await call({ port: gw.port, method: 'GET', p: '/v1/responses/' + id + '/input_items', body: null });
+      assert.strictEqual(items.status, 200, 'input_items 应可用，实际 ' + items.status + ' ' + items.text.slice(0, 160));
+      assert.ok(/"object":"list"/.test(items.text), items.text.slice(0, 160));
+
+      const created2 = await call({ port: gw.port, p: '/v1/responses', body: { model: 'test-model', input: 'two' } });
+      const id2 = /"id":"(resp_test\d+)"/.exec(created2.text)[1];
+      const cancelled = await call({ port: gw.port, method: 'POST', p: '/v1/responses/' + id2 + '/cancel', body: {} });
+      assert.strictEqual(cancelled.status, 200, 'cancel 应可用，实际 ' + cancelled.status + ' ' + cancelled.text.slice(0, 160));
+
+      const deleted = await call({ port: gw.port, method: 'DELETE', p: '/v1/responses/' + id, body: null });
+      assert.strictEqual(deleted.status, 200, 'DELETE 应可用，实际 ' + deleted.status + ' ' + deleted.text.slice(0, 160));
+      assert.ok(/"deleted":true/.test(deleted.text), deleted.text.slice(0, 160));
+      // 删除后同一 id 再取 → 上游 404（网关如实回 404，不再探测别家）
+      const gone = await call({ port: gw.port, method: 'GET', p: '/v1/responses/' + id, body: null });
+      assert.strictEqual(gone.status, 404, '已删除的资源应回 404，实际 ' + gone.status + ' ' + gone.text.slice(0, 160));
+
+      assert.strictEqual(up2.st.calls, up2Before,
+        '非 owner 供应商不得收到任何子路由请求（旧版全部 404 unsupported route），实际新增 ' + (up2.st.calls - up2Before));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/responses affinity: resp_test\d+ → r1/.test(logText), '日志应记录 response→供应商 亲和：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('网关：未知 response id —— 只读操作逐家探测（404），写操作拒绝猜测（零上游请求）', async () => {
+    const up1 = await startFakeUpstream({ responses: true });
+    const up2 = await startFakeUpstream({ responses: true });
+    const gw = await startGatewayWith([
+      providerOf('r1', up1, { priority: 1 }),
+      providerOf('r2', up2, { priority: 2 }),
+    ], 'resp3');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const before = [up1.st.calls, up2.st.calls];
+      const got = await call({ port: gw.port, method: 'GET', p: '/v1/responses/resp_unknown_xyz', body: null });
+      assert.strictEqual(got.status, 404, '实际 ' + got.status + ' ' + got.text.slice(0, 200));
+      assert.ok(/not found on any configured provider/.test(got.text), got.text.slice(0, 200));
+      assert.ok(up1.st.calls > before[0] && up2.st.calls > before[1],
+        '未知 id 的只读请求应逐家探测（各家对别人的 id 都回 404）：' + up1.st.calls + ',' + up2.st.calls);
+
+      const before2 = [up1.st.calls, up2.st.calls];
+      const del = await call({ port: gw.port, method: 'DELETE', p: '/v1/responses/resp_unknown_xyz', body: null });
+      assert.strictEqual(del.status, 404, '实际 ' + del.status);
+      assert.ok(/refusing to guess/.test(del.text), '写操作应明确拒绝猜测归属：' + del.text.slice(0, 200));
+      assert.deepStrictEqual([up1.st.calls, up2.st.calls], before2,
+        '写操作（DELETE）不得向任何供应商试探，避免误删别家资源');
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('网关：previous_response_id 在多轮中钉回原供应商（round-robin 下也不例外）', async () => {
+    const up1 = await startFakeUpstream({ responses: true });
+    const up2 = await startFakeUpstream({ responses: true });
+    const gw = await startGatewayWith([
+      providerOf('r1', up1, { priority: 1 }),
+      providerOf('r2', up2, { priority: 2 }),
+    ], 'resp4', null, { routing: 'round-robin' });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r1 = await call({ port: gw.port, p: '/v1/responses', body: { model: 'test-model', input: 'turn-1' } });
+      assert.strictEqual(r1.status, 200, '实际 ' + r1.status);
+      const id = /"id":"(resp_test\d+)"/.exec(r1.text)[1];
+      assert.strictEqual(up1.st.calls, 1, '轮询起点应为 r1，实际 ' + up1.st.calls);
+      const c1 = up1.st.calls;
+      const c2 = up2.st.calls;
+      const r2 = await call({
+        port: gw.port, p: '/v1/responses',
+        body: { model: 'test-model', input: 'turn-2', previous_response_id: id },
+      });
+      assert.strictEqual(r2.status, 200, '实际 ' + r2.status);
+      assert.strictEqual(up1.st.calls, c1 + 1, '带 previous_response_id 的多轮请求应回到原供应商（轮询不得改变归属）');
+      assert.strictEqual(up2.st.calls, c2, '有状态请求不得发给别家（否则上下文丢失/404）');
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('网关：owner 上游故障（5xx）→ 502（不谎报 404 "资源不存在"）', async () => {
+    const up = await startFakeUpstream({ responses: true, resourceStatus: 500 });
+    const gw = await startGatewayWith([providerOf('r1', up, { priority: 1 })], 'resp5');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const created = await call({ port: gw.port, p: '/v1/responses', body: { model: 'test-model', input: 'x' } });
+      const id = /"id":"(resp_test\d+)"/.exec(created.text)[1];
+      const got = await call({ port: gw.port, method: 'GET', p: '/v1/responses/' + id, body: null });
+      assert.strictEqual(got.status, 502, '上游故障应回 502，实际 ' + got.status + ' ' + got.text.slice(0, 200));
+      assert.ok(/retry shortly/.test(got.text), '应提示可重试：' + got.text.slice(0, 200));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：上游对子路由回确定性 4xx（400）→ 按资源语境回 400（不把 response id 说成"模型"）', async () => {
+    const up = await startFakeUpstream({ responses: true, resourceStatus: 400 });
+    const gw = await startGatewayWith([providerOf('r1', up, { priority: 1 })], 'resp7');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const created = await call({ port: gw.port, p: '/v1/responses', body: { model: 'test-model', input: 'x' } });
+      const id = /"id":"(resp_test\d+)"/.exec(created.text)[1];
+      const r = await call({ port: gw.port, method: 'POST', p: '/v1/responses/' + id + '/cancel', body: {} });
+      assert.strictEqual(r.status, 400, '应把确定性 400 映射回客户端，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(/rejected POST \/v1\/responses\/\{id\} with HTTP 400/.test(r.text), '文案应是资源语境：' + r.text.slice(0, 300));
+      assert.ok(!/model \\?"|rejected model/.test(r.text), '不得把 response id 说成模型名：' + r.text.slice(0, 300));
+      assert.ok(!/upstream temporarily unavailable/.test(r.text), '不得回显上游原文：' + r.text.slice(0, 300));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：上游未实现 Responses 子路由（new-api 的 Invalid URL）→ 404 文案指出"供应商能力缺失"而非"已删除"', async () => {
+    const up = await startFakeUpstream({ responses: true, noResourceRoutes: true });
+    const gw = await startGatewayWith([providerOf('r1', up, { priority: 1 })], 'resp6');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const created = await call({ port: gw.port, p: '/v1/responses', body: { model: 'test-model', input: 'x' } });
+      assert.strictEqual(created.status, 200, '创建本身应成功（上游实现了 POST）：' + created.status);
+      const id = /"id":"(resp_test\d+)"/.exec(created.text)[1];
+      for (const [method, p, epName] of [
+        ['GET', '/v1/responses/' + id, 'GET /v1/responses/{id}'],
+        ['GET', '/v1/responses/' + id + '/input_items', 'GET /v1/responses/{id}/input_items'],
+        ['DELETE', '/v1/responses/' + id, 'DELETE /v1/responses/{id}'],
+        ['POST', '/v1/responses/' + id + '/cancel', 'POST /v1/responses/{id}/cancel'],
+      ]) {
+        const r = await call({ port: gw.port, method, p, body: method === 'POST' ? {} : null });
+        assert.strictEqual(r.status, 404, method + ' ' + p + ' 应回 404，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+        assert.ok(/does not implement the Responses resource endpoint/.test(r.text),
+          '应指出是供应商能力缺失：' + r.text.slice(0, 300));
+        assert.ok(r.text.includes(epName), '文案应点名端点 ' + epName + '：' + r.text.slice(0, 300));
+        assert.ok(!/expired or been deleted/.test(r.text), '不得误导为"资源已过期/被删"：' + r.text.slice(0, 300));
+      }
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/owner-miss\/route-missing/.test(logText), '日志应标注 route-missing（便于排查）：' + logText.slice(-300));
     } finally { killGw(gw); closeUp(up); }
   });
 
