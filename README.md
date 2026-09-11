@@ -57,7 +57,7 @@ dsh-app/
 │   ├── dist.mirror.mjs      # NSIS 安装版 + 单文件便携（npmmirror 镜像）
 │   ├── release.ps1          # 通用发布脚本（版本号从 package.json 读取）
 │   └── reupload-zip.ps1     # 单资产补传（大文件上传断线重试）
-└── tests/unit.js       # 纯逻辑单测（node tests/unit.js）
+└── tests/              # 6 个测试套件（unit 单测 / node tests/unit.js 可单独运行）
 ```
 
 ## 设置项（设置窗口）
@@ -175,9 +175,22 @@ powershell -ExecutionPolicy Bypass -File scripts\reupload-zip.ps1 -Token <TOKEN>
 ## 测试
 
 ```powershell
-npm test          # 单测 22 项 + 集成 9 项（看门狗/网关/图标/数据迁移/安全模式文件往返）
+npm test          # 6 个套件（见下），全部在临时目录内操作，不触碰真实用户数据
 npm run check     # 语法检查
 ```
+
+| 套件 | 覆盖 |
+|---|---|
+| `tests/unit.js` | 纯逻辑单测（版本比较 / 看门狗日志解析 / 网关配置校验） |
+| `tests/integration.js` | 无需 Electron 的托管逻辑（网关配置读写与解包 / 安全模式文件往返 / 默认插件安装与自检） |
+| `tests/market.test.js` | 插件市场条目标准化与源配置 |
+| `tests/email-scrub.test.mjs` | **发布安全闸门**（真实邮箱/密钥拦截、占位符不误报、fail-closed） |
+| `tests/runtime.test.js` | 运行时回归：launcher 状态机 / 看门狗终态 / 市场包名校验 / 网关管理器 / 主进程接线 / 渲染层结构 |
+| `tests/gateway.test.js` | **模型网关端到端**：进程内假上游 + 真启动网关进程（鉴权 / SSE / 客户端断开取消上游 / 413 / 畸形 Host / write-dsh 的 YAML 定位） |
+
+> 本机若未安装独立 Node.js，`node` 会解析到随应用分发的 `DSH-App.exe`（Electron 的
+> `ELECTRON_RUN_AS_NODE` 模式）——测试已适配（`process.noAsar`、`process.resourcesPath`
+> 只读、子进程管道 stdio 受限等）。
 
 ## 已知边界
 
