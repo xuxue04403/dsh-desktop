@@ -18,20 +18,51 @@ const REGEX_URL_LINE = /dsh web:\s*(https?:\/\/[^\s\)]+)/;
 // 等待就绪超时（毫秒）
 const READY_TIMEOUT = 90 * 1000;
 
-// 简易版本比较：'0.1.3-alpha.1' vs '0.1.2-rc.1'
+// semver 版本比较（审计修复）：
+// 旧实现按 `[.-]` 切分后逐段比较，把预发布标识当普通段 → `0.1.3-alpha.1` 被判为**高于**
+// `0.1.3`（与 semver 相反）：多版本并存时 findDsh 可能选错版本，checkForUpdate 也可能对
+// 已是最新的稳定版反复提示升级。现在按 semver 规则：
+//   1) 先比 x.y.z 数字段（缺失/非数字按 0）；
+//   2) 都有预发布标识 → 逐段比较（数字段 < 字母段；段数少者更小）；
+//   3) 只有一方有预发布标识 → **有预发布的那方更小**。
 function compareVersions(a, b) {
-  const parse = (v) =>
-    (v || '').split(/[.-]/).map((s) => (/^\d+$/.test(s) ? parseInt(s, 10) : s));
-  const pa = parse(a), pb = parse(b);
-  const n = Math.max(pa.length, pb.length);
+  const parse = (v) => {
+    const s = String(v == null ? '' : v).trim().replace(/^v/i, '');
+    const dash = s.indexOf('-');
+    const core = dash >= 0 ? s.slice(0, dash) : s;
+    const pre = dash >= 0 ? s.slice(dash + 1) : '';
+    return {
+      nums: core.split('.').map((x) => (/^\d+$/.test(x) ? parseInt(x, 10) : NaN)),
+      pre: pre ? pre.split('.') : [],
+    };
+  };
+  const A = parse(a);
+  const B = parse(b);
+  const n = Math.max(A.nums.length, B.nums.length);
   for (let i = 0; i < n; i++) {
-    const x = pa[i], y = pb[i];
+    const x = Number.isFinite(A.nums[i]) ? A.nums[i] : 0;
+    const y = Number.isFinite(B.nums[i]) ? B.nums[i] : 0;
+    if (x !== y) return x > y ? 1 : -1;
+  }
+  if (A.pre.length === 0 && B.pre.length === 0) return 0;
+  if (A.pre.length === 0) return 1;    // 正式版 > 预发布版
+  if (B.pre.length === 0) return -1;
+  const m = Math.max(A.pre.length, B.pre.length);
+  for (let i = 0; i < m; i++) {
+    const x = A.pre[i];
+    const y = B.pre[i];
     if (x === undefined) return -1;
     if (y === undefined) return 1;
-    if (typeof x === 'number' && typeof y === 'number') {
-      if (x !== y) return x > y ? 1 : -1;
-    } else if (String(x) !== String(y)) {
-      return String(x) > String(y) ? 1 : -1;
+    const xd = /^\d+$/.test(x);
+    const yd = /^\d+$/.test(y);
+    if (xd && yd) {
+      const xi = parseInt(x, 10);
+      const yi = parseInt(y, 10);
+      if (xi !== yi) return xi > yi ? 1 : -1;
+    } else if (xd !== yd) {
+      return xd ? -1 : 1;              // 数字标识符优先级低于字母标识符
+    } else if (x !== y) {
+      return x > y ? 1 : -1;
     }
   }
   return 0;
@@ -198,6 +229,8 @@ class Launcher extends EventEmitter {
     this.running = false;
     this.ready = false;
     this.manualStop = false;   // 手动停止标志：避免退出事件触发看门狗
+    this.installing = false;   // 首次安装（npm/npx）进行中——这期间 this.proc 为 null
+    this.installChild = null;  // 安装子进程句柄（允许「停止服务」取消安装）
     this.webLogBaseline = 0;   // R22：本次启动前 web.log 字节基线（看门狗切分用）
   }
 
@@ -210,12 +243,100 @@ class Launcher extends EventEmitter {
       this.applySubprocessPatch(this.found);
       // R21：OpenCode Go 的 x-opencode-session 头（2026-09-05 起上游强制）
       this.applyOpenCodeSessionPatch(this.found);
+      // R28：模型发现实时化（内置目录快照不含新上线模型）
+      this.applyLiveModelDiscoveryPatch(this.found);
     }
     return this.found;
   }
 
   get version() {
     return this.found ? this.found.version : '';
+  }
+
+  // R28（模型发现实时化，2026-09-10）：
+  //   dsh 的「获取模型」走 @deepseek-ai/dsh-llm-pi-ai 的 discoverModels()。它**先查内置
+  //   目录**（pi-ai 随包发布的 models 快照）——目录命中的 provider（如 opencode-go）直接
+  //   return，**根本不发网络请求**。于是新上线的模型（如 deepseek-v4.1-flash）在 UI 里
+  //   永远看不到，用户点多少次"获取模型"都没用。
+  //   本补丁把该分支改成「实时优先 + 目录回退」：对白名单 provider 先按目录里声明的
+  //   baseUrl/api 拉一次实时列表（实测 https://opencode.ai/zen/go/v1/models 返回 37 个模型，
+  //   含 deepseek-v4.1-flash），同名模型沿用目录里的显示名与容量，失败/为空则回退目录
+  //   （离线可用性不变）。白名单可用环境变量 DSH_APP_LIVE_MODELS 覆盖（逗号分隔）。
+  //   幂等：含 R28 标记即跳过；dsh 升级替换文件后由 detect() 自动重打。
+  applyLiveModelDiscoveryPatch(found) {
+    if (!found || !found.dir) return false;
+    try {
+      const file = path.join(found.dir, 'node_modules', '@deepseek-ai', 'dsh-llm-pi-ai', 'lib', 'index.js');
+      if (!fs.existsSync(file)) return false;
+      let src = fs.readFileSync(file, 'utf8');
+      if (src.includes('// R28 dsh-app')) return true;   // 已打过
+      const anchor = [
+        '\tif (request.provider !== void 0) {',
+        '\t\tconst installed = catalogModels(request.provider);',
+        '\t\tif (installed.size > 0) return [...installed.values()].map((model) => ({',
+        '\t\t\tid: model.id,',
+        '\t\t\tname: model.name,',
+        '\t\t\tcontextWindow: model.contextWindow,',
+        '\t\t\tmaxTokens: model.maxTokens',
+        '\t\t}));',
+        '\t}',
+      ].join('\n');
+      if (!src.includes(anchor)) {
+        this.log('R28 补丁：未找到模型发现目录短路锚点（dsh 版本变化？）——「获取模型」仍只会返回内置快照');
+        return false;
+      }
+      const replacement = [
+        '\tif (request.provider !== void 0) {',
+        '\t\tconst installed = catalogModels(request.provider);',
+        '\t\tif (installed.size > 0) {',
+        '\t\t\tconst catalogReply = [...installed.values()].map((model) => ({',
+        '\t\t\t\tid: model.id,',
+        '\t\t\t\tname: model.name,',
+        '\t\t\t\tcontextWindow: model.contextWindow,',
+        '\t\t\t\tmaxTokens: model.maxTokens',
+        '\t\t\t}));',
+        '\t\t\t// R28 dsh-app: 内置目录是安装时的快照——目录命中的 provider 在此直接返回，永不联网，',
+        '\t\t\t// 新上线的模型因此在「获取模型」里永远看不到。白名单内的 provider 先要一次实时列表，',
+        '\t\t\t// 失败/为空再回退目录（离线行为不变）。DSH_APP_LIVE_MODELS 可覆盖白名单。',
+        '\t\t\tconst liveProviders = new Set(String((typeof process !== "undefined" && process.env && process.env.DSH_APP_LIVE_MODELS) || "opencode-go,opencode").split(",").map((s) => s.trim()).filter(Boolean));',
+        '\t\t\tif (liveProviders.has(request.provider)) {',
+        '\t\t\t\ttry {',
+        '\t\t\t\t\tconst entries = [...installed.values()];',
+        '\t\t\t\t\tconst seed = entries.find((m) => typeof m.baseUrl === "string" && m.baseUrl.length > 0);',
+        '\t\t\t\t\tconst liveBase = request.baseURL !== void 0 && request.baseURL.length > 0 ? request.baseURL : (seed === void 0 ? void 0 : seed.baseUrl);',
+        '\t\t\t\t\tif (liveBase !== void 0) {',
+        '\t\t\t\t\t\tconst known = new Map(catalogReply.map((m) => [m.id, m]));',
+        '\t\t\t\t\t\tconst live = await discoverModels({',
+        '\t\t\t\t\t\t\t...request,',
+        '\t\t\t\t\t\t\tprovider: void 0,',
+        '\t\t\t\t\t\t\tbaseURL: liveBase,',
+        '\t\t\t\t\t\t\tapi: request.api ?? (seed === void 0 ? void 0 : seed.api)',
+        '\t\t\t\t\t\t}, storedProfile);',
+        '\t\t\t\t\t\tconst merged = live.map((m) => {',
+        '\t\t\t\t\t\t\tconst hit = known.get(m.id);',
+        '\t\t\t\t\t\t\treturn hit === void 0 ? m : {',
+        '\t\t\t\t\t\t\t\t...m,',
+        '\t\t\t\t\t\t\t\tname: m.name ?? hit.name,',
+        '\t\t\t\t\t\t\t\tcontextWindow: m.contextWindow ?? hit.contextWindow,',
+        '\t\t\t\t\t\t\t\tmaxTokens: m.maxTokens ?? hit.maxTokens',
+        '\t\t\t\t\t\t\t};',
+        '\t\t\t\t\t\t});',
+        '\t\t\t\t\t\tif (merged.length > 0) return merged;',
+        '\t\t\t\t\t}',
+        '\t\t\t\t} catch { /* 实时失败 → 回退目录 */ }',
+        '\t\t\t}',
+        '\t\t\treturn catalogReply;',
+        '\t\t}',
+        '\t}',
+      ].join('\n');
+      src = src.replace(anchor, replacement);
+      fs.writeFileSync(file, src, 'utf8');
+      this.log('R28 补丁：dsh-llm-pi-ai 模型发现改为「实时优先 + 目录回退」 ✓');
+      return true;
+    } catch (e) {
+      this.log('R28 补丁 失败: ' + (e && e.message ? e.message : e));
+      return false;
+    }
   }
 
   // dsh 便携安装前缀（内嵌运行时方案）：<data>\node-global —— npm --prefix 安装位置，
@@ -338,7 +459,10 @@ class Launcher extends EventEmitter {
   // UI 表现为"正在启动中"一直转圈）；失败路径保证 this.proc 不为 null 的兜底（错误事件
   // 处理依赖 proc），并在安装失败时发出 'install-failed' 事件让 UI 及时反馈。
   start() {
-    if (this.proc) return;
+    // 审计修复（P1）：首次安装期间 this.proc 仍为 null，`if (this.proc) return` 拦不住
+    // 重复触发（用户在"正在安装"时再点「启动」/托盘重复点击/服务操作队列前后两次调用）
+    // → 会对同一 --prefix 并发跑两个 npm install，互相踩 node_modules。这里加独立闸门。
+    if (this.proc || this.installing) return;
     this.ready = false;
     this.authUrl = '';
     this.manualStop = false;
@@ -387,7 +511,16 @@ class Launcher extends EventEmitter {
       // 本机无 dsh → 首次自动安装（异步，不阻塞 UI）：
       // 优先内嵌 npm（装到 data\node-global 便携前缀，零系统依赖）；
       // 回退 npx（系统有 node 的环境）。
-      this._installAndStart(args, spawnEnv);
+      // 审计修复：安装全程持 installing 闸门（并发 start 直接返回），并允许 stop() 取消。
+      this.installing = true;
+      const token = (this._installToken = (this._installToken || 0) + 1);
+      this._installAndStart(args, spawnEnv)
+        .catch((e) => this.log('首次安装异常：' + (e && e.message ? e.message : e)))
+        .finally(() => {
+          // 令牌校验：安装被 stop() 取消后紧接着又有新的安装启动时，
+          // 旧任务的收尾不得把新任务的闸门打开（否则又出现并发安装）
+          if (this._installToken === token) { this.installing = false; this.installChild = null; }
+        });
     }
   }
 
@@ -486,20 +619,24 @@ class Launcher extends EventEmitter {
             '@deepseek-ai/dsh@latest', '--no-fund', '--no-audit', '--force', '--registry', registry], {
             windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: prep.env,
           });
+          this.installChild = child;   // 审计修复：暴露句柄，stop() 可取消安装
           let out = '';
           const t = setTimeout(() => { try { child.kill(); } catch (_) { /* 忽略 */ } resolve({ status: 1, output: out + '\n[超时] 5 分钟' }); }, 5 * 60 * 1000);
           if (child.stdout) child.stdout.on('data', (c) => { out += c; });
           if (child.stderr) child.stderr.on('data', (c) => { out += c; });
           child.on('error', (e) => { clearTimeout(t); resolve({ status: 1, output: String(e) }); });
-          child.on('exit', (code) => { clearTimeout(t); resolve({ status: code, output: out }); });
+          child.on('exit', (code) => { clearTimeout(t); if (this.installChild === child) this.installChild = null; resolve({ status: code, output: out }); });
         });
         if (install.status === 0) {
           this.log('dsh 安装完成（便携前缀），正在启动…');
           this.detect();   // 重新扫描（便携前缀在 findDsh 扫描列表内）
+          // 审计修复：安装期间被「停止服务」取消（manualStop）→ 不再自动拉起服务
+          if (this.manualStop) { this.log('安装完成，但服务已被用户停止——不自动启动。'); return; }
           if (this.found && this._spawnDsh(args, spawnEnv)) return;
           this.log('安装完成但未检测到 dsh，回退 npx…');
         } else {
           this.log('内嵌 npm 安装失败（退出码 ' + install.status + '）：' + String(install.output || '').slice(-300));
+          if (this.manualStop) return;   // 被用户取消 → 不落入 npx 回退
         }
       } catch (e) {
         this.log('内嵌 npm 安装异常：' + (e && e.message ? e.message : e));
@@ -579,6 +716,19 @@ class Launcher extends EventEmitter {
     const p = this.proc;
     this.proc = null;
     this.manualStop = true;
+    // 审计修复（P1）：running 必须在 stop 时复位。旧版只置 proc=null，而 _wireProc 的
+    // 进程身份守卫（R22）会拦掉随后迟到的 exit 事件 → running 永远停在 true：
+    //   · upgradeDsh 的 wasRunning 误判 → 用户手动停服后升级还会自动把服务拉起来；
+    //   · waitReadyByProbe / onBootTimeout 的 launcher.running 判断失真。
+    this.running = false;
+    this.ready = false;
+    // 首次安装进行中 → 允许取消（安装子进程不在 this.proc 上）
+    if (this.installChild) {
+      try { this.installChild.kill(); this.log('已取消进行中的 dsh 安装。'); } catch (_) { /* 忽略 */ }
+      this.installChild = null;
+    }
+    this._installToken = (this._installToken || 0) + 1;   // 使在途安装任务的收尾失效
+    this.installing = false;                              // 让紧随其后的 start() 能重新发起
     if (!p || p.exitCode !== null) return;
     try {
       // Windows 进程树终止
