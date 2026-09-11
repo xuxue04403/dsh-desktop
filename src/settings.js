@@ -18,6 +18,7 @@ const DEFAULTS = {
   minimizeToTray: true,     // 关窗最小化到托盘
   checkUpdates: true,       // 启动时检查 dsh 新版本
   installDefaultPlugins: true,   // v1.7.0：随 app 分发默认插件（dsh-email-bridge 邮箱桥接）并挂载到 dsh profile
+  trayBalloonShown: false,   // 托盘"首次运行"气泡是否已提示过（审计修复：旧版每次启动都弹）
   // —— 安全模式状态（程序自身维护，勿手改）——
   safeMode: false,
   safeModeLevel: 0,         // 1=补丁禁用故障插件 2=临时剥离第三方插件
@@ -59,6 +60,12 @@ class Settings {
 
   update(patch) {
     Object.assign(this.data, patch);
+    // 审计修复（P1）：端口在**写入路径**上就要兜底。旧版只在 load() 里校验，渲染层
+    // 手填 99999 / 0 / 空串会原样落盘并被 launcher 拼进 `dsh web --port`（连不上端口 →
+    // 走看门狗恢复），且 UI 显示与落盘值不一致。
+    const p = Number(this.data.port);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) this.data.port = DEFAULTS.port;
+    else this.data.port = p;
     this.save();
     return this.data;
   }
