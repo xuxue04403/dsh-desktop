@@ -1,7 +1,8 @@
 // scripts/vendor-email-bridge.mjs — 把 dsh-email-bridge 插件连同其运行依赖打包进 out\_vendor
 //
 // 用法：node scripts/vendor-email-bridge.mjs [--src <插件目录>]
-// 默认源：D:\IDE\dsh\dsh-email-bridge
+// 源目录解析顺序（审计修复 P2，不再硬编码开发机路径 D:\IDE\dsh\dsh-email-bridge）：
+//   命令行 --src  >  环境变量 DSH_EMAIL_BRIDGE_SRC  >  <项目根>\..\dsh-email-bridge
 //
 // 产物：out\_vendor\dsh-email-bridge\{package.json,lib\,README.md,node_modules\}
 //   - 第三方运行依赖（imapflow/mailparser/nodemailer/js-yaml）扁平化安装（真实目录，
@@ -17,12 +18,13 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
 const srcArg = (() => { const i = args.indexOf('--src'); return i >= 0 ? args[i + 1] : ''; })();
-const src = srcArg || 'D:\\IDE\\dsh\\dsh-email-bridge';
+const src = srcArg || process.env.DSH_EMAIL_BRIDGE_SRC || path.resolve(root, '..', 'dsh-email-bridge');
 const destRoot = path.join(root, 'out', '_vendor');
 const dest = path.join(destRoot, 'dsh-email-bridge');
 
 if (!existsSync(path.join(src, 'package.json'))) {
   console.error('[错误] 找不到插件源: ' + src);
+  console.error('       请用 --src <目录> 或环境变量 DSH_EMAIL_BRIDGE_SRC 指定（默认 ' + path.resolve(root, '..', 'dsh-email-bridge') + '）。');
   process.exit(1);
 }
 
@@ -88,11 +90,50 @@ const npmArgs = ['install', '--omit=dev', '--no-audit', '--no-fund', '--no-packa
   '--cache', path.join(root, 'out', '_npm-cache'),
   '--registry', process.env.DSH_NPM_REGISTRY || 'https://registry.npmmirror.com',
   ...runtimeDeps];
-const r = npmCli
-  ? spawnSync(process.execPath, [npmCli, ...npmArgs], { cwd: dest, stdio: 'inherit' })
-  : spawnSync('npm', npmArgs, { cwd: dest, stdio: 'inherit', shell: true });
+// 审计修复（P2）：回退分支不能再 `spawnSync('npm', args, {shell:true})` —— shell:true 会把
+// 数组参数拼成命令行且**不加引号**，路径含空格/&/^ 时被拆断（此前的实测事故）。
+// 现在：参数逐个显式引用后再交给 shell；POSIX 上直接用数组传参（无 shell）。
+function quoteArg(a) {
+  const s = String(a);
+  if (s === '') return '""';
+  if (!/[\s"&|<>^()%!]/.test(s)) return s;
+  return '"' + s.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, '$1$1') + '"';
+}
+let r;
+if (npmCli) {
+  r = spawnSync(process.execPath, [npmCli, ...npmArgs], { cwd: dest, stdio: 'inherit' });
+} else if (process.platform === 'win32') {
+  // Windows 上 npm 是 npm.cmd（批处理），Node 的 spawn 不能直接执行 .cmd（EINVAL），
+  // 因此显式引用后走 shell 字符串（每个参数单独加引号，避免拆断）。
+  const cmdline = ['npm', ...npmArgs].map(quoteArg).join(' ');
+  console.log('[..] 回退到系统 npm（shell，参数已显式引用）: ' + cmdline.slice(0, 200) + ' ...');
+  r = spawnSync(cmdline, { cwd: dest, stdio: 'inherit', shell: true });
+} else {
+  r = spawnSync('npm', npmArgs, { cwd: dest, stdio: 'inherit' });
+}
+if (r.error) {
+  console.error('[错误] 无法启动 npm：' + r.error.message + '（请确认已安装 npm 或项目内 node_modules\\npm 存在）');
+  process.exit(1);
+}
 if (r.status !== 0) {
   console.error('[错误] 依赖安装失败（退出码 ' + r.status + '）');
+  process.exit(1);
+}
+
+// 审计修复（P2）：只看 npm 退出码不够——npm 可能"成功退出"但某些包没装上
+// （registry 缺包、缓存损坏、optional 失败）。逐个校验 runtimeDep 的 package.json，
+// 缺失即非零退出，避免把缺依赖的 vendor 打进产物。
+const installed = new Map();
+const missingDeps = [];
+for (const n of runtimeDeps) {
+  const pj = path.join(dest, 'node_modules', n, 'package.json');
+  if (!existsSync(pj)) { missingDeps.push(n); continue; }
+  try { installed.set(n, JSON.parse(readFileSync(pj, 'utf8')).version || '?'); }
+  catch (err) { missingDeps.push(n + '（package.json 解析失败：' + (err && err.message ? err.message : err) + '）'); }
+}
+if (missingDeps.length) {
+  console.error('[错误] 依赖未真正安装（node_modules\\<dep>\\package.json 不存在）：' + missingDeps.join(', '));
+  console.error('       vendor 目录不可用，已拒绝产出（否则会把缺依赖的插件打进安装包）。');
   process.exit(1);
 }
 
@@ -101,11 +142,7 @@ const meta = {
   name: outPkg.name,
   version: outPkg.version,
   vendoredAt: new Date().toISOString(),
-  runtimeDeps: runtimeDeps.map((n) => {
-    try {
-      return n + '@' + JSON.parse(readFileSync(path.join(dest, 'node_modules', n, 'package.json'), 'utf8')).version;
-    } catch (_) { return n + '@?'; }
-  }),
+  runtimeDeps: runtimeDeps.map((n) => n + '@' + (installed.get(n) || '?')),
 };
 writeFileSync(path.join(destRoot, 'vendor-meta.json'), JSON.stringify(meta, null, 2) + '\n', 'utf8');
 
