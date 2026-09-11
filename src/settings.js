@@ -8,6 +8,8 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+// 可移植性修复（2026-09-11）：workDir 可能来自另一台电脑 → 统一走"不可用就回退主目录"
+const { dirUsable, workDirOrHome } = require('./paths');
 
 const DEFAULTS = {
   port: 3080,               // dsh web 监听端口（与 --port 契约对应）
@@ -44,8 +46,19 @@ class Settings {
     // R25（审计低-4）：load 路径也校验端口（IPC 保存路径有校验，手改 settings.json 没有）
     const p = Number(this.data.port);
     if (!Number.isInteger(p) || p < 1 || p > 65535) this.data.port = DEFAULTS.port;
-    // 工作目录兜底
-    if (!this.data.workDir) this.data.workDir = os.homedir();
+    // 工作目录兜底（可移植性修复 2026-09-11）：settings.json 常随绿色目录一起被复制到
+    // **另一台电脑**，里面的 workDir 是旧机器的绝对路径（C:\Users\旧用户名）。
+    // 该路径不存在时必须换成当前用户主目录并落盘，否则 launcher 以它为 cwd → spawn ENOENT，
+    // 表现为"双击后只有空白窗口"（与 cmd.exe 那条 ENOENT 是同一类故障）。
+    const wanted = this.data.workDir;
+    if (!dirUsable(wanted)) {
+      const fixed = workDirOrHome(wanted);
+      if (wanted && fs.existsSync(this.file)) {
+        this.logError('workDir', new Error('工作目录不存在（可能来自其它电脑）已回退：' + wanted + ' → ' + fixed));
+      }
+      this.data.workDir = fixed;
+      if (fs.existsSync(this.file)) this.save();   // 落盘，避免每次启动重复判定
+    }
     return this.data;
   }
 
