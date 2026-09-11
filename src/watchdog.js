@@ -110,15 +110,6 @@ class Watchdog {
 
   // 启动失败（未就绪即退出 / 或等待超时）时由 main 调用
   async tryRecover() {
-    // R25（审计阻断修复）：旧版单发闸 `if (this.triggered) return` —— Level 1/2 重启后
-    // 若二次失败，这里直接 return，"安全模式也未能启动"分支成为死代码，UI 永久卡
-    // "正在重启…"。改为：已触发过**且已进入安全模式**才终止（safeMode 已持久化，
-    // 重入必然落入安全模式分支结束，不会死循环）；未进安全模式的重入允许再分析
-    // （例如非插件失败消耗了名额后，真正的插件故障仍能被隔离）。成功启动由
-    // main 的 onReady 复位 triggered。
-    if (this.triggered && this.settings.data.safeMode) return;
-    this.triggered = true;
-
     const logPath = path.join(this.settings.dir, 'logs', 'web.log');
     let logText = '';
     try {
@@ -135,6 +126,24 @@ class Watchdog {
     const names = parseFailedPlugins(logText);
 
     const data = this.settings.data;
+
+    // R25 复核（审计 P1）：本轮已触发过看门狗且**已在安全模式**（Level 1/2 重启后再次
+    // 失败）→ 终止自动尝试并给出**终态**。旧版在这里直接 `return`，使下面「安全模式也
+    // 未能启动服务」分支在同进程内不可达：UI 永久停在"正在重启…"，既没有失败原因，
+    // 也拿不到「退出安全模式」入口（用户只能杀进程/手删配置）。
+    if (this.triggered && data.safeMode) {
+      this.state.update({
+        service: 'failed',
+        phase: '安全模式也未能启动服务',
+        failReason: 'dsh 在禁用故障插件后仍无法启动。' + (names.length
+          ? '（日志仍显示：' + names.join(', ') + '）'
+          : '（日志未显示插件故障，请检查端口/网络/工作目录）'),
+      });
+      this.log('安全模式启动失败，等待用户处理（可在状态页「退出安全模式」恢复正常启动）。');
+      return;
+    }
+    this.triggered = true;
+
     if (data.safeMode) {
       // 安全模式下仍失败：停止自动尝试，交还用户
       this.state.update({
@@ -159,7 +168,9 @@ class Watchdog {
 
     // —— 插件故障 → Level 1：按条目禁用 ——
     this.log('检测到故障插件: ' + names.join(', ') + '，尝试自动隔离…');
-    const yaml = this.runDumpConfig();
+    // 审计修复（P2）：dump-config 失败（受限权限下会 EPERM）时退回 profile patch 索引，
+    // 避免直接升级到"剥离全部第三方插件"的 Level 2。
+    const yaml = this.runDumpConfig() || this.patchEntryIndex();
     const ids = resolveEntryIds(yaml, names);
     if (ids.length && this.writeSafePatch(ids)) {
       data.safeMode = true;
@@ -251,7 +262,45 @@ class Watchdog {
       const r = spawnSync(node, [bin, '--profile', 'web', '--dump-config'], {
         cwd: this.workDir, encoding: 'utf8', timeout: 30000, windowsHide: true, env,
       });
-      return r.status === 0 ? r.stdout : null;
+      if (r.status !== 0) {
+        // 不再静默：失败原因写进日志，便于判断是否走了下面的兜底索引
+        this.log('--dump-config 失败（退出码 ' + r.status + '）：'
+          + String(r.stderr || r.stdout || '').trim().slice(0, 200));
+        return null;
+      }
+      return r.stdout;
+    } catch (err) {
+      this.log('--dump-config 异常：' + (err && err.message ? err.message : err));
+      return null;
+    }
+  }
+
+  /**
+   * dump-config 失败时的兜底索引（审计修复 P2）。
+   * `dsh --profile web --dump-config` 会**先写 profile 根文件**——在受限权限/只读 profile
+   * 下会 EPERM 失败（实测）。旧版此时直接升级到 Level 2（剥离**全部**第三方插件），
+   * 用一个坏插件惩罚所有插件。这里直接从 cordis.patch.yml 提取 (id, name) 对，喂给
+   * resolveEntryIds —— 结构与 dump-config 输出同形，足以定位故障条目。
+   */
+  patchEntryIndex() {
+    try {
+      const cp = path.join(this.profileDir, 'cordis.patch.yml');
+      if (!fs.existsSync(cp)) return null;
+      const lines = fs.readFileSync(cp, 'utf8').split(/\r?\n/);
+      const entries = [];
+      let cur = null;
+      for (const raw of lines) {
+        const t = raw.trim();
+        const mi = t.match(/^-\s*id:\s*['"]?([^'"\s]+)['"]?$/);
+        const mi2 = t.match(/^id:\s*['"]?([^'"\s]+)['"]?$/);
+        if (mi || mi2) { cur = { id: (mi ? mi[1] : mi2[1]) }; entries.push(cur); continue; }
+        const mn = t.match(/^name:\s*['"]?([^'"\s]+)['"]?$/);
+        if (mn && cur && !cur.name) cur.name = mn[1];
+      }
+      const good = entries.filter((e) => e.id);
+      if (!good.length) return null;
+      this.log('已改用 profile patch 索引定位故障条目（' + good.length + ' 条）');
+      return good.map((e) => '- id: ' + e.id + (e.name ? '\n  name: ' + e.name : '')).join('\n') + '\n';
     } catch (_) { return null; }
   }
 
@@ -270,13 +319,16 @@ class Watchdog {
   }
 
   // —— Level 2：备份/还原 profile 配置 ——
+  // 审计修复（P2）：已存在备份时**不得覆盖**。否则第二次进入 Level 2（或上次 Level 2 后
+  // 未正常退出安全模式就崩溃/重启）会把"已被剥离过的 profile"当成原始配置备份，
+  // 原始 package.json / cordis.patch.yml 永久丢失。
   backupProfile() {
     try {
       if (!fs.existsSync(this.profileDir)) return false;
       const pj = path.join(this.profileDir, 'package.json');
       const cp = path.join(this.profileDir, 'cordis.patch.yml');
-      if (fs.existsSync(pj)) fs.copyFileSync(pj, pj + '.dshsafe.bak');
-      if (fs.existsSync(cp)) fs.copyFileSync(cp, cp + '.dshsafe.bak');
+      if (fs.existsSync(pj) && !fs.existsSync(pj + '.dshsafe.bak')) fs.copyFileSync(pj, pj + '.dshsafe.bak');
+      if (fs.existsSync(cp) && !fs.existsSync(cp + '.dshsafe.bak')) fs.copyFileSync(cp, cp + '.dshsafe.bak');
       return true;
     } catch (_) { return false; }
   }
