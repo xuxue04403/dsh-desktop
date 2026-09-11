@@ -1,4 +1,4 @@
-# 单独重传 v1.5.5 的绿色版 zip 资产
+﻿# 单独重传 v1.5.5 的绿色版 zip 资产
 param(
     [Parameter(Mandatory = $true)]
     [string]$Token,
@@ -23,6 +23,35 @@ if (-not (Test-Path $zipPath)) {
     exit 1
 }
 Write-Host ("[..] zip: {0} ({1:N1} MB)" -f $zipPath, ((Get-Item $zipPath).Length / 1MB))
+
+# ---------- R27 安全闸门（审计修复 P1-4） ----------
+# 本脚本此前是**唯一没有闸门**的上传路径：任意来源的 zip（手工压缩、上次中断留下的
+# 半成品、忘了剔除 data\ 的包）都能直接推到 GitHub Release——data\gateway.config.json
+# 里是明文 API Key，一旦上传即公开。这里与 publish.mjs / release.ps1 对齐：
+# 上传前必须通过 email-scrub 的 zip 扫描。
+$nodeExe = $env:DSH_NODE
+if (-not $nodeExe -or -not (Test-Path $nodeExe)) {
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($cmd) { $nodeExe = $cmd.Source }
+}
+if (-not $nodeExe) {
+    Write-Host '[FAIL] 找不到 node.exe（可设 $env:DSH_NODE 指定）。' -ForegroundColor Red
+    exit 1
+}
+# 绿色版自带的 node.exe 其实是 Electron 二进制：设 ELECTRON_RUN_AS_NODE=1 确保以 Node 模式运行
+# （对真正的 node 无副作用）。
+$env:ELECTRON_RUN_AS_NODE = '1'
+$scrubScript = Join-Path $PSScriptRoot 'email-scrub.mjs'
+if (-not (Test-Path $scrubScript)) {
+    Write-Host '[FAIL] 缺少 scripts\email-scrub.mjs，无法执行安全闸门，已中止上传。' -ForegroundColor Red
+    exit 1
+}
+Write-Host '[..] 安全闸门：扫描 zip 内容（真实邮箱地址/服务器/本机密钥）...'
+& $nodeExe $scrubScript --scan-zip $zipPath
+if ($LASTEXITCODE -ne 0) {
+    Write-Host '[FAIL] 安全闸门未通过（zip 内含真实邮箱/密钥信息），已中止上传。' -ForegroundColor Red
+    exit 1
+}
 
 # 找到 release
 $login = 'xuxue04403'
