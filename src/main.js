@@ -64,6 +64,9 @@ function createMainWindow() {
     icon: WINDOW_ICON,
     autoHideMenuBar: true,
     webPreferences: {
+      // 主窗口先加载 renderer/status.html（本地 file:// 状态页，需要 dshApp 桥），
+      // 就绪后再导航到 dsh web 页面。桥本身保留，但**所有壳级 IPC 都按来源帧校验**
+      // （见 fromLocalPage）：只有 file:// 的 renderer/*.html 能用，dsh web 页面用不了。
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
@@ -93,6 +96,19 @@ function createMainWindow() {
     }
   });
   mainWindow.on('closed', () => { mainWindow = null; });
+  // 审计修复（P2）：渲染进程崩溃/无响应时，旧版窗口会永久白屏或假死，用户没有任何恢复
+  // 入口（只能杀进程）。崩溃 → 回到本地状态页并给出提示（状态页有「重新启动」按钮）。
+  mainWindow.webContents.on('render-process-gone', (_e, details) => {
+    const reason = (details && details.reason) || 'unknown';
+    logger.appendLog('界面渲染进程异常退出：' + reason + '（exitCode ' + ((details && details.exitCode) || 0) + '）');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'status.html'))
+        .then(() => state.update({ phase: '界面进程异常退出（' + reason + '），已回到状态页——可点「重新启动」恢复' }))
+        .catch(() => { /* 忽略 */ });
+    }
+  });
+  mainWindow.on('unresponsive', () => logger.appendLog('界面无响应（dsh 页面卡死或机器繁忙）。'));
+  mainWindow.on('responsive', () => logger.appendLog('界面已恢复响应。'));
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
     broadcast();
@@ -151,9 +167,37 @@ function ensureMainWindow() {
 const IH_KEYS = Object.freeze(['ArrowUp', 'ArrowDown', 'Enter']);
 const IH_MAX = 200;
 
+// 主进程侧的「输入框状态镜像」：由 preload.js 暴露的 __dshAppIh.report() 单向上报维护，
+// before-input-event 里**同步**读取——按键派发路径上不允许 await（见下方注释）。
+let ihMirror = null;
+// 当前会话 id（页面从 WebSocket 帧里学到后上报）：输入历史按它隔离。
+let ihSid = '';
+// 学到会话 id 时的回调（由 wireInputHistory 注册）：用于把"刚提交但当时还不知道会话 id"
+// 的那一条历史补记到正确的会话桶里，并做一次性的旧历史迁移。
+let ihSessionHook = null;
+
+// 会话 id 是否真的存在于 dsh 的会话库（~/.dsh/sessions/<工作目录>/<会话id>）。
+// 用于过滤掉帧里偶然出现的、非当前会话的临时 id：不因为一个查不到的 id 丢掉已验证会话。
+let sessionIdCache = { at: 0, ids: new Set() };
+function knownSessionIds() {
+  const now = Date.now();
+  if (now - sessionIdCache.at < 60000) return sessionIdCache.ids;
+  const ids = new Set();
+  try {
+    const root = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'sessions');
+    for (const dir of require('fs').readdirSync(root)) {
+      try {
+        for (const id of require('fs').readdirSync(path.join(root, dir))) ids.add(id);
+      } catch (_) { /* 单个工作目录不可读 → 跳过 */ }
+    }
+  } catch (_) { /* 无 sessions 目录 */ }
+  sessionIdCache = { at: now, ids };
+  return ids;
+}
+
 // 页面内辅助函数（通过 executeJavaScript 注入到 dsh web 页面）
-// 除 get/set 外，还维护一个"当前输入框状态缓存"（keyup/input/mouseup 时刷新），
-// 供主进程 before-input-event **同步**决策（异步查询赶不上按键派发）。
+// 除 get/set 外，还把"当前输入框状态"经 window.__dshAppIh.report() 上报给主进程，
+// 供 before-input-event **同步**决策（异步查询赶不上按键派发，见 wireInputHistory 注释）。
 const INPUT_HELPER_JS = [
   '(function(){',
   'if (window.__dshAppIhInstalled) return;',
@@ -187,6 +231,39 @@ const INPUT_HELPER_JS = [
   'function refresh(){',
   '  var n=el();',
   '  window.__dshAppIhCache=n?{val:valOf(n),atTop:atTopOf(n),tag:n.tagName}:null;',
+  // 上报给主进程（审计：主进程据此同步决策 ↑↓ 是否 preventDefault）
+  // 同时带上"当前会话 id"——dsh 是 SPA，切会话不改 URL（实测 URL 恒为 /），
+  // 输入历史必须按会话隔离，否则会变成"整个 dsh 的历史"。
+  '  try{if(window.__dshAppIh&&window.__dshAppIh.report)window.__dshAppIh.report({input:window.__dshAppIhCache,sid:(window.__dshAppIhSid||"")});}catch(e){}',
+  '}',
+  // —— 会话 id 侦测（审计修复 P1）——
+  // dsh 客户端把会话选择走 WebSocket RPC（dsh-api-gateway: socket.send(JSON.stringify(frame))），
+  // 因此这里钩住 WebSocket.prototype.send，从外发帧里学习当前会话 id：切会话会 follow、
+  // 发消息会带 sessionId/agentId。帧是 JSON 文本，形如 "sessionId":"xxxx"。
+  'window.__dshAppIhSid="";',
+  // 按优先级取 id：sessionId（当前会话）> agentId（dsh 里就是会话 id 的别名）>
+  // childSessionId（子会话——最后才用，避免把子代理会话当成当前会话）
+  'function pickSid(data){',
+  '  var m=data.match(/"sessionId":"([^"]{4,80})"/);',
+  '  if(m)return m[1];',
+  '  m=data.match(/"agentId":"([^"]{4,80})"/);',
+  '  if(m)return m[1];',
+  '  m=data.match(/"childSessionId":"([^"]{4,80})"/);',
+  '  if(m)return m[1];',
+  '  return "";',
+  '}',
+  'function learnSid(data){',
+  '  try{',
+  '    if(typeof data!=="string"||data.length>400000)return;',
+  '    if(data.indexOf("essionId")<0&&data.indexOf("gentId")<0)return;',
+  '    var s=pickSid(data);',
+  '    if(s&&s!==window.__dshAppIhSid){window.__dshAppIhSid=s;refresh();}',
+  '  }catch(e){}',
+  '}',
+  'if(!window.__dshAppIhWsHooked&&window.WebSocket&&WebSocket.prototype&&WebSocket.prototype.send){',
+  '  window.__dshAppIhWsHooked=true;',
+  '  var _ihSend=WebSocket.prototype.send;',
+  '  WebSocket.prototype.send=function(d){learnSid(d);return _ihSend.apply(this,arguments);};',
   '}',
   'window.__dshAppIhGet=function(){refresh();return window.__dshAppIhCache;};',
   'window.__dshAppIhSet=function(v){',
@@ -212,14 +289,19 @@ const INPUT_HELPER_JS = [
   'document.addEventListener("keyup",refresh,true);',
   'document.addEventListener("mouseup",refresh,true);',
   'setInterval(refresh,800);',
+  'refresh();',
   '})();',
 ].join('\n');
 
 function wireInputHistory(win, getPort, userDataDir) {
-  // 每会话历史：key = port + 稳定路径（去掉 token 等易变 query，保留 pathname/hash）
+  // 每会话历史：key = port|sid:<会话id>（dsh 是 SPA，URL 不变，必须用会话 id）
   const histories = new Map();   // key -> string[]
   const drafts = new Map();      // key -> { idx, active, draft }（↑ 回溯状态）
   let keyFor = '';
+  // "提交时还不知道会话 id"的历史暂存（学到后补记到正确会话）
+  let pendingValue = '';
+  let pendingTimer = null;
+  let legacyMigrated = false;   // 旧版全站历史是否已一次性并入会话桶
 
   // —— 持久化：data\input-history.json（跨启动保留）——
   const histFile = userDataDir ? path.join(userDataDir, 'input-history.json') : '';
@@ -250,19 +332,26 @@ function wireInputHistory(win, getPort, userDataDir) {
   }
   loadHistories();
 
-  async function sessionKey() {
+  // 会话 key（同步：**按键派发路径上不能 await**，见下）
+  //
+  // 审计修复（P1）：dsh 是 SPA——切换会话**不改 URL**（实测 input-history.json 里长期只有
+  // 一个 key `3080|/`），所以旧的"端口+路径"方案等于全站共用一个历史桶（用户看到的是
+  // "整个 dsh 的历史"）。现在优先用页面从 WebSocket 帧里学到的**会话 id**；只有在还没学到
+  // （刚加载、尚未 follow/发送）时才退回 URL 桶，且单独用一个 "pending" 命名空间，避免把
+  // 旧的全站历史当成当前会话的历史显示出来。
+  function sessionKey() {
+    const port = typeof getPort === 'function' ? getPort() : 3080;
+    if (ihSid) return port + '|sid:' + ihSid;
     try {
       const url = win.webContents.getURL();
-      const port = typeof getPort === 'function' ? getPort() : 3080;
-      // 只保留 pathname + hash（存根），丢弃 token 等易变 query：
-      //   dsh web URL 形如 http://127.0.0.1:<port>/?token=xxx#/session/<id>…
+      // 只保留 pathname + hash（存根），丢弃 token 等易变 query
       const m = url.indexOf('127.0.0.1:' + port);
       let rest = m >= 0 ? url.slice(m + ('127.0.0.1:' + port).length) : url;
       const hashAt = rest.indexOf('#');
       const hash = hashAt >= 0 ? rest.slice(hashAt) : '';
       const qAt = rest.indexOf('?');
       const pathname = (qAt >= 0 ? rest.slice(0, qAt) : rest.split('#')[0]) || '/';
-      return port + '|' + pathname + hash;
+      return port + '|pending|' + pathname + hash;
     } catch (_) { return 'default'; }
   }
 
@@ -276,25 +365,6 @@ function wireInputHistory(win, getPort, userDataDir) {
     } catch (_) { /* 页面未就绪时跳过 */ }
   }
 
-  async function getInputState() {
-    try {
-      const r = await win.webContents.executeJavaScript(
-        'window.__dshAppIhGet ? window.__dshAppIhGet() : null'
-      );
-      return r && typeof r === 'object' ? r : null;
-    } catch (_) { return null; }
-  }
-
-  // 同步读取页面缓存的输入框状态（决策用，避免异步赶不上按键派发）
-  async function peekInputState() {
-    try {
-      const r = await win.webContents.executeJavaScript(
-        'window.__dshAppIhCache ? window.__dshAppIhCache : null'
-      );
-      return r && typeof r === 'object' ? r : null;
-    } catch (_) { return null; }
-  }
-
   async function setInput(val) {
     try {
       await win.webContents.executeJavaScript(
@@ -303,28 +373,33 @@ function wireInputHistory(win, getPort, userDataDir) {
     } catch (_) { /* 忽略 */ }
   }
 
-  const onBeforeInput = async (event, input) => {
+  // ⚠️ 审计修复（P1）：本处理器**必须同步**决策。
+  // Electron 的 before-input-event 只在处理器同步执行期间接受 preventDefault()——
+  // 旧实现在 `await sessionKey()` / `await peekInputState()` 之后才调用 preventDefault，
+  // 此时按键早已派发到页面：结果是「光标按原生行为移动/换行」与「我们异步写回历史」
+  // 同时发生（光标错位、↑ 与 ↓ 行为不稳定）。现在状态从主进程镜像 ihMirror 同步读取。
+  const onBeforeInput = (event, input) => {
     // 快捷键带修饰符时不拦截（保留 dsh 自己的 Ctrl/Cmd 组合）
     if (input.control || input.meta || input.alt) return;
     if (input.type !== 'keyDown') return;
     if (IH_KEYS.indexOf(input.key) < 0) return;
 
-    keyFor = await sessionKey();
+    keyFor = sessionKey();
     let hist = histories.get(keyFor);
     if (!hist) { hist = []; histories.set(keyFor, hist); }
     let st = drafts.get(keyFor);
     if (!st) { st = { idx: hist.length, active: false, draft: '' }; drafts.set(keyFor, st); }
 
     if (input.key === 'ArrowUp') {
-      const stateNow = await peekInputState();
-      if (!stateNow) return;                    // 不在输入框
+      const stateNow = ihMirror;                 // 主进程镜像（同步）
+      if (!stateNow) return;                     // 不在输入框 / 尚未上报
       if (!(stateNow.atTop || stateNow.val === '')) return;  // 非文首/空 → 交还 dsh
       if (hist.length === 0) return;
       if (!st.active) { st.draft = stateNow.val; st.idx = hist.length; st.active = true; }
       if (st.idx > 0) {
         st.idx--;
-        event.preventDefault();
-        setInput(hist[st.idx]);   // 异步写回（不回退整个按键派发）
+        event.preventDefault();                  // 同步 → 真正拦下原生光标移动
+        setInput(hist[st.idx]);                  // 异步写回（值本身不受影响）
       }
       return;
     }
@@ -345,21 +420,82 @@ function wireInputHistory(win, getPort, userDataDir) {
     }
 
     if (input.key === 'Enter' && !input.shift && !input.control && !input.meta) {
-      const stateNow = await peekInputState();
-      if (!stateNow) return;
-      const v = stateNow.val;
-      if (v && v !== hist[hist.length - 1]) {
-        hist.push(v);
-        if (hist.length > IH_MAX) hist.splice(0, hist.length - IH_MAX);
-        saveHistories();   // 持久化（防抖）
+      const stateNow = ihMirror;
+      if (stateNow) {
+        const v = stateNow.val;
+        // 审计修复（P1）：历史按会话落桶。提交那一刻**还不知道**会话 id 时（Enter 早于
+        // dsh 发出 RPC 帧），先把这条挂起，等页面学到会话 id 后补记（见 ihSessionHook）；
+        // 3 秒仍未学到就丢弃，绝不写进别的会话桶。
+        if (v) {
+          if (ihSid) recordHistory(hist, v);
+          else {
+            pendingValue = v;
+            if (pendingTimer) clearTimeout(pendingTimer);
+            pendingTimer = setTimeout(() => { pendingValue = ''; pendingTimer = null; }, 3000);
+          }
+        }
       }
       st.idx = hist.length; st.active = false; st.draft = '';
       return;   // 不拦截 Enter，交给 dsh 发送
     }
   };
 
+  // 记录一条历史（去重 + 上限 + 防抖持久化）
+  function recordHistory(hist, v) {
+    if (!v || v === hist[hist.length - 1]) return false;
+    hist.push(v);
+    if (hist.length > IH_MAX) hist.splice(0, hist.length - IH_MAX);
+    saveHistories();
+    return true;
+  }
+
+  // 会话 id 刚学到：① 补记挂起的那条提交；② 一次性把旧版"全站一个桶"的历史并入该会话
+  ihSessionHook = (sid) => {
+    const port = typeof getPort === 'function' ? getPort() : 3080;
+    const key = port + '|sid:' + sid;
+    let h = histories.get(key);
+    if (!h) { h = []; histories.set(key, h); }
+
+    // ① 旧版历史（key 形如 `3080|/`，即"整个 dsh 的历史"）一次性并入**第一个学到会话 id 的会话**，
+    //    之后各会话各自独立。数据只搬不删（并入后旧桶移除，避免再次并入其它会话）。
+    if (!legacyMigrated) {
+      legacyMigrated = true;
+      const legacyKeys = [...histories.keys()].filter((k) => /^\d+\|(\/|pending\|)/.test(k));
+      let moved = 0;
+      for (const lk of legacyKeys) {
+        const arr = (histories.get(lk) || []).filter((v) => typeof v === 'string' && v);
+        if (arr.length) {
+          const merged = [...arr.filter((v) => !h.includes(v)), ...h];
+          h.length = 0;
+          h.push(...merged.slice(-IH_MAX));
+          moved += arr.length;
+        }
+        histories.delete(lk);
+      }
+      if (moved) {
+        // eslint-disable-next-line no-console
+        console.log('[dshapp] 已把旧的全站输入历史并入当前会话（' + moved + ' 条，一次性迁移）');
+        saveHistories();
+      }
+    }
+
+    // ② 提交时还不知道会话 id 的那一条 → 补记到本会话
+    if (!pendingValue) return;
+    const v = pendingValue;
+    pendingValue = '';
+    if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+    if (recordHistory(h, v)) {
+      // eslint-disable-next-line no-console
+      console.log('[dshapp] 会话历史已归档到 ' + key);
+    }
+  };
+
   win.webContents.on('before-input-event', onBeforeInput);
-  win.webContents.on('did-finish-load', () => { ensureHelper(); });
+  win.webContents.on('did-finish-load', () => {
+    ihMirror = null;        // 页面重载 → 镜像失效，等新的上报
+    ihSid = '';             // 新页面 → 会话 id 需要重新学习
+    ensureHelper();
+  });
   ensureHelper();
 }
 
@@ -395,6 +531,13 @@ function createSettingsWindow(section) {
     if (url.startsWith('http')) shell.openExternal(url).catch(() => { /* 忽略 */ });
     return { action: 'deny' };
   });
+  // 审计修复（P3）：设置窗此前没有 will-navigate 守卫。设置页只应停留在本地文件，
+  // 任何外部导航一律拒绝并交系统浏览器（与主窗口同策略，纵深防御）。
+  settingsWindow.webContents.on('will-navigate', (e, url) => {
+    if (url.startsWith('file://')) return;
+    e.preventDefault();
+    if (url.startsWith('http')) shell.openExternal(url).catch(() => { /* 忽略 */ });
+  });
   if (section) {
     settingsWindow.webContents.once('did-finish-load', () => focusSection(section));
   }
@@ -402,9 +545,16 @@ function createSettingsWindow(section) {
 
 // 请求设置窗滚动并高亮某个卡片（如模型网关）
 function focusSection(section) {
-  if (settingsWindow && !settingsWindow.isDestroyed()) {
-    settingsWindow.webContents.send('dsh:focus-section', section);
-  }
+  if (!settingsWindow || settingsWindow.isDestroyed()) return;
+  // 审计修复（P3）：窗口刚创建、页面尚未加载完时立即 send 会丢事件（旧版只在
+  // "本次创建"时注册 did-finish-load，复用已存在的窗口就直接发 → 定位失效）。
+  try {
+    if (settingsWindow.webContents.isLoading()) {
+      settingsWindow.webContents.once('did-finish-load', () => focusSection(section));
+      return;
+    }
+  } catch (_) { /* 忽略：直接尝试发送 */ }
+  settingsWindow.webContents.send('dsh:focus-section', section);
 }
 
 function broadcast() {
@@ -673,10 +823,58 @@ function wireLauncher() {
 
 // ---------------- IPC ----------------
 
+// ---------------- IPC 来源守卫（审计 P0） ----------------
+// 主窗口会从 renderer/status.html（本地 file://）导航到 dsh web 页面
+// （http://127.0.0.1:<port>，第三方插件的客户端脚本在同一页面执行），preload 桥对两者
+// 都可见。壳级通道（读网关配置＝全部供应商明文 Key / 改写网关配置 / 安装插件 /
+// 改设置 / 升级）**只应服务本地渲染页**，否则页面内任意脚本即可导出密钥并落地命令。
+// 判定三条同时成立：① 来源是主框架（排除被注入的 iframe）；② file:// 协议；
+// ③ 路径是本应用的 renderer/*.html。
+function fromLocalPage(event) {
+  try {
+    const frame = event && event.senderFrame;
+    if (!frame) return false;
+    const sender = event.sender;
+    if (sender && sender.mainFrame && frame !== sender.mainFrame) return false;
+    const u = String(frame.url || '');
+    if (!u.startsWith('file://')) return false;
+    return /\/renderer\/[A-Za-z0-9._-]+\.html$/i.test(u);
+  } catch (_) {
+    return false;   // senderFrame 已销毁时取属性会抛错 → 视为非本地
+  }
+}
+
 function registerIpc() {
-  ipcMain.handle('dsh:state', () => state.snapshot());
-  ipcMain.handle('dsh:settings', () => settings.data);
-  ipcMain.handle('dsh:save-settings', (_e, patch) => {
+  // 统一入口：所有壳级 IPC 都经此注册（新增通道自动获得来源校验）
+  const handle = (channel, fn) => ipcMain.handle(channel, (event, ...args) => {
+    if (!fromLocalPage(event)) {
+      logger.appendLog('[安全] 已拒绝非本地页面对 IPC ' + channel + ' 的调用');
+      return { ok: false, error: 'forbidden-origin' };
+    }
+    return fn(event, ...args);
+  });
+  // 主窗口（dsh web 页面）经 preload.js 的 __dshAppIh 单向上报输入框状态：只更新镜像，不返回数据
+  ipcMain.on('dsh:ih-state', (event, s) => {
+    try {
+      if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+      const input = (s && s.input && typeof s.input === 'object' && typeof s.input.val === 'string')
+        ? { val: s.input.val.slice(0, 100000), atTop: !!s.input.atTop, tag: String(s.input.tag || '') }
+        : null;
+      ihMirror = input;
+      const sid = (s && typeof s.sid === 'string') ? s.sid.slice(0, 80) : '';
+      if (sid && sid !== ihSid) {
+        // 会话库校验：不因为一个"查不到"的候选 id 丢掉已确认的会话
+        const ids = knownSessionIds();
+        if (!ids.has(sid) && ihSid && ids.has(ihSid)) return;
+        ihSid = sid;
+        // 会话 id 刚学到：把"提交时还不知道会话"的那条历史补记到正确的会话桶，并迁移旧历史
+        try { if (typeof ihSessionHook === 'function') ihSessionHook(sid); } catch (_) { /* 忽略 */ }
+      }
+    } catch (_) { /* 忽略 */ }
+  });
+  handle('dsh:state', () => state.snapshot());
+  handle('dsh:settings', () => settings.data);
+  handle('dsh:save-settings', (_e, patch) => {
     settings.update(patch);
     // 端口变化即时同步到状态机（导航白名单/状态显示依赖）
     if (patch && typeof patch.port === 'number' && patch.port > 0) {
@@ -689,7 +887,7 @@ function registerIpc() {
     broadcast();
     return settings.data;
   });
-  ipcMain.handle('dsh:action', async (_e, name) => {
+  handle('dsh:action', async (_e, name) => {
     switch (name) {
       case 'start': await startService(); break;
       case 'stop': await stopService(); break;
@@ -739,17 +937,17 @@ function registerIpc() {
     broadcast();
     return true;
   });
-  ipcMain.handle('dsh:versions', async () => {
+  handle('dsh:versions', async () => {
     const local = launcher.found ? launcher.found.version : null;
     const info = await updater.checkForUpdate(local);
     return { local, update: info };
   });
   // —— 模型网关 ——
-  ipcMain.handle('gw:state', () => {
+  handle('gw:state', () => {
     const s = gateway.getState();
     return Object.assign({}, s, { log: gateway.logTailText(8000) });
   });
-  ipcMain.handle('gw:action', async (_e, name, payload) => {
+  handle('gw:action', async (_e, name, payload) => {
     switch (name) {
       case 'start': await gateway.start(); break;
       case 'stop': await gateway.stop(); break;
@@ -768,17 +966,17 @@ function registerIpc() {
   // npm registry 元数据校验（同名+稳定版+有效 dsh.bundle.patch）；安装/卸载统一走
   // 标准 dsh CLI（与手工命令一致——市场/CLI/手工三途径互通，已安装视图读 dsh 真实
   // profile 状态，天然兼容自行安装的插件）。
-  ipcMain.handle('mk:discover', async (_e, payload) => {
+  handle('mk:discover', async (_e, payload) => {
     const p = payload || {};
     return await market.discover(String(p.sourceId || ''), String(p.q || ''), String(p.category || ''), p.cursor || '', Number(p.limit) || 50);
   });
-  ipcMain.handle('mk:preview', async (_e, pkgName) => {
+  handle('mk:preview', async (_e, pkgName) => {
     return await market.npmPreview(String(pkgName || ''));
   });
-  ipcMain.handle('mk:installed', () => {
+  handle('mk:installed', () => {
     return market.installedPlugins();
   });
-  ipcMain.handle('mk:action', async (_e, name, pkgName) => {
+  handle('mk:action', async (_e, name, pkgName) => {
     if (!marketOps) marketOps = new market.MarketOps({
       nodeInfo: launcher.nodeInfo || { exe: 'node', env: {}, embedded: false },
       dshBin: launcher.found ? launcher.found.bin : null,
@@ -805,7 +1003,7 @@ function registerIpc() {
     return { ok: false, error: 'unknown-action' };
   });
   // 复制文本到剪贴板（设置页"复制"按钮等）
-  ipcMain.handle('dsh:clipboard', (_e, text) => {
+  handle('dsh:clipboard', (_e, text) => {
     clipboard.writeText(String(text == null ? '' : text));
     return true;
   });
@@ -827,7 +1025,9 @@ function quitAll() {
       const { killAllDshProcesses } = require('./gateway-manager');
       // R25：限定本应用数据目录（broker/网关 --config 都在其下）——不再用裸特征误杀
       // 用户手工跑的 dsh / 桌面助手网关
-      const n = killAllDshProcesses((s) => logger.appendLog(s), gateway ? gateway.userDataDir : undefined);
+      // 审计修复（P2）：killAllDshProcesses 已改异步（旧版 spawnSync 会让退出流程卡住
+      // 最多 3×15 秒，界面在此期间完全无响应）
+      const n = await killAllDshProcesses((s) => logger.appendLog(s), gateway ? gateway.userDataDir : undefined);
       if (n > 0) logger.appendLog('退出清理：共清理 ' + n + ' 个 dsh 相关进程树。');
     } catch (e) {
       logger.appendLog('退出清理异常: ' + (e && e.message ? e.message : e));
@@ -850,6 +1050,18 @@ async function bootstrap() {
   const userData = resolveDataDir();
   APP_USERDATA = userData;   // 供输入历史等模块持久化
   logger.init(userData);
+  // 审计修复（P2）：单文件便携版会解包到**系统临时目录**运行，而数据目录按"exe 旁"定位
+  // → data\ 落在临时目录里，系统清理后配置/历史/密钥全丢（用户毫无察觉）。这里显式告警。
+  let dataDirInTemp = false;
+  try {
+    const t = path.resolve(os.tmpdir()).toLowerCase();
+    dataDirInTemp = path.resolve(userData).toLowerCase().startsWith(t);
+  } catch (_) { /* 忽略 */ }
+  if (dataDirInTemp) {
+    logger.appendLog('[警告] 数据目录位于系统临时目录（' + userData + '）：这是单文件便携版的运行时行为，'
+      + '系统清理临时文件后配置/会话历史/供应商密钥会丢失。建议改用绿色目录版，或设置环境变量 '
+      + 'DSH_DATA_DIR=<固定目录>。');
+  }
   // R22：兜底未捕获异常/Promise 拒绝——主进程缺 handler 时 Node 默认直接 throw，
   // 用户操作路径上偶发的 openExternal/加载失败即可带崩整个壳
   process.on('unhandledRejection', (reason) => {
@@ -883,11 +1095,16 @@ async function bootstrap() {
   gateway.init();
   // 网关状态变化 → 推送给设置窗（若打开）
   gateway.on('state', () => broadcastGw());
+  // 逐请求日志（pushLog 内 800ms 节流 emit）→ 也推送给设置窗，日志框才能实时跟随
+  gateway.on('log', () => broadcastGw());
   registerIpc();
   wireLauncher();
 
   tray = new TrayController({
     getState: () => state.snapshot(),
+    // 审计修复（P3）：托盘气泡只在首次运行提示一次（旧版每次启动都弹）
+    shouldBalloon: () => !!(settings && !settings.data.trayBalloonShown),
+    onBalloon: () => { try { settings.update({ trayBalloonShown: true }); } catch (_) { /* 忽略 */ } },
     actions: {
       showMain: ensureMainWindow,
       start: startService,
@@ -917,6 +1134,10 @@ async function bootstrap() {
 
   createMainWindow();
   if (settings.data.minimizeToTray) tray.refresh(state.snapshot());
+  // 临时数据目录 → 在状态页给出常驻提示（用户最需要知道的"数据会丢"风险）
+  if (dataDirInTemp && !state.authUrl) {
+    state.update({ phase: '注意：数据目录在系统临时目录（' + userData + '）——清理临时文件会丢失配置与密钥；请改用绿色目录版或设置 DSH_DATA_DIR' });
+  }
 
   app.on('window-all-closed', () => { /* 驻留托盘 */ });
   app.on('before-quit', (e) => {
