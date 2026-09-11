@@ -77,6 +77,17 @@ t('compareVersions 基础', () => {
   assert.ok(compareVersions('0.1.1-rc.2', '0.1.2-rc.1') < 0);
 });
 
+// 审计修复回归：旧实现把预发布标识当普通段比较 → `0.1.3-alpha.1` 被判为高于 `0.1.3`
+// （与 semver 相反，会导致 findDsh 选错版本 / 对最新稳定版反复提示升级）
+t('compareVersions 符合 semver 预发布规则', () => {
+  assert.ok(compareVersions('0.1.3', '0.1.3-alpha.1') > 0, '正式版 > 同号预发布版');
+  assert.ok(compareVersions('0.1.5-rc.1', '0.1.5') < 0);
+  assert.ok(compareVersions('1.0.0-alpha', '1.0.0-alpha.1') < 0, '段数少者更小');
+  assert.ok(compareVersions('1.0.0-alpha.1', '1.0.0-alpha.beta') < 0, '数字标识符 < 字母标识符');
+  assert.ok(compareVersions('v0.1.5-rc.1', '0.1.4') > 0, '容忍 v 前缀');
+  assert.strictEqual(compareVersions('1.0.0', '1.0.0'), 0);
+});
+
 t('REGEX_URL_LINE 匹配 dsh web 就绪行（含 token）', () => {
   const line = 'dsh web: http://127.0.0.1:3080/?token=abc123 (LAN: http://192.168.1.2:3080/?token=abc123)';
   const m = REGEX_URL_LINE.exec(line);
