@@ -11,24 +11,43 @@ const MAX_SIZE = 1024 * 1024;
 let logDir = null;
 let logFile = null;
 let webLogFile = null;
+// 各文件已知字节数（审计修复）：旧实现每次写入都 existsSync + statSync——同步 IO 且落在
+// dsh stdout 高频输出路径上。改为内存记账，仅首次/异常回退到 fs 探测。
+const sizes = new Map();
 
 function init(userDataDir) {
   logDir = path.join(userDataDir, 'logs');
   logFile = path.join(logDir, 'app.log');
   webLogFile = path.join(logDir, 'web.log');
+  sizes.clear();
   try {
     fs.mkdirSync(logDir, { recursive: true });
   } catch (_) { /* 忽略 */ }
 }
 
-function rotate(file) {
+// 轮转：**rename 到 .prev**（原子、不复制、不丢历史）。
+// 审计修复：旧实现是 copyFileSync 到 .prev 再 writeFileSync 清空——既整文件复制，又可能
+// "复制成功但清空失败"造成不一致，且被清空的那段历史在崩溃时彻底丢失。
+// 与看门狗的基线切分兼容：轮转后文件尺寸归零，watchdog 会视为"整文件都是新内容"。
+function rotateIfNeeded(file, incoming) {
   try {
-    if (!fs.existsSync(file)) return;
-    if (fs.statSync(file).size > MAX_SIZE) {
-      try { fs.copyFileSync(file, file + '.prev'); } catch (_) { /* 忽略 */ }
-      fs.writeFileSync(file, '', 'utf8');
+    let size = sizes.get(file);
+    if (size === undefined) {
+      try { size = fs.existsSync(file) ? fs.statSync(file).size : 0; } catch (_) { size = 0; }
     }
-  } catch (_) { /* 忽略 */ }
+    if (size + incoming <= MAX_SIZE) { sizes.set(file, size); return; }
+    try {
+      fs.renameSync(file, file + '.prev');
+    } catch (_) {
+      try {
+        fs.rmSync(file + '.prev', { force: true });
+        fs.renameSync(file, file + '.prev');
+      } catch (_) {
+        try { fs.writeFileSync(file, '', 'utf8'); } catch (_) { /* 忽略 */ }
+      }
+    }
+    sizes.set(file, 0);
+  } catch (_) { /* 轮转失败不影响写入 */ }
 }
 
 // 壳自身日志（带时间戳）
@@ -46,8 +65,10 @@ function appendWeb(text) {
 function write(file, text) {
   try {
     if (!file) return;
-    rotate(file);
-    fs.appendFileSync(file, text, 'utf8');
+    const buf = Buffer.from(text, 'utf8');
+    rotateIfNeeded(file, buf.length);
+    fs.appendFileSync(file, buf);
+    sizes.set(file, (sizes.get(file) || 0) + buf.length);
   } catch (_) { /* 忽略 */ }
 }
 
