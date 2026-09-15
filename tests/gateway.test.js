@@ -600,37 +600,92 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
-  // ---- 修复项 2：配置 models 参与路由 ----
-  t('网关：模型不在 catalog 也不在 provider.models → 404 且不向上游发计费请求（带排查提示）', async () => {
+  // ---- 修复项 2：配置 models 参与路由（2026-09-15 起：**配置列表为唯一权威**）----
+  t('网关：配置了别的模型但没配这个 → 404 且零转发、零目录探测（配置权威）', async () => {
     const up = await startFakeUpstream({ modelsStatus: 404 });   // catalog 不可用 → "未知"桶
     const gw = await startGatewayWith([providerOf('only-other', up, { models: ['other-model'] })], 'nomodel');
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
       const r = await call({ port: gw.port });                   // 请求 test-model（配置里没有）
-      assert.strictEqual(r.status, 404, 'catalog 未知且 models 不含该模型 → 404，实际 ' + r.status + ' ' + r.text.slice(0, 200));
-      assert.strictEqual(up.st.calls, 0, '不得把未知模型发给上游（旧版会发给所有供应商烧额度），实际 ' + up.st.calls);
-      assert.strictEqual(up.st.modelsReqs, 1, 'catalog 探测应只发生一次（失败态有冷却缓存），实际 ' + up.st.modelsReqs);
+      assert.strictEqual(r.status, 404, '配置未声明该模型 → 404，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 0, '不得把未声明的模型发给上游，实际 ' + up.st.calls);
+      assert.strictEqual(up.st.modelsReqs, 0,
+        '该 provider 已配置模型 → 请求路径上不应再做目录探测（配置权威，实测旧版每次请求多等 ~1.5s），实际 ' + up.st.modelsReqs);
       assert.ok(/models/.test(r.text) && /model \\"test-model\\"/.test(r.text), '错误信息应提示检查 provider 的 models 列表：' + r.text.slice(0, 300));
-      assert.ok(/catalog-unknown,models-miss/.test(r.text), '错误详情应带每个 provider 的判定原因：' + r.text.slice(0, 300));
+      assert.ok(/not-declared\(config-authoritative\)/.test(r.text), '错误详情应带判定原因：' + r.text.slice(0, 300));
       const logText = fs.readFileSync(gw.logPath, 'utf8');
-      assert.ok(/only-other=catalog-unknown,models-miss/.test(logText), '日志应记录判定原因（便于排查"模型没配上"）：' + logText.slice(-400));
-      // 同一实例：catalog 未知但 provider.models 含该模型 → 仍作为候选（保持宽容，不改变旧行为）
+      assert.ok(/only-other=not-declared\(config-authoritative\)/.test(logText), '日志应记录判定原因：' + logText.slice(-400));
+      // 同一实例：配置里声明的模型照常路由
       const r2 = await call({ port: gw.port, body: { model: 'other-model', messages: [{ role: 'user', content: 'hi' }] } });
-      assert.strictEqual(r2.status, 200, 'catalog 未知但 models 命中应仍可路由，实际 ' + r2.status + ' ' + r2.text.slice(0, 200));
+      assert.strictEqual(r2.status, 200, '配置声明的模型应可路由，实际 ' + r2.status + ' ' + r2.text.slice(0, 200));
       assert.strictEqual(up.st.calls, 1, 'other-model 应恰好转发一次，实际 ' + up.st.calls);
-      assert.strictEqual(up.st.modelsReqs, 1, '失败态 catalog 在冷却期内不得重复探测，实际 ' + up.st.modelsReqs);
+      assert.strictEqual(up.st.modelsReqs, 0, '仍不应有目录探测，实际 ' + up.st.modelsReqs);
     } finally { killGw(gw); closeUp(up); }
   });
 
-  t('网关：catalog 命中但配置 models 未声明 → 仍作为候选（供应商新增模型不必改配置）', async () => {
+  t('网关：上游目录里有、但我没配 → **不是候选**（b.ai 事故：目录里有却回 400，把请求判死）', async () => {
     const up = await startFakeUpstream({ catalog: [{ id: 'test-model' }] });
     const gw = await startGatewayWith([providerOf('cat', up, { models: ['other-model'] })], 'cathit');
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
       const r = await call({ port: gw.port });
-      assert.strictEqual(r.status, 200, 'catalog 命中即候选（优先级高于 models 声明），实际 ' + r.status + ' ' + r.text.slice(0, 200));
-      assert.strictEqual(up.st.calls, 1, '应转发一次，实际 ' + up.st.calls);
+      assert.strictEqual(r.status, 404, '仅目录命中不算候选（配置权威），实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 0, '不得把请求发给"只是目录里有"的那家，实际 ' + up.st.calls);
+      assert.strictEqual(up.st.modelsReqs, 0, '配置了的 provider 不需要探测目录，实际 ' + up.st.modelsReqs);
     } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：一个模型都没配的 provider → 仍按目录兜底（没有可遵循的配置时才这样）', async () => {
+    const up = await startFakeUpstream({ catalog: [{ id: 'test-model' }] });
+    const gw = await startGatewayWith([providerOf('unconfigured', up, { models: [] })], 'nocfg');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '未配置任何模型的 provider 应按目录命中兜底，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 1, '应转发一次，实际 ' + up.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/no-models-declared,catalog-hit/.test(logText), '判定原因应标明是"未配置→目录兜底"：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：声明的归属优先——轮询也不会把请求先发给"仅目录命中"的那家（真实事故回归）', async () => {
+    // 实测场景：chiyi-ds 声明 deepseek-v4.1-flash；b.ai 目录里也有同名模型（但实际回 400）。
+    // 旧实现把目录命中排在最前 + round-robin → 请求被送到 b.ai 并因"确定性 4xx"直接失败。
+    const upDecl = await startFakeUpstream({ catalog: [{ id: 'other-model' }] });   // 目录里没有该模型
+    const upCat = await startFakeUpstream({ catalog: [{ id: 'test-model' }] });     // 仅目录里有
+    const gw = await startGatewayWith([
+      providerOf('declared', upDecl, { priority: 1, models: ['test-model'] }),
+      providerOf('catalog-only', upCat, { priority: 1, models: ['other-model'] }),
+    ], 'tier', null, { routing: 'round-robin' });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 6; i++) {
+        const r = await call({ port: gw.port });
+        assert.strictEqual(r.status, 200, '第 ' + (i + 1) + ' 次应成功，实际 ' + r.status);
+      }
+      assert.strictEqual(upDecl.st.calls, 6, '声明归属的那家应承担全部请求，实际 ' + upDecl.st.calls);
+      assert.strictEqual(upCat.st.calls, 0, '仅目录命中的那家一次都不该被调用（配置权威），实际 ' + upCat.st.calls);
+    } finally { killGw(gw); closeUp(upDecl); closeUp(upCat); }
+  });
+
+  t('网关：上游"余额/额度"类 400 → 不终止 failover（换下一家；旧实现把请求直接判死）', async () => {
+    // 实测原文：b.ai 余额为 0 时回 HTTP 400 {"error":{"message":"credit insufficient balance: balance=0 ..."}}
+    const up1 = await startFakeUpstream({ status: 400, errorBody: { error: { message: 'credit insufficient balance: balance=0 required=29146' } } });
+    const up2 = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('p1', up1, { priority: 1, models: ['test-model'] }),
+      providerOf('p2', up2, { priority: 2, models: ['test-model'] }),
+    ], 'prov4xx');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '应换到第二家成功，实际 ' + r.status + ' ' + r.text.slice(0, 220));
+      assert.strictEqual(up1.st.calls, 1, '第一家只应被尝试一次，实际 ' + up1.st.calls);
+      assert.strictEqual(up2.st.calls, 1, '第二家应收到转发，实际 ' + up2.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/供应商账号\/额度\/权限/.test(logText), '日志应标明按"供应商侧错误"处理：' + logText.slice(-300));
+      assert.ok(/breaker OPEN: p1 失败（403）/.test(logText), '余额类属长期状态 → 应长熔断：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
   });
 
   t('网关：catalog 未命中但配置显式声明 → 仍作为候选（声明优先于目录快照）', async () => {
@@ -691,7 +746,7 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(upA); }
   });
 
-  t('网关：/v1/models 列逻辑模型名（映射后的名字），不暴露各家上游 ID', async () => {
+  t('网关：/v1/models 只列**配置里声明的**模型（不再列目录里的，避免 dsh 选中后被 404）', async () => {
     const up = await startFakeUpstream({ catalog: [{ id: 'vendor-raw-id-1' }, { id: 'plain-catalog-model' }] });
     const gw = await startGatewayWith([
       providerOf('lst', up, {
@@ -708,8 +763,22 @@ let upstreamPort = 0;
       const ids = (JSON.parse(r.text).data || []).map((m) => m.id);
       assert.ok(ids.includes('nice-logical-name'), '应列出逻辑名：' + ids.join(','));
       assert.ok(ids.includes('plain-declared-model'), '应列出未映射的声明：' + ids.join(','));
-      assert.ok(ids.includes('plain-catalog-model'), '目录里未被映射覆盖的模型应原样列出：' + ids.join(','));
+      assert.ok(!ids.includes('plain-catalog-model'),
+        '配置了模型的 provider 不再补目录模型（配置权威：列出来也会因未声明而 404）：' + ids.join(','));
       assert.ok(!ids.includes('vendor-raw-id-1'), '被映射覆盖的上游 ID 不应单独出现：' + ids.join(','));
+      assert.strictEqual(up.st.modelsReqs, 0, '配置齐全时不应探测目录，实际 ' + up.st.modelsReqs);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：/v1/models 对"未配置模型"的 provider 仍补目录（否则该家模型不可见）', async () => {
+    const up = await startFakeUpstream({ catalog: [{ id: 'free-model-a' }, { id: 'free-model-b' }] });
+    const gw = await startGatewayWith([providerOf('nocfg', up, { models: [] })], 'maplist2');
+    try {
+      assert.ok(gw.ready);
+      const r = await call({ port: gw.port, method: 'GET', p: '/v1/models', body: null });
+      const ids = (JSON.parse(r.text).data || []).map((m) => m.id);
+      assert.ok(ids.includes('free-model-a') && ids.includes('free-model-b'),
+        '未配置任何模型的服务商应按目录列出：' + ids.join(','));
     } finally { killGw(gw); closeUp(up); }
   });
 
