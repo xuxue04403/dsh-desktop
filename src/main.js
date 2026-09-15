@@ -20,6 +20,7 @@ const { GatewayManager } = require('./gateway-manager');
 const { resolveDataDir } = require('./datadir');
 const market = require('./market');   // v1.5.18 插件市场（1024Store + npm 校验 + dsh CLI）
 const { installDefaultPlugins, verifyDefaultPlugins } = require('./default-plugins');   // v1.7.0 随 app 分发的默认插件（B1 修复：漏导入 verifyDefaultPlugins 曾使启动前自检静默失效）
+const pluginSnapshot = require('./plugin-snapshot');   // v1.7.7：插件迁移快照（复制目录到新电脑后自动装回插件）
 let marketOps = null;                 // 市场安装/卸载执行器（懒初始化，detect 后可用）
 let defaultPluginsDone = false;       // 默认插件安装幂等闸（每进程最多装一次）
 
@@ -623,8 +624,70 @@ async function verifyDefaultPluginsBeforeStart() {
   }
 }
 
-// ---------------- 服务控制 ----------------
+// ---------------- 迁移快照（v1.7.7：复制绿色目录到新电脑后自动装回插件与 dsh 配置） ----------------
+// 背景：壳与内置 dsh、网关配置都随目录走，但用户自己装的插件与 dsh 自身配置都在 ~/.dsh 里——
+// 新机器上插件会"消失"（搜索插件没了、邮箱桥接要重填密码）、dsh 也不认识任何模型路由。
+// 这里把插件清单 + 插件配置 + dsh 配置（settings.yaml/.credentials.yaml 等）采集到数据目录
+// （随目录复制；发布 zip 剔除 data\ 所以不会外泄），新机器启动前自动补齐。
+let pluginSnapshotCaptured = false;
+let pluginSnapshotApplied = false;
+let serviceBootStartAt = 0;   // 本次 dsh 拉起时刻（算"就绪耗时"用）
 
+// 市场执行器（懒初始化；与「市场」IPC 复用同一构造参数）
+function ensureMarketOps() {
+  if (!marketOps) {
+    marketOps = new market.MarketOps({
+      nodeInfo: (launcher && launcher.nodeInfo) || { exe: 'node', env: {}, embedded: false },
+      dshBin: launcher && launcher.found ? launcher.found.bin : null,
+      log: (s) => logger.appendLog('[市场] ' + s),
+    });
+  }
+  return marketOps;
+}
+
+/** 启动 dsh 之前应用插件快照（首次在新机器上运行时装回缺失插件） */
+async function applyPluginSnapshotBeforeStart() {
+  if (pluginSnapshotApplied) return null;
+  const found = launcher && launcher.found;
+  if (!found || !APP_USERDATA) return null;
+  pluginSnapshotApplied = true;   // 每次进程只尝试一次（失败不阻断、也不反复触发 pnpm）
+  const t0 = Date.now();
+  try {
+    const r = await pluginSnapshot.applyIfNeeded({
+      dataDir: APP_USERDATA,
+      profile: 'web',
+      marketOps: ensureMarketOps(),
+      hostDshDir: found.dir,      // 宿主依赖本地化（junction）：让 dsh 启动不必联网解析依赖
+      log: (s) => logger.appendLog('[迁移快照] ' + s),
+    });
+    logger.appendLog('[迁移快照] ' + r.action + '：' + r.message + '（启动前，耗时 ' + (Date.now() - t0) + 'ms）');
+    return r;
+  } catch (err) {
+    logger.appendLog('[迁移快照] 应用异常：' + (err && err.message ? err.message : err));
+    return null;
+  }
+}
+
+/** 服务就绪后刷新快照（保持"随时可复制迁移"的状态） */
+function capturePluginSnapshotNow(reason) {
+  if (pluginSnapshotCaptured || !APP_USERDATA) return null;
+  pluginSnapshotCaptured = true;
+  try {
+    const r = pluginSnapshot.capture({
+      dataDir: APP_USERDATA,
+      profile: 'web',
+      log: (s) => logger.appendLog('[迁移快照] ' + s),
+    });
+    if (r.ok) logger.appendLog('[迁移快照] ' + r.action + '：' + r.message + '（' + reason + '）');
+    else logger.appendLog('[迁移快照] ' + r.action + '：' + r.message + '（' + reason + '）');
+    return r;
+  } catch (err) {
+    logger.appendLog('[迁移快照] 采集异常：' + (err && err.message ? err.message : err));
+    return null;
+  }
+}
+
+// ---------------- 服务控制 ----------------
 // 服务操作串行队列（审计高-2/中-5）：start/stop 并发进入时（启动中点停止、双击启动、
 // 托盘与设置页同时操作）按序执行，杜绝"启动中 verify/pnpm 阶段被 stop 穿透后
 // in-flight start 继续 launcher.start() 把状态翻回 ready"的竞态。
@@ -644,14 +707,45 @@ async function startService() {
   return runServiceOp('启动', async () => {
     readyHandled = false;
     state.update({ service: 'starting', phase: '正在启动 dsh 服务…', failReason: '' });
+    // 启动分段计时（2026-09-11 加）：迁移到新机器后"启动慢"必须能一眼看出卡在哪一段。
+    //   [启动计时] 停旧进程 0ms / 检测 dsh 120ms / 默认插件自检 5000ms / 迁移快照 20ms → 已拉起 dsh
+    const t0 = Date.now();
     await launcher.stop();
+    const t1 = Date.now();
     launcher.detect();
+    const t2 = Date.now();
     // R24：启动 dsh 前自检默认插件（挂载条目 ⇒ 包可解析；不一致自动修复，防悬空条目启动失败）
     await verifyDefaultPluginsBeforeStart();
+    const t3 = Date.now();
+    // v1.7.7：新机器首次运行 → 按快照把用户插件装回（幂等；无快照时是纯读取，零开销）
+    await applyPluginSnapshotBeforeStart();
+    const t4 = Date.now();
     launcher.start();
+    serviceBootStartAt = Date.now();
+    logger.appendLog('[启动计时] 停旧进程 ' + (t1 - t0) + 'ms / 检测 dsh ' + (t2 - t1)
+      + 'ms / 默认插件自检 ' + (t3 - t2) + 'ms / 迁移快照 ' + (t4 - t3) + 'ms → 已拉起 dsh');
     // 就绪等待由 'url'/'exit' 事件驱动；这里额外启动端口轮询兜底
     waitReadyByProbe();
   });
+}
+
+/** 慢启动取证（2026-09-11 加）：dsh 就绪耗时过长时，把它自己的 stdout（web.log）末尾若干行
+ *  抄进 app.log——用户只需贴一个文件，就能看出是插件加载、pnpm 同步还是网络等待。 */
+function logSlowBootDetails(bootMs) {
+  try {
+    const p = logger.webLogPath();
+    if (!p || !fs.existsSync(p)) {
+      logger.appendLog('[启动诊断] web.log 不存在（dsh 未输出？）');
+      return;
+    }
+    const lines = String(fs.readFileSync(p, 'utf8')).split(/\r?\n/).filter((l) => l.trim());
+    const tail = lines.slice(-25);
+    logger.appendLog('[启动诊断] dsh 就绪耗时 ' + Math.round(bootMs / 1000) + 's（偏慢）；web.log 末尾 '
+      + tail.length + ' 行（共 ' + lines.length + ' 行）：');
+    for (const l of tail) logger.appendLog('[启动诊断] | ' + l.slice(0, 240));
+  } catch (err) {
+    logger.appendLog('[启动诊断] 读取 web.log 失败：' + (err && err.message ? err.message : err));
+  }
 }
 
 async function stopService() {
@@ -765,10 +859,21 @@ function onReady() {
   if (readyHandled) return;
   readyHandled = true;
   launcher.ready = true;
+  // 启动计时收尾（2026-09-11）：dsh 从"被拉起"到打印就绪行耗时；超过 25s 时附上它的
+  // stdout 末尾若干行（插件加载/pnpm 同步/网络等待都能看出来）
+  if (serviceBootStartAt) {
+    const bootMs = Date.now() - serviceBootStartAt;
+    serviceBootStartAt = 0;
+    logger.appendLog('[启动计时] dsh 就绪耗时 ' + bootMs + 'ms');
+    if (bootMs > 25000) logSlowBootDetails(bootMs);
+  }
   // R25（审计修复）：成功启动复位看门狗单发闸（否则同进程内第二次故障被闸吞掉）
   if (watchdog) watchdog.triggered = false;
   // v1.7.0：服务就绪后确保默认插件已安装（含首次启动才完成 dsh 安装的场景）
-  ensureDefaultPlugins('服务就绪').catch(() => { /* 内部已记录 */ });
+  // v1.7.7：其后再刷新插件迁移快照（此时 profile 必然已生成）
+  ensureDefaultPlugins('服务就绪')
+    .then(() => capturePluginSnapshotNow('服务就绪'))
+    .catch(() => { /* 内部已记录 */ });
   const safe = settings.data.safeMode;
   state.update({
     service: safe ? 'safe' : 'ready',
@@ -800,6 +905,27 @@ function onBootTimeout() {
 // ---------------- 看门狗事件 ----------------
 function wireLauncher() {
   launcher.on('url', () => onReady());
+  // 2026-09-14 事故修复：dsh 不接受 --patch（安全模式补丁层）时，退出安全模式并立刻重试——
+  // 否则每次启动都会带这个未知选项、永远停在"安全模式启动失败"，用户再也起不来服务。
+  launcher.on('patch-unsupported', () => {
+    try {
+      if (settings && settings.data.safeMode) {
+        settings.update({ safeMode: false, safeModeLevel: 0, safeModeNames: '' });
+        logger.appendLog('[安全模式] 当前 dsh 版本不支持 --patch 补丁层——已自动退出安全模式并重试正常启动');
+      } else {
+        logger.appendLog('[安全模式] 当前 dsh 版本不支持 --patch 补丁层（本次未处于安全模式，忽略）');
+      }
+      // 让看门狗别把这次"标志不支持"误判成插件故障
+      if (watchdog) watchdog.triggered = false;
+    } catch (err) {
+      logger.appendLog('[安全模式] 退出安全模式失败：' + (err && err.message ? err.message : err));
+    }
+    setTimeout(() => {
+      if (launcher && !launcher.running && !launcher.manualStop) {
+        startService().catch(() => { /* 内部已记录 */ });
+      }
+    }, 300);
+  });
   launcher.on('error', (err) => {
     logger.appendLog('启动进程失败: ' + (err && err.message ? err.message : err));
     state.update({ service: 'failed', phase: '启动进程失败', failReason: String(err.message || err) });
