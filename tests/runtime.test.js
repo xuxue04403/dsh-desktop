@@ -246,9 +246,14 @@ t('gateway：saveConfig 原子落盘（不留 .tmp、内容正确）', async () 
   assert.deepStrictEqual(leftovers, [], '不得残留临时文件');
 });
 
-t('gateway：PowerShell 命令行特征转义单引号（路径含 \' 不再失效）', () => {
+t('gateway：PowerShell 命令行特征转义单引号（路径含 \' 不再失效）+ 只按映像名过滤', () => {
   const src = fs.readFileSync(path.join(SRC, 'gateway-manager.js'), 'utf8');
-  assert.ok(/String\(marker\)\.replace\(\/'\/g, "''"\)/.test(src), '应把单引号翻倍转义后再拼 PowerShell');
+  assert.ok(/replace\(\/'\/g, "''"\)/.test(src), '应把单引号翻倍转义后再拼 PowerShell');
+  assert.ok(/Get-CimInstance Win32_Process -Filter/.test(src),
+    '进程枚举必须带服务端 -Filter（全量枚举在进程多的机器上单次 5-20 秒，退出会卡几十秒）');
+  assert.ok(!/Get-CimInstance Win32_Process \|/.test(src), '不得再无过滤地枚举全部进程');
+  assert.ok(/killProcessesByCommandlines\(markers/.test(src),
+    '退出清理的三个特征应一次枚举完成（旧版逐个调用 = 3 次全量查询）');
 });
 
 t('gateway：killAllDshProcesses 不再退回裸 @deepseek-ai 兜底', () => {
@@ -900,6 +905,319 @@ t('日志时间戳：缺省北京时间（与机器时区无关），DSH_LOG_TZ 
   ctx.process.env.DSH_LOG_TZ = 'local';
   vm.runInContext('__tz2 = logTzOffsetMin();', ctx);
   assert.strictEqual(ctx.__tz2, null, '网关 DSH_LOG_TZ=local 应跟随系统时区');
+});
+
+// ================= 11. 2026-09-11：插件迁移快照（复制目录到新电脑自动装回插件）=================
+
+t('插件快照：采集只收"用户自己装的插件"（排除宿主/默认插件），并随包复制插件目录', () => {
+  const ps = require(path.join(SRC, 'plugin-snapshot.js'));
+  const home = fs.mkdtempSync(path.join(tmpRoot, 'snap-home-'));
+  const prof = path.join(home, 'profiles', 'web');
+  fs.mkdirSync(path.join(prof, 'node_modules', 'dsh-web-search-free'), { recursive: true });
+  fs.mkdirSync(path.join(prof, 'node_modules', 'dsh-email-bridge'), { recursive: true });
+  fs.writeFileSync(path.join(prof, 'node_modules', 'dsh-web-search-free', 'package.json'), '{"name":"dsh-web-search-free","version":"1.3.0"}');
+  fs.writeFileSync(path.join(prof, 'node_modules', 'dsh-web-search-free', 'index.js'), '// x');
+  fs.writeFileSync(path.join(prof, 'node_modules', 'dsh-email-bridge', 'package.json'), '{"name":"dsh-email-bridge","version":"0.1.0"}');
+  fs.writeFileSync(path.join(prof, 'package.json'), JSON.stringify({
+    name: 'dsh-profile-web', private: true,
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'dsh-web-search-free'], patchReload: 'live' } },
+    dependencies: { 'dsh-web-search-free': '^1.3.0', 'dsh-email-bridge': 'file:vendor/dsh-email-bridge', '@deepseek-ai/schemastery': '^3.0.0' },
+  }, null, 2));
+  fs.writeFileSync(path.join(prof, 'cordis.patch.yml'), [
+    '- insert:',
+    '    - id: email',
+    '      name: dsh-email-bridge',
+    '      config:',
+    "        smtp: { user: 'me@example.com' }",
+    '',
+    '- id: web-search-deepseek',
+    '  disabled: true',
+    '',
+  ].join('\n'));
+  // dsh 自身配置（在 ~/.dsh 根下，不在 profile 里）
+  fs.writeFileSync(path.join(home, 'settings.yaml'), 'llm-pi-ai:\n  providers:\n    gateway:\n      baseURL: http://127.0.0.1:3091\n');
+  fs.writeFileSync(path.join(home, '.credentials.yaml'), 'version: 1\nrefs: {}\nrecords: {}\n');
+  fs.writeFileSync(path.join(home, 'AGENTS.md'), '# 全局指令\n');
+  fs.writeFileSync(path.join(home, 'pet.json'), '{"pet":"cat"}\n');
+  fs.mkdirSync(path.join(home, '.agent-presets'), { recursive: true });
+  fs.writeFileSync(path.join(home, '.agent-presets', 'a.json'), '{"x":1}\n');
+
+  const dataDir = fs.mkdtempSync(path.join(tmpRoot, 'snap-data-'));
+  const savedHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const r = ps.capture({ dataDir, profile: 'web' });
+    assert.strictEqual(r.ok, true, '采集应成功：' + r.message);
+    const snap = JSON.parse(fs.readFileSync(ps.snapshotPath(dataDir), 'utf8'));
+    assert.deepStrictEqual(snap.plugins.map((p) => p.name), ['dsh-web-search-free'],
+      '只采集用户自己装的注册表插件（排除 file: 的默认插件与 @deepseek-ai 宿主包）');
+    assert.strictEqual(snap.plugins[0].bundled, true, '插件目录应随包复制（离线可装）');
+    assert.ok(fs.existsSync(path.join(ps.bundleDirFor(dataDir, 'dsh-web-search-free'), 'package.json')), '随包目录应含插件包');
+    assert.ok(fs.existsSync(path.join(ps.bundleDirFor(dataDir, 'dsh-web-search-free'), 'index.js')), '随包目录应含插件文件');
+    assert.deepStrictEqual(snap.bundles, ['dsh-web-search-free'], 'bundle 挂载只收非宿主条目');
+    assert.strictEqual(snap.patchEntries.length, 2,
+      '应全量采集顶层 patch 条目（间接配置如 web-search-deepseek 禁用条目不能被漏掉）');
+    assert.ok(snap.patchEntries.some((b) => /web-search-deepseek/.test(b)), '间接配置条目应在快照里');
+    assert.ok(snap.capturedAtLocal && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(snap.capturedAtLocal),
+      '应带人类可读的北京时间戳：' + snap.capturedAtLocal);
+    // dsh 自身配置（模型路由/凭据/全局指令）也应随目录走——否则新机器上 dsh 不认识任何模型
+    assert.ok(snap.dshConfig.files.includes('settings.yaml') && snap.dshConfig.files.includes('.credentials.yaml'),
+      'dsh 配置应纳入快照：' + JSON.stringify(snap.dshConfig));
+    assert.ok(fs.existsSync(path.join(ps.dshConfigRoot(dataDir), 'settings.yaml')), '配置副本应写入数据目录');
+    assert.ok(snap.dshConfig.dirs.includes('.agent-presets'), '小体积配置目录也应随包');
+
+    // 卸载后的插件不应继续随包（清理陈旧随包目录）
+    fs.rmSync(path.join(prof, 'node_modules', 'dsh-web-search-free'), { recursive: true, force: true });
+    const pkg = JSON.parse(fs.readFileSync(path.join(prof, 'package.json'), 'utf8'));
+    delete pkg.dependencies['dsh-web-search-free'];
+    fs.writeFileSync(path.join(prof, 'package.json'), JSON.stringify(pkg, null, 2));
+    ps.capture({ dataDir, profile: 'web' });
+    assert.ok(!fs.existsSync(ps.bundleDirFor(dataDir, 'dsh-web-search-free')),
+      '已卸载插件的陈旧随包目录应被清理');
+  } finally {
+    if (savedHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = savedHome;
+  }
+});
+
+t('插件快照：新机器首次启动装回插件 + 补挂 bundle + 用真配置替换同 id 占位（幂等、备份、换机重装）', async () => {
+  const ps = require(path.join(SRC, 'plugin-snapshot.js'));
+  const home = fs.mkdtempSync(path.join(tmpRoot, 'snap2-home-'));
+  const srcProf = path.join(home, 'profiles', 'web');
+  fs.mkdirSync(path.join(srcProf, 'node_modules', 'dsh-web-search-free'), { recursive: true });
+  fs.writeFileSync(path.join(srcProf, 'node_modules', 'dsh-web-search-free', 'package.json'), '{"name":"dsh-web-search-free","version":"1.3.0"}');
+  fs.writeFileSync(path.join(srcProf, 'package.json'), JSON.stringify({
+    name: 'dsh-profile-web', private: true,
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-web-search-free'], patchReload: 'live' } },
+    dependencies: { 'dsh-web-search-free': '^1.3.0' },
+  }, null, 2));
+  fs.writeFileSync(path.join(srcProf, 'cordis.patch.yml'), [
+    '- insert:',
+    '    - id: email',
+    '      name: dsh-email-bridge',
+    '      config:',
+    "        smtp: { user: 'real@example.com', password: 'secret' }",
+    '',
+  ].join('\n'));
+
+  const dataDir = fs.mkdtempSync(path.join(tmpRoot, 'snap2-data-'));
+  const savedHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    fs.writeFileSync(path.join(home, 'settings.yaml'), 'llm-pi-ai:\n  providers:\n    gateway: {}\n');
+    fs.writeFileSync(path.join(home, '.credentials.yaml'), 'version: 1\nrecords: {}\n');
+    ps.capture({ dataDir, profile: 'web' });
+
+    // 换到"新机器"的家目录（~/.dsh 是空的，只有 dsh 刚建的 profile）
+    // 且「默认插件」机制已先写入一份占位邮箱配置（真实启动顺序）
+    const newHome = fs.mkdtempSync(path.join(tmpRoot, 'snap2-newhome-'));
+    process.env.DSH_HOME = newHome;
+    fs.writeFileSync(path.join(newHome, 'pet.json'), '{"pet":"my-own"}\n');   // 目标机自己的个性化配置
+    const prof = path.join(newHome, 'profiles', 'fresh');
+    fs.mkdirSync(prof, { recursive: true });
+    const writePkg = (p, obj) => fs.writeFileSync(path.join(p, 'package.json'), JSON.stringify(obj, null, 2));
+    writePkg(prof, { name: 'dsh-profile-web', private: true, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'], patchReload: 'live' } }, dependencies: {} });
+    fs.writeFileSync(path.join(prof, 'cordis.patch.yml'), [
+      '- insert:', '    - id: email', '      name: dsh-email-bridge', '      config:', '        imap: { host: "" }', '',
+    ].join('\n'));
+
+    const calls = [];
+    const marketOps = {
+      install: async (spec) => {
+        calls.push(spec);
+        // 必须是**相对**规格 file:vendor/<name>（绝对路径带盘符会被 MarketOps 白名单拒掉）
+        if (!String(spec).startsWith('file:vendor/')) return { ok: false, error: '应优先用随包本地目录的相对规格' };
+        const name = String(spec).slice('file:vendor/'.length);
+        const vendorSrc = path.join(prof, 'vendor', name);
+        if (!fs.existsSync(path.join(vendorSrc, 'package.json'))) return { ok: false, error: 'profile\\vendor 副本缺失' };
+        const dst = path.join(prof, 'node_modules', name);
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        fs.cpSync(vendorSrc, dst, { recursive: true });
+        const pkg = JSON.parse(fs.readFileSync(path.join(prof, 'package.json'), 'utf8'));
+        pkg.dependencies[name] = '^1.3.0';
+        writePkg(prof, pkg);
+        return { ok: true };
+      },
+    };
+
+    const a = await ps.applyIfNeeded({ dataDir, profile: 'fresh', marketOps });
+    assert.strictEqual(a.action, 'applied', '首次在新机器上应执行安装：' + a.message);
+    assert.deepStrictEqual(a.installed, ['dsh-web-search-free']);
+    assert.ok(calls.length === 1 && calls[0] === 'file:vendor/dsh-web-search-free',
+      '应优先用随目录带过来的本地包（相对规格）：' + JSON.stringify(calls));
+    assert.ok(fs.existsSync(path.join(prof, 'vendor', 'dsh-web-search-free', 'package.json')),
+      '插件源码应常驻 profile\\vendor（pnpm 之后可自愈重装）');
+    const after = JSON.parse(fs.readFileSync(path.join(prof, 'package.json'), 'utf8'));
+    assert.deepStrictEqual(after.dependencies, { 'dsh-web-search-free': '^1.3.0' }, '插件依赖应写进 profile');
+    assert.ok(after.dsh.profile.bundles.includes('dsh-web-search-free'), '应补挂 bundle：' + JSON.stringify(after.dsh.profile.bundles));
+    // dsh 自身配置：目标机缺失的补齐、已有的不动
+    assert.strictEqual(fs.readFileSync(path.join(newHome, 'settings.yaml'), 'utf8'), 'llm-pi-ai:\n  providers:\n    gateway: {}\n',
+      '新机器缺失的 settings.yaml（模型路由）应被恢复');
+    assert.ok(fs.existsSync(path.join(newHome, '.credentials.yaml')), '供应商密钥文件应被恢复');
+    assert.strictEqual(fs.readFileSync(path.join(newHome, 'pet.json'), 'utf8'), '{"pet":"my-own"}\n',
+      '目标机已有的配置文件不得被覆盖（尊重新机器自己的设置）');
+    const patch = fs.readFileSync(path.join(prof, 'cordis.patch.yml'), 'utf8');
+    assert.ok(/real@example\.com/.test(patch) && /secret/.test(patch), '应用户真配置覆盖本机占位条目：\n' + patch);
+    assert.strictEqual((patch.match(/id:\s*email/g) || []).length, 1, '同 id 不得出现重复条目：\n' + patch);
+    assert.ok(fs.readdirSync(prof).some((f) => f.includes('.bak-pluginsnapshot')), '改写 patch 前应留备份');
+
+    // 幂等：同机再次启动不再安装、不再改写
+    const b = await ps.applyIfNeeded({ dataDir, profile: 'fresh', marketOps });
+    assert.strictEqual(b.action, 'ready', '同机第二次应直接 ready：' + b.message);
+    assert.strictEqual(calls.length, 1, '不得重复安装');
+    assert.strictEqual(fs.readFileSync(path.join(prof, 'cordis.patch.yml'), 'utf8'), patch, '不得重复改写 patch');
+
+    // 用户在新机器上手工卸载后：不得被下次启动装回
+    const off = JSON.parse(fs.readFileSync(path.join(prof, 'package.json'), 'utf8'));
+    delete off.dependencies['dsh-web-search-free'];
+    writePkg(prof, off);
+    fs.rmSync(path.join(prof, 'node_modules', 'dsh-web-search-free'), { recursive: true, force: true });
+    await ps.applyIfNeeded({ dataDir, profile: 'fresh', marketOps });
+    assert.strictEqual(calls.length, 1, '用户手工卸载后不得自动装回（尊重人工改动）');
+
+    // 再换一台电脑（机器指纹变了）+ 全新 profile → 应再次装回
+    const marker = JSON.parse(fs.readFileSync(ps.appliedPath(dataDir), 'utf8'));
+    marker.machine = 'ANOTHER-PC|someone-else';
+    fs.writeFileSync(ps.appliedPath(dataDir), JSON.stringify(marker));
+    const prof2 = path.join(newHome, 'profiles', 'fresh2');
+    fs.mkdirSync(prof2, { recursive: true });
+    writePkg(prof2, { name: 'dsh-profile-web', private: true, dependencies: {} });
+    const c = await ps.applyIfNeeded({ dataDir, profile: 'fresh2', marketOps });
+    assert.strictEqual(c.action, 'applied', '换机器后应重新应用：' + c.message);
+    assert.strictEqual(calls.length, 2, '换机器后应再次安装');
+  } finally {
+    if (savedHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = savedHome;
+  }
+});
+
+t('插件快照：迁移后再采集仍认得"本地 vendor 安装"的插件（规格取自随包元数据，不被误删）', () => {
+  const ps = require(path.join(SRC, 'plugin-snapshot.js'));
+  const home = fs.mkdtempSync(path.join(tmpRoot, 'snap3-home-'));
+  const prof = path.join(home, 'profiles', 'web');
+  fs.mkdirSync(path.join(prof, 'node_modules', 'dsh-web-search-free'), { recursive: true });
+  fs.writeFileSync(path.join(prof, 'node_modules', 'dsh-web-search-free', 'package.json'),
+    '{"name":"dsh-web-search-free","version":"1.3.0","dependencies":{"@deepseek-ai/schemastery":"^3.18.1"}}');
+  // 迁移后的形态：依赖规格是 file:vendor/<名>（本地安装），而不是注册表版本范围
+  fs.writeFileSync(path.join(prof, 'package.json'), JSON.stringify({
+    name: 'dsh-profile-web', private: true,
+    dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', 'dsh-web-search-free'], patchReload: 'live' } },
+    dependencies: { 'dsh-web-search-free': 'file:vendor/dsh-web-search-free', 'dsh-email-bridge': 'file:vendor/dsh-email-bridge' },
+  }, null, 2));
+  const dataDir = fs.mkdtempSync(path.join(tmpRoot, 'snap3-data-'));
+  // 模拟"上一跳"留下的随包目录 + 原始规格元数据
+  const bundleDir = ps.bundleDirFor(dataDir, 'dsh-web-search-free');
+  fs.mkdirSync(bundleDir, { recursive: true });
+  fs.writeFileSync(path.join(bundleDir, 'package.json'), '{"name":"dsh-web-search-free","version":"1.3.0"}');
+  fs.writeFileSync(path.join(bundleDir, 'dsh-app-bundle.json'), JSON.stringify({ name: 'dsh-web-search-free', spec: '^1.3.0' }));
+  const savedHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    const r = ps.capture({ dataDir, profile: 'web' });
+    assert.strictEqual(r.ok, true, r.message);
+    const snap = JSON.parse(fs.readFileSync(ps.snapshotPath(dataDir), 'utf8'));
+    assert.deepStrictEqual(snap.plugins.map((p) => p.name), ['dsh-web-search-free'],
+      '本地 vendor 安装的插件必须仍在快照里（否则第二次复制就丢插件）：' + JSON.stringify(snap.plugins));
+    assert.strictEqual(snap.plugins[0].spec, '^1.3.0', '原始注册表规格应从随包元数据恢复（供注册表回退）');
+    assert.ok(fs.existsSync(path.join(bundleDir, 'package.json')), '随包目录不得被清理（曾因误判而删除）');
+    // 元数据里没有 spec（老快照）也不能丢插件
+    fs.rmSync(path.join(bundleDir, 'dsh-app-bundle.json'), { force: true });
+    ps.capture({ dataDir, profile: 'web' });
+    const snap2 = JSON.parse(fs.readFileSync(ps.snapshotPath(dataDir), 'utf8'));
+    assert.deepStrictEqual(snap2.plugins.map((p) => p.name), ['dsh-web-search-free'], '无元数据时仍应识别为插件');
+    assert.ok(fs.existsSync(bundleDir), '随包目录仍应保留');
+    // 默认插件（邮箱桥接）依旧不纳入快照
+    assert.ok(!snap2.plugins.some((p) => p.name === 'dsh-email-bridge'), '默认插件由独立机制负责，不重复纳入');
+  } finally {
+    if (savedHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = savedHome;
+  }
+});
+
+// ================= 12. 2026-09-14：安全模式 --patch 参数顺序（真实事故）=================
+// 事故：DSH-App 复制到新电脑后"启动失败，等待用户处理"且再也起不来。
+// web.log: error: unknown option '--patch'
+// 根因：`dsh web` 用 commander 的 passThroughOptions()——第一个不认识的 token 之后的所有参数
+// 都交给"内层 app 解析器"。旧顺序 `web --no-open --port <n> --patch <safe.yml>` 把 --patch
+// 放在了 --no-open 之后 → app 解析器不认识 → 启动必然失败（安全模式 = 永久死锁）。
+
+t('launcher：安全模式的 --patch 必须排在 app 标志之前（否则 dsh 报 unknown option）', async () => {
+  spawnCalls.length = 0;
+  const { L, dir } = mkLauncher();
+  const safe = path.join(dir, 'safe.yml');
+  fs.writeFileSync(safe, '- id: web-search-deepseek\n  disabled: true\n');
+  L.settings.data.safeMode = true;
+  L.settings.safePatchPath = safe;
+  L.nodeInfo = { exe: 'node', env: {}, embedded: false };
+  L.nodePath = 'node';
+  L.found = { dir: tmpRoot, version: '9.9.9', bin: path.join(tmpRoot, 'bin.js') };
+  L.start();
+  const call = spawnCalls[spawnCalls.length - 1];
+  const a = call.args;
+  const iPatch = a.indexOf('--patch');
+  const iNoOpen = a.indexOf('--no-open');
+  assert.ok(iPatch > 0 && iNoOpen > 0, '应同时带 --patch 与 --no-open：' + JSON.stringify(a));
+  assert.ok(iPatch < iNoOpen, '--patch 必须在 --no-open 之前（dsh 的 passThroughOptions 会把后者之后的参数全当 app 参数）：' + JSON.stringify(a));
+  assert.strictEqual(a[iPatch + 1], safe, '--patch 后应跟补丁文件路径：' + JSON.stringify(a));
+  assert.strictEqual(a[a.indexOf('web') + 1], '--patch',
+    '子命令 web 之后必须紧跟 --patch（dsh 的 launcher 标志要先于任何 app 标志）：' + JSON.stringify(a));
+  await L.stop();
+});
+
+t('launcher：dsh 仍报 unknown option \'--patch\' 时 → 标记不支持并发出 patch-unsupported（只发一次）', async () => {
+  const { L, dir } = mkLauncher();
+  const safe = path.join(dir, 'safe.yml');
+  fs.writeFileSync(safe, '- id: x\n  disabled: true\n');
+  L.settings.data.safeMode = true;
+  L.settings.safePatchPath = safe;
+  L.nodeInfo = { exe: 'node', env: {}, embedded: false };
+  L.nodePath = 'node';
+  L.found = { dir: tmpRoot, version: '9.9.9', bin: path.join(tmpRoot, 'bin.js') };
+  let fired = 0;
+  L.on('patch-unsupported', () => { fired++; });
+  L.start();
+  const p = L.proc;
+  assert.ok(p && p.stdout, '应有 stdout 桩');
+  p.stdout.emit('data', Buffer.from("error: unknown option '--patch'\n"));
+  assert.strictEqual(fired, 1, '应发出 patch-unsupported（main 据此退出安全模式重试）');
+  assert.strictEqual(L.patchUnsupported, true, '应标记为不支持');
+  p.stdout.emit('data', Buffer.from("error: unknown option '--patch'\n"));
+  assert.strictEqual(fired, 1, '只应发一次（避免反复重启）');
+  await L.stop();
+});
+
+t('main.js：收到 patch-unsupported 时自动退出安全模式（死锁逃生）', () => {
+  const src = fs.readFileSync(path.join(SRC, 'main.js'), 'utf8');
+  assert.ok(/launcher\.on\('patch-unsupported'/.test(src), '应监听 patch-unsupported');
+  assert.ok(/settings\.update\(\{ safeMode: false/.test(src), '应把 safeMode 置回 false 再重试');
+  const wd = fs.readFileSync(path.join(SRC, 'watchdog.js'), 'utf8');
+  assert.ok(/--patch|patch/.test(wd), '看门狗应仍能识别安全模式相关状态');
+});
+
+// ================= 13. 2026-09-15：配置页布局与供应商重排 =================
+
+t('renderer：供应商列表支持 ▲▼ 重排（顺序即优先级），两栏比例与映射表列宽已调整', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
+  // ① 重排按钮 + 逻辑
+  assert.ok(/id="btnGwUp"/.test(html) && /id="btnGwDown"/.test(html), '应有 ▲上移 / ▼下移 按钮');
+  assert.ok(/gw-tools/.test(html), '应有列表工具条容器');
+  assert.ok(/function gwMoveSel\(delta\)/.test(html), '应有 gwMoveSel 重排函数');
+  assert.ok(/function gwSyncMoveButtons\(\)/.test(html), '应有按钮可用状态同步（首/尾禁用）');
+  // 交换后必须把 priority 重编号为 1…N——否则列表顺序与实际路由顺序不一致（用户困惑的来源）
+  assert.ok(/arr\.forEach\(\(p, n\) => \{ p\.priority = n \+ 1; \}\)/.test(html),
+    '重排后必须按列表顺序重编号 priority');
+  assert.ok(/gwMoveSel\(-1\)/.test(html) && /gwMoveSel\(1\)/.test(html), '按钮应绑定 ±1 位移');
+  // ② 两栏比例：左 44% / 右 56%（旧版 1.15:1，右侧被挤窄）
+  assert.ok(/\.gw-left \{ flex: 1 1 44%/.test(html) && /\.gw-right \{ flex: 1 1 56%/.test(html),
+    '两栏应改为 44% : 56%（左侧收窄、右侧加宽）');
+  // ③ 模型映射表：3 列（上游 ID 1.3fr / 映射为 1fr / 操作 64px），表头同为 3 格
+  assert.ok(/\.gw-map \.map-hd,[\s\S]{0,120}grid-template-columns: minmax\(0, 1\.3fr\) minmax\(0, 1fr\) 64px;/.test(html),
+    '映射表应为 1.3fr / 1fr / 64px 三列');
+  const hd = /<div class="map-hd">([\s\S]*?)<\/div>/.exec(html);
+  assert.ok(hd, '应能定位映射表表头');
+  assert.strictEqual((hd[1].match(/<span>/g) || []).length, 3,
+    '表头必须与内容同为 3 列（旧版多一个空 span → "操作"错位、删除按钮被拉满）');
+  assert.ok(!/wrap\.appendChild\(tail\)/.test(html), '映射行不应再挂多余的空 span');
+  // ④ 说明折叠、标签加宽（长标签不再折行）
+  assert.ok(/class="gw-hint-more"/.test(html) && /<summary>说明：/.test(html), '长说明应折叠为可展开块');
+  assert.ok(/\.row label \{ width: 165px;/.test(html), '行标签宽度应加到 165px（130px 时"启动应用时自动启动服务"折行）');
 });
 
 // ================= 执行 =================
