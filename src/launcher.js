@@ -237,6 +237,7 @@ class Launcher extends EventEmitter {
     this.installing = false;   // 首次安装（npm/npx）进行中——这期间 this.proc 为 null
     this.installChild = null;  // 安装子进程句柄（允许「停止服务」取消安装）
     this.webLogBaseline = 0;   // R22：本次启动前 web.log 字节基线（看门狗切分用）
+    this.patchUnsupported = false;   // 本次进程内是否已发现"该 dsh 版本不接受 --patch"
   }
 
   detect() {
@@ -487,8 +488,19 @@ class Launcher extends EventEmitter {
     const port = this.settings.data.port;
     const patch = this.settings.data.safeMode ? this.settings.safePatchPath : null;
 
-    let args = ['web', '--no-open', '--port', String(port)];
+    // 参数顺序（2026-09-14 事故修复，实测复现）：
+    //   `dsh web` 的 CLI 用 commander 的 passThroughOptions()——**第一个它不认识的 token 会把
+    //   后面所有参数当作"内层 app 参数"交给 app 自己的解析器**（见 dsh lib/bin.js 的
+    //   args.js 注释："Launcher flags therefore come first"）。
+    //   旧顺序 `web --no-open --port <n> --patch <safe.yml>` 里 `--patch` 落在 `--no-open`
+    //   之后 → 被当作 app 参数 → app 解析器报 `error: unknown option '--patch'` → 安全模式
+    //   永远起不来（用户机器上表现为"启动失败，等待用户处理"，且再也出不来）。
+    //   因此 `--patch` 必须紧跟子命令、位于任何 app 标志之前。实测：
+    //     web --no-open --port 3099 --patch x.yml --dump-config → unknown option（复现）
+    //     web --patch x.yml --dump-config                       → exit 0，补丁层生效
+    let args = ['web'];
     if (patch && fs.existsSync(patch)) args.push('--patch', patch);
+    args.push('--no-open', '--port', String(port));
 
     const found = this.found;
     // spawn env：内嵌运行时需要 ELECTRON_RUN_AS_NODE=1
@@ -710,6 +722,14 @@ class Launcher extends EventEmitter {
     const onData = (chunk) => {
       const text = chunk.toString('utf8');
       this.logRaw(text);
+      // 兜底（2026-09-14）：若这个 dsh 版本根本不接受 --patch（位置对了仍报未知选项），
+      // 说明"安全模式补丁"这条路在当前版本不可用——把它记下来，让看门狗退出安全模式重试，
+      // 否则会永远卡在"安全模式启动失败"（用户机器上的真实死锁）。
+      if (/unknown option '?--patch'?/i.test(text) && !this.patchUnsupported) {
+        this.patchUnsupported = true;
+        this.log('当前 dsh 版本不接受 --patch（安全模式补丁不可用）——将退出安全模式并重试');
+        this.emit('patch-unsupported');
+      }
       buf += text;
       let idx;
       while ((idx = buf.indexOf('\n')) >= 0) {
