@@ -12,7 +12,9 @@
   }
   h1 { font-size: 17px; font-weight: 600; margin-bottom: 18px; color: #edf1f7; }
   .row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; font-size: 13px; }
-  .row label { width: 130px; color: #9aa7bc; flex: none; }
+  /* 标签宽度 165px（2026-09-15）：130px 装不下「启动应用时自动启动服务」这类长标签 →
+     折行把该行撑成两行高，与相邻行的复选框不对齐。 */
+  .row label { width: 165px; color: #9aa7bc; flex: none; }
   .row input[type=text] {
     flex: 1; background: #1b212c; border: 1px solid #2c3546; color: #e8ecf2;
     border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none;
@@ -65,7 +67,7 @@
      文本靠 .mono 的省略号收尾，因此窄窗下只会省略内容、不会撑出横向滚动条。 */
   .gw-row {
     display: grid;
-    grid-template-columns: 26px minmax(56px, .9fr) minmax(60px, 1.25fr) 44px 28px minmax(84px, auto);
+    grid-template-columns: 26px minmax(52px, .8fr) minmax(44px, 1.05fr) 78px 26px minmax(80px, auto);
     align-items: center; gap: 8px; padding: 9px 10px; font-size: 12px;
     border-bottom: 1px solid #232b39; cursor: pointer; color: #cdd6e4;
     overflow: hidden;
@@ -103,25 +105,30 @@
     border: 1px solid #2c3546; border-radius: 6px; padding: 8px; font-family: Consolas, monospace;
     font-size: 11px; resize: vertical;
   }
-  /* —— 模型映射（本次改动）：编辑器内「模型列表」由逗号文本框改为 上游 ID ↔ 逻辑名 映射表 —— */
+  /* —— 模型映射：编辑器内「模型列表」= 上游 ID ↔ 逻辑名 映射表 ——
+     列宽（2026-09-15 调整）：上游 ID 往往很长（deepseek-ai/deepseek-v4-flash），旧版给
+     96px 直接被截断、而「映射为」占掉两列 1fr、删除按钮被拉满整列 → 现在：
+       上游 ID 1.3fr（更宽） | 映射为 1fr | 操作 64px（按钮定宽，不再拉伸）
+     表头也改成 3 列并各就各位（旧版表头是 4 格，"操作"落进了 1fr 列 → 与内容错位）。 */
   .gw-map { display: block; margin-bottom: 14px; font-size: 12px; }
   .gw-map .map-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; }
   .gw-map .map-head > span:first-child { width: 130px; flex: none; color: #9aa7bc; }
-  .gw-map .map-hd {
-    display: grid; grid-template-columns: 96px minmax(0, 1fr) minmax(0, 1fr) 52px;
-    gap: 6px; padding: 0 0 4px; color: #8a93a3; font-size: 11px;
-  }
+  .gw-map .map-hd,
   .gw-map .map-row {
-    display: grid; grid-template-columns: 96px minmax(0, 1fr) minmax(0, 1fr) 52px;
-    gap: 6px; align-items: center; margin-bottom: 6px;
+    display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) 64px;
+    gap: 8px; align-items: center;
   }
+  .gw-map .map-hd { padding: 0 0 5px; color: #8a93a3; font-size: 11px; }
+  .gw-map .map-hd span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gw-map .map-row { margin-bottom: 6px; }
   /* 行内输入框覆盖 .row input[type=text] 的 flex:1（表格里由网格轨道定宽） */
   .gw-map .map-row input[type=text] {
     flex: none; width: 100%; min-width: 0; padding: 6px 8px; font-size: 12px;
     font-family: Consolas, monospace; background: #1b212c; border: 1px solid #2c3546;
     color: #e8ecf2; border-radius: 6px; outline: none;
   }
-  .gw-map .map-row button { padding: 5px 8px; font-size: 11px; width: 100%; }
+  .gw-map .map-row input[type=text]:focus { border-color: #3b6ef5; background: #1d2430; }
+  .gw-map .map-row button { padding: 6px 0; font-size: 11px; width: 100%; }
   .gw-map .map-empty { color: #8a93a3; font-size: 11px; padding: 6px 2px; }
   .gw-map .map-foot { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
   .gw-paste { margin-top: 8px; }
@@ -134,10 +141,29 @@
   }
   .gw-paste .paste-foot { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
 
-  /* —— 两栏布局（仿 dsh 模型配置页：左列表 + 右编辑面板）—— */
+  /* —— 两栏布局（仿 dsh 模型配置页：左列表 + 右编辑面板）——
+     宽度（2026-09-15 调整）：左侧列表收窄到 44%、右侧编辑面板放宽到 56%（旧版 1.15:1，
+     右侧字段与模型映射表被挤得太窄，长上游 ID 显示不全）。 */
   .gw-wrap { display: flex; gap: 12px; align-items: flex-start; }
-  .gw-left { flex: 1.15; min-width: 0; }
-  .gw-right { flex: 1; min-width: 0; }
+  .gw-left { flex: 1 1 44%; min-width: 0; }
+  .gw-right { flex: 1 1 56%; min-width: 0; }
+  /* 左侧列表工具条（选中项上移/下移 = 重排路由优先级） */
+  .gw-tools { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; }
+  .gw-tools button {
+    border: 1px solid rgba(110,130,160,.4); background: rgba(40,48,62,.9); color: #cdd6e4;
+    border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; white-space: nowrap;
+  }
+  .gw-tools button:hover:not(:disabled) { background: rgba(56,67,86,.95); }
+  .gw-tools button:disabled { opacity: .38; cursor: not-allowed; }
+  .gw-tools .gw-tools-hint { color: #8a93a3; font-size: 11px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  /* 说明折叠块（2026-09-15 规整）：原来六行纯文本说明占据半个屏幕，改为默认收起 */
+  .gw-hint-more { margin: 0 0 12px; }
+  .gw-hint-more > summary {
+    cursor: pointer; color: #8a93a3; font-size: 12px; padding: 4px 2px; user-select: none;
+  }
+  .gw-hint-more > summary:hover { color: #cdd6e4; }
+  .gw-hint-more .hint { margin-top: 6px; }
   .gw-ed { border: 1px solid #2c3546; border-radius: 8px; padding: 12px 14px 4px;
     background: rgba(24,30,40,.55); }
   .gw-ed .hint-empty { color: #8a93a3; font-size: 12px; padding: 14px 4px 18px; }
@@ -221,12 +247,21 @@
       <input type="text" id="gwProxyUrl" placeholder="http://127.0.0.1:7890" style="flex:1;" />
       <span style="color:#8a93a3;font-size:11px;">访问需代理的上游时启用；留空自动探测本机代理</span>
     </div>
-    <div class="hint">防屏蔽：仿真模式不透传任何 dsh 特征头；熔断（401/403 即断 30 分钟、网络/5xx 连续 3 次断 5 分钟）、catalog 探测 30s 冷却防风暴、上游错误日志自动脱敏。<b>协议联动</b>：「写入 dsh 配置」按此处的仿真选择写入 dsh 协议——Claude Code=Anthropic（/v1/messages），Codex/关闭=OpenAI（/v1/chat/completions）；修改仿真后需重新「写入 dsh 配置」并重启 dsh web。
-      <br /><b>支持的协议</b>：OpenAI Chat Completions（/v1/chat/completions）、<b>OpenAI Responses</b>（/v1/responses，含 response.id 取回 / input_items / cancel / delete 子路由，多轮按 previous_response_id 回到原供应商）、Anthropic Messages（/v1/messages）、模型列表（/v1/models）。密钥打码、developer→system、reasoning 档位映射对三种协议一致生效。</div>
+    <details class="gw-hint-more">
+      <summary>说明：防屏蔽与熔断 · 支持的协议 · 模型路由规则（点击展开）</summary>
+      <div class="hint">防屏蔽：仿真模式不透传任何 dsh 特征头；熔断（401/403 与"余额/额度"类拒绝即断 30 分钟、网络/5xx 连续 3 次断 5 分钟）、上游错误日志自动脱敏。<b>协议联动</b>：「写入 dsh 配置」按此处的仿真选择写入 dsh 协议——Claude Code=Anthropic（/v1/messages），Codex/关闭=OpenAI（/v1/chat/completions）；修改仿真后需重新「写入 dsh 配置」并重启 dsh web。
+      <br /><b>支持的协议</b>：OpenAI Chat Completions（/v1/chat/completions）、<b>OpenAI Responses</b>（/v1/responses，含 response.id 取回 / input_items / cancel / delete 子路由，多轮按 previous_response_id 回到原供应商）、Anthropic Messages（/v1/messages）、模型列表（/v1/models）。密钥打码、developer→system、reasoning 档位映射对三种协议一致生效。
+      <br /><b>模型路由以这里配置的模型列表为唯一依据</b>：某供应商<b>配了别的模型但没配这个</b> → 即使它的 /models 目录里有该模型，网关也不会把请求发给它（目录只对"一个模型都没配"的供应商兜底）。因此「调用策略=负载均衡」只在你声明承载该模型的几家之间轮询；<code>/v1/models</code> 也只列出你配置的模型。每次请求的选路判定会写进网关日志（<code>[route] …</code> 一行），排查"为什么走了这家"直接看日志。上游"余额/额度"类拒绝不再终止切换（会换下一家并熔断该家）。</div>
+    </details>
 
     <!-- 供应商可视化配置（仿 dsh 模型配置页：左列表 + 右编辑面板） -->
     <div class="gw-wrap">
       <div class="gw-left">
+        <div class="gw-tools">
+          <button type="button" id="btnGwUp" title="把选中的供应商上移一位（列表顺序 = 路由优先级）">▲ 上移</button>
+          <button type="button" id="btnGwDown" title="把选中的供应商下移一位（列表顺序 = 路由优先级）">▼ 下移</button>
+          <span class="gw-tools-hint">选中一行后用 ▲▼ 调整顺序 · 顺序即优先级 P1…Pn</span>
+        </div>
         <div class="gw-tbl">
           <div id="gwRows"></div>
         </div>
@@ -250,7 +285,6 @@
                 <span>上游模型 ID（真实）</span>
                 <span>映射为（网关路由名，留空=同名）</span>
                 <span>操作</span>
-                <span></span>
               </div>
               <div id="eModelRows"></div>
               <div class="map-foot">
@@ -269,7 +303,8 @@
                 </div>
               </details>
             </div>
-            <div class="row"><label>优先级</label><input type="number" id="ePriority" min="1" value="1" style="width:90px;" /></div>
+            <div class="row"><label>优先级</label><input type="number" id="ePriority" min="1" value="1" style="width:90px;" />
+              <span style="color:#8a93a3;font-size:11px;">列表顺序即优先级（P1 最先尝试）；用左侧 ▲▼ 重排会自动重编号</span></div>
             <div class="row"><label>启用</label><input type="checkbox" id="eEnabled" /></div>
             <div class="row">
               <label style="width:auto;"></label>
@@ -485,6 +520,27 @@
       try { $('gwConfig').value = JSON.stringify(gwCfg, null, 2); } finally { gwUpdating = false; }
     }
 
+    // 供应商重排（2026-09-15 加）：选中一行 → ▲/▼ 与相邻行交换。
+    // 关键：**列表顺序 = 路由优先级**——交换后把 priority 重编号为 1…N，否则网关仍按
+    // 旧的 priority 排序，界面看到的顺序与实际选路不一致（这正是用户困惑的来源）。
+    function gwMoveSel(delta) {
+      if (!gwCfg || !Array.isArray(gwCfg.providers)) return;
+      const i = gwSel;
+      if (i < 0 || i >= gwCfg.providers.length) return;
+      const j = i + delta;
+      if (j < 0 || j >= gwCfg.providers.length) return;
+      const arr = gwCfg.providers;
+      const tmp = arr[i];
+      arr[i] = arr[j];
+      arr[j] = tmp;
+      // 重编号：列表第 n 行 → priority = n（P1 最高优先级，failover 从这里开始）
+      arr.forEach((p, n) => { p.priority = n + 1; });
+      gwSel = j;
+      gwSyncText();
+      gwRenderRows();
+      gwOpenEditor(j);          // 编辑器里的「优先级」字段同步刷新
+    }
+
     // 渲染供应商表格
     function gwRenderRows() {
       const box = $('gwRows');
@@ -498,7 +554,9 @@
         // 模型映射（本次改动）：条数语义不变（映射表每行=1 个模型），另标出其中的「映射」条数
         // （as 与上游 ID 不同 —— 旧数据里就是对象写法），列表里一眼看出该供应商是否配了映射。
         const mapped = gwCountMapped(modelList);
-        const cntText = modelList.length + ' 模型' + (mapped ? '（含 ' + mapped + ' 个映射）' : '');
+        // 文案压缩（2026-09-15）：左侧列表收窄后「3 模型（含 1 个映射）」会被省略号截断，
+        // 改为紧凑写法「3 模型 · 1 映射」；完整映射清单仍在 title 里（悬停可见）。
+        const cntText = modelList.length + ' 模型' + (mapped ? '·' + mapped + '映射' : '');
         const cntTitle = gwNormalizeModels(modelList).map((r) => r.as + ' ← ' + r.up).join('\n');
         row.innerHTML =
           '<span><input type="checkbox" ' + (p.enabled === false ? '' : 'checked') + ' title="启用"></span>' +
@@ -532,7 +590,19 @@
           }
         };
       });
+      gwSyncMoveButtons();
     }
+
+    /** ▲▼ 的可用状态：未选中 / 已在首尾时禁用（避免点了没反应） */
+    function gwSyncMoveButtons() {
+      const n = gwCfg && Array.isArray(gwCfg.providers) ? gwCfg.providers.length : 0;
+      const up = $('btnGwUp');
+      const down = $('btnGwDown');
+      if (up) up.disabled = !(gwSel > 0 && gwSel < n);
+      if (down) down.disabled = !(gwSel >= 0 && gwSel < n - 1);
+    }
+    if ($('btnGwUp')) $('btnGwUp').onclick = () => gwMoveSel(-1);
+    if ($('btnGwDown')) $('btnGwDown').onclick = () => gwMoveSel(1);
 
     function esc(s) {
       // 审计修复（P3）：补单引号转义——现有调用点都安全，但属性值里若改用单引号包裹
@@ -647,11 +717,9 @@
       del.type = 'button';
       del.textContent = '删除';
       del.onclick = () => { wrap.remove(); gwSyncModelRowsHint(); };
-      const tail = document.createElement('span');
       wrap.appendChild(iUp);
       wrap.appendChild(iAs);
-      wrap.appendChild(del);
-      wrap.appendChild(tail);
+      wrap.appendChild(del);   // 3 列网格：上游 ID / 映射为 / 操作（旧版多挂了一个空 span，与表头错位）
       return wrap;
     }
 
