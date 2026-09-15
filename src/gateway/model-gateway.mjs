@@ -510,39 +510,56 @@ function bodyForProvider(body, provider, logical) {
   return Object.assign({}, body, { model: up });
 }
 
-/* ---------------- 候选收敛：catalog × 配置声明（模型映射） ----------------
- * 规则（可信度从高到低，2026-09-11 加入模型映射后修订）：
- *   catalog 命中（目录含请求的逻辑名本身，或含某条映射的上游 ID 且该条映射的逻辑名匹配）
- *                                            → 候选（排最前）
- *   **配置声明了该逻辑名**（models 里某条的 as / 字符串本身等于请求名）
- *                                            → 候选（用户显式声明优先：上游 /models 常滞后或不完整；
- *                                               映射场景下上游 ID 与逻辑名不同，目录里根本不会出现逻辑名）
- *   catalog 未知(null) 且该 provider 未声明任何模型 → 候选（无法判断，保持宽容）
- *   catalog 已知但不含 且 配置未声明该逻辑名 → 不是候选（模型名写错/上游没这个模型）
- *   catalog 未知 且 声明了其它模型但都不含该逻辑名 → 不是候选（"模型没配上"的典型场景）
- * 返回 { eligible, reasons }：reasons 记录每个 provider 的判定原因（写日志 + 404 错误详情）。
+/* ---------------- 候选收敛：**以配置的模型列表为唯一权威** ----------------
+ * 用户明确要求（2026-09-15）：*"不应该以目录命中（上游 /models 里有）为准，而应该以我配置的
+ * 模型列表为准"*。因此规则简化为：
+ *
+ *   ① **配置声明了该逻辑名**（provider.models 里某条的 as / 字符串本身等于请求名）
+ *        → 第一层候选（唯一可信的归属声明；轮询/优先级都只在这一层内进行）
+ *   ② 该 provider **一个模型都没配**（models 缺失/空数组）
+ *        → 第二层候选：没有可遵循的配置，只能按它的上游目录兜底（历史行为，保证"没配也不误杀"）
+ *        · 目录里有该模型 → 候选（reason: no-models-declared,catalog-hit）
+ *        · 目录探测失败/未知 → 也候选（无法判断，保持宽容）
+ *        · 目录已知且没有 → 不是候选
+ *   ③ 该 provider **配了别的模型但没配这个** → **不是候选**（即使上游目录里有！）
+ *        这正是 2026-09-15 的事故形态：b.ai 目录里列着 deepseek-v4.1-flash，配置却只声明了
+ *        mimo/glm-flash/qwen，转发过去上游回 400（欠费/不可用）→ 用户明明配了 chiyi-ds 承载它，
+ *        却被"目录里有"的那家抢走。配置是用户意图的唯一来源，目录只用来兜底未配置的服务商。
+ *
+ * 另：本函数同时返回 needCatalogFor（哪些 provider 需要查目录）——调用方据此**只为"没配模型"
+ * 的 provider 探测目录**，配置齐全时请求路径上不再有任何目录探测（省掉每次请求 ~1.5s）。
+ * 返回 { eligible, reasons, tierSizes }
  */
 function selectCandidates(candidates, catalogResults, model) {
-  const hit = [];
-  const lenient = [];
+  const declaredTier = [];
+  const fallbackTier = [];
   const reasons = [];
   candidates.forEach((p, i) => {
     const set = catalogResults ? catalogResults[i] : null;
     const entries = modelEntries(p);
-    const catalogKnown = set !== null && set !== undefined;
     const declared = entries.filter((e) => e.as === model);   // 声明承载该逻辑名的条目（可能多条）
-    // 目录命中：① 目录直接含请求名（供应商新增模型未改配置的老路径）；② 映射的上游 ID 在目录里
-    const catalogHit = catalogKnown && (set.has(model) || declared.some((e) => set.has(e.up)));
-    if (catalogHit) { hit.push(p); reasons.push({ id: p.id, reason: 'catalog-hit' }); return; }
     if (declared.length) {
-      lenient.push(p);
-      reasons.push({ id: p.id, reason: catalogKnown ? 'models-declared(catalog-miss)' : 'catalog-unknown,models-match' });
+      declaredTier.push(p);
+      reasons.push({ id: p.id, reason: 'models-declared' });
       return;
     }
-    if (!catalogKnown && entries.length === 0) { lenient.push(p); reasons.push({ id: p.id, reason: 'catalog-unknown,models-undeclared' }); return; }
-    reasons.push({ id: p.id, reason: catalogKnown ? 'catalog-miss' : 'catalog-unknown,models-miss' });
+    if (entries.length > 0) {
+      // 配置了模型但没这个 → 配置权威：不是候选（无论上游目录里有没有）
+      reasons.push({ id: p.id, reason: 'not-declared(config-authoritative)' });
+      return;
+    }
+    // 一个模型都没配 → 目录兜底
+    const catalogKnown = set !== null && set !== undefined;
+    if (!catalogKnown) { fallbackTier.push(p); reasons.push({ id: p.id, reason: 'no-models-declared,catalog-unknown' }); return; }
+    if (set.has(model)) { fallbackTier.push(p); reasons.push({ id: p.id, reason: 'no-models-declared,catalog-hit' }); return; }
+    reasons.push({ id: p.id, reason: 'no-models-declared,catalog-miss' });
   });
-  return { eligible: [...hit, ...lenient], reasons };
+  return { eligible: [...declaredTier, ...fallbackTier], reasons, tierSizes: [declaredTier.length, fallbackTier.length] };
+}
+
+/** 该 provider 是否需要查上游目录才能判定候选（= 它一个模型都没配） */
+function needsCatalog(provider) {
+  return modelEntries(provider).length === 0;
 }
 
 /** 每个 provider 的判定原因（日志/错误详情用；只含网关自身的判定码，不含上游内容）。 */
@@ -977,6 +994,18 @@ const ROUTE_MISSING_RE = /invalid\s+url|not\s+implemented|unsupported\s+(method|
 const DETERMINISTIC_4XX_STATUS = { 400: 400, 404: 404, 413: 413, 422: 422 };
 
 /**
+ * 「供应商侧」4xx（账号/额度/权限/套餐）——**不是**请求本身有错，而是"这家现在不能给你服务"。
+ * 实测事故（2026-09-15）：b.ai 余额为 0 时回 HTTP **400** `credit insufficient balance: balance=0`，
+ * 旧实现按"确定性 4xx"终止 failover → 用户明明还有可用的 chiyi-ds，却被欠费的那家直接打死
+ * （客户端拿到 400「请求本身无效」，误导排查方向）。
+ * 语义上它与 401/403 同类：冷却该家 + 计入熔断 + **继续换下一家**。
+ * 注意：必须在"内容拦截"判定之后使用，且不能吞掉真正的客户端错误（参数/size/不可处理）。
+ */
+const PROVIDER_SIDE_4XX_RE = /credit|balance|insufficient|quota|deposit|billing|unpaid|arrears|recharge|top\s*up|account\s+(?:suspended|disabled|locked|deactivated|banned)|no\s+available\s+(?:channel|quota|balance)|exceeded\s+your\s+(?:current\s+)?quota|not\s+available\s+(?:for|on)\s+your\s+(?:plan|account)|欠费|余额|额度|充值|未开通|无可用(?:渠道|额度)/i;
+/** 其中"余额/欠费"类属于长期状态（充值前不会自愈）→ 用长熔断，避免反复打点 */
+const PERSISTENT_ACCOUNT_RE = /credit|balance|deposit|billing|unpaid|arrears|欠费|余额|充值/i;
+
+/**
  * 确定性 4xx 的客户端文案：**不回显上游错误体原文**（防泄露上游信息/供应商指纹），
  * 只说明"请求本身有问题 + 已停止 failover（重发给别家不会有帮助）"。
  */
@@ -1190,6 +1219,19 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         // 让它能给客户端一句能照着排查的提示（实测 new-api 对 GET/DELETE/cancel 回 Invalid URL）
         return rawMode ? { notFound: true, routeMissing } : false;
       }
+      // 2026-09-15 实测修复：**供应商侧 4xx（账号/额度/权限/套餐）不属于"请求本身有错"**——
+      // 实测 b.ai 余额为 0 时回 HTTP 400 `credit insufficient balance: balance=0`，旧实现
+      // 把它当确定性错误终止 failover，用户明明还有可用的 chiyi-ds 却直接失败（且客户端被告知
+      // "请求无效"，排查方向全错）。现在按"这家暂时不能服务"处理：冷却 + 熔断 + 继续换下一家，
+      // 与 401/403 同类（余额/欠费类状态在充值前不会自愈 → 长熔断，避免反复打点）。
+      if (PROVIDER_SIDE_4XX_RE.test(detail)) {
+        const persistent = PERSISTENT_ACCOUNT_RE.test(detail);
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"供应商账号/额度/权限"类错误`
+          + `（${persistent ? '长期状态' : '临时'}）→ 冷却该家并继续 failover`);
+        catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+        breakerRecordFail(provider.id, persistent ? 403 : 0);   // 403 → 长熔断（30 分钟）；0 → 短熔断
+        return rawMode ? { retryable: upstream.status } : false;
+      }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
       log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 终止 failover（回 ${status}，不回显上游原文）`);
       return { stop: { status, upstreamStatus: upstream.status } };
@@ -1390,11 +1432,18 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     return json(res, 404, { error: { message: `no providers configured for model "${model}"` } });
   }
 
-  // 1) availability pre-filter（审计修复 P1，本次）：catalog × 配置 models，见 selectCandidates
-  //    并行探测各供应商目录，避免串行等待放大首请求延迟（E3）
-  const catalogResults = await Promise.all(candidates.map((p) => fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)));
-  const { eligible, reasons } = selectCandidates(candidates, catalogResults, model);
+  // 1) 候选收敛（**配置列表为唯一权威**，见 selectCandidates）：
+  //    只为"一个模型都没配"的 provider 探测上游目录 —— 配置齐全时请求路径上零探测
+  //    （旧版对每个候选都探测，实测每次请求要多等 ~1.5s；而且探测结果会把
+  //     "目录里有但其实不能服务"的供应商拉进候选，正是 2026-09-15 事故的来源）。
+  const catalogResults = await Promise.all(candidates.map((p) => (needsCatalog(p)
+    ? fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)
+    : null)));
+  const { eligible, reasons, tierSizes } = selectCandidates(candidates, catalogResults, model);
   const reasonsText = routeReasonsText(reasons);
+  // 选路决策日志（2026-09-15 加）：**每次请求都记**——"为什么发给了这家"必须能在日志里
+  // 直接看到（此前只在失败时才记原因，用户遇到"该走 A 却走了 B"时无从判断）。
+  log(`[route] ${model}: ${eligible.length} 个候选（配置声明 ${tierSizes[0]} / 未配置按目录兜底 ${tierSizes[1]}）｜${reasonsText}`);
 
   // V1 防封：跳过熔断中的 provider（连续失败保护期，不发起上游请求）
   const breakerOpen = (p) => { if (breakerIsOpen(p.id)) { log(`skip ${p.id} (breaker open)`); return true; } return false; };
@@ -1677,10 +1726,15 @@ async function handleMessages(cfg, req, res, body) {
     return json(res, 404, { type: 'error', error: { type: 'invalid_request_error', message: `model "${model}" is not configured on this gateway` } });
   }
 
-  // 候选收敛（审计修复 P1，本次）：catalog × 配置 models，见 selectCandidates
-  const catalogResults = await Promise.all(candidates.map((p) => fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)));
-  const { eligible, reasons } = selectCandidates(candidates, catalogResults, model);
+  // 候选收敛（**配置列表为唯一权威**，见 selectCandidates）：只探测"没配模型"的 provider
+  const catalogResults = await Promise.all(candidates.map((p) => (needsCatalog(p)
+    ? fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)
+    : null)));
+  const { eligible, reasons, tierSizes } = selectCandidates(candidates, catalogResults, model);
   const reasonsText = routeReasonsText(reasons);
+  // 选路决策日志（2026-09-15 加）：**每次请求都记**——"为什么发给了这家"必须能在日志里
+  // 直接看到（此前只在失败时才记原因，用户遇到"该走 A 却走了 B"时无从判断）。
+  log(`[route] ${model}: ${eligible.length} 个候选（配置声明 ${tierSizes[0]} / 未配置按目录兜底 ${tierSizes[1]}）｜${reasonsText}`);
 
   // V1 防封：跳过熔断中的 provider（连续失败保护期，不发起上游请求）
   const breakerOpen = (p) => { if (breakerIsOpen(p.id)) { log(`skip ${p.id} (breaker open)`); return true; } return false; };
@@ -1764,9 +1818,11 @@ async function handleModels(cfg, req, res) {
   const providers = providersForModel(cfg);
   // 1) 先列**配置里声明的逻辑模型名**（模型映射后，dsh 请求的是逻辑名，目录里可能根本没有它）
   for (const p of providers) for (const as of logicalModelNames(p)) push(as, p.id);
-  // 2) 再补目录里的模型：已被映射覆盖的上游 ID 归到它的逻辑名下，其余按上游 ID 原样列出
-  await Promise.all(providers.map((p) => fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)));
+  // 2) 只对**一个模型都没配**的服务商补目录（配置列表是权威：配了就不看目录，
+  //    否则会列出网关根本不会路由的模型——dsh 选中后才 404，体验更差）
+  await Promise.all(providers.filter((p) => needsCatalog(p)).map((p) => fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)));
   for (const p of providers) {
+    if (!needsCatalog(p)) continue;
     const entry = catalogCache.get(p.id);
     // 失败冷却期（models=null）或无缓存：跳过（R10：不能对 null models 迭代）
     if (!entry || !entry.models) continue;
