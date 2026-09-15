@@ -43,18 +43,32 @@ function runPowerShell(script, timeoutMs) {
 // 按命令行特征杀进程树（R18 抽出共用）：仅匹配 node.exe/DSH-App.exe/cmd.exe 且命令行含
 // 指定特征串的进程，taskkill /T 树杀；返回杀掉的进程数。排除自身 PID。
 // 审计修复（P2）：改为 async（见 runPowerShell 注释），调用点需 await。
-async function killProcessesByCommandline(marker, logLabel, logFn) {
+// 性能修复（2026-09-11，实测"退出慢 22 秒"）：
+//   ① 旧版 `Get-CimInstance Win32_Process`（无 -Filter）会**枚举全部进程并取回每个进程的
+//      CommandLine**——在进程多/冷 WMI 的机器上单次就要 5-20 秒；而退出路径会调用它 3 次
+//      （launch-dsh.cmd / plugin-op.cmd / 数据目录）+ 网关 stop 再调 1 次 → 累计 20-60 秒。
+//   ② 现在：服务端 `-Filter` 只取我们关心的三种映像名，且**多特征一次枚举**。
+async function killProcessesByCommandlines(markers, logLabel, logFn) {
+  const list = (Array.isArray(markers) ? markers : [markers])
+    .filter((m) => m && String(m).trim())
+    .map((m) => String(m));
+  if (list.length === 0) return 0;
   try {
-    // 审计修复（P2）：marker 会原样拼进 PowerShell 单引号字符串。路径含 `'`
-    // （如 C:\Users\O'Brien\…）时旧版会把命令切断（PS 语法错误 → 清理静默失效，
-    // 甚至可被构造为注入）。按 PowerShell 规则把单引号翻倍转义。
-    const safe = String(marker).replace(/'/g, "''");
-    const script = "Get-CimInstance Win32_Process | " +
-      "Where-Object { ($_.Name -eq 'node.exe' -or $_.Name -eq 'DSH-App.exe' -or $_.Name -eq 'cmd.exe') -and $_.CommandLine -and $_.CommandLine.Contains('" + safe + "') -and $_.ProcessId -ne " + process.pid + " } | " +
-      'ForEach-Object { Write-Output $_.ProcessId }';
+    // marker 会原样拼进 PowerShell 单引号字符串：按 PS 规则把单引号翻倍转义（防路径含 ' 切断命令）
+    const arr = list.map((m) => "'" + m.replace(/'/g, "''") + "'").join(',');
+    const script = '$ms = @(' + arr + '); ' +
+      "Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='DSH-App.exe' OR Name='cmd.exe'\" | " +
+      'ForEach-Object { $cl = $_.CommandLine; if (-not $cl) { return }; foreach ($m in $ms) { if ($cl.Contains($m)) { Write-Output $_.ProcessId; break } } }';
     const stdout = await runPowerShell(script, 15000);
+    const seen = new Set();
     const pids = String(stdout || '')
-      .split(/\r?\n/).map((s) => parseInt(s.trim(), 10)).filter((n) => Number.isInteger(n) && n > 0 && n !== process.pid);
+      .split(/\r?\n/)
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => {
+        if (!Number.isInteger(n) || n <= 0 || n === process.pid || seen.has(n)) return false;
+        seen.add(n);
+        return true;
+      });
     if (pids.length === 0) return 0;
     let killed = 0;
     for (const pid of pids) {
@@ -66,6 +80,11 @@ async function killProcessesByCommandline(marker, logLabel, logFn) {
     if (killed > 0 && logFn) logFn(logLabel + ' ' + killed + ' 个进程树。');
     return killed;
   } catch (_) { return 0; }
+}
+
+// 单特征版本（网关 stop 等既有调用点）
+async function killProcessesByCommandline(marker, logLabel, logFn) {
+  return killProcessesByCommandlines([marker], logLabel, logFn);
 }
 
 // R18（退出全清）：杀掉所有 dsh-app 拉起的 dsh 相关进程树——特征匹配：
@@ -80,12 +99,8 @@ async function killAllDshProcesses(logFn, dataDir) {
   const markers = ['launch-dsh.cmd', 'plugin-op.cmd'];
   if (dataDir) markers.push(dataDir);
   else if (logFn) logFn('[退出清理] 未提供数据目录，跳过按路径匹配的进程清理（防误杀）。');
-  let total = 0;
-  for (const m of markers) {
-    // eslint-disable-next-line no-await-in-loop
-    total += await killProcessesByCommandline(m, '[退出清理]', logFn);
-  }
-  return total;
+  // 性能修复（2026-09-11）：三个特征**一次枚举**（旧版逐个调用 → 3 次全量 CIM 查询）
+  return await killProcessesByCommandlines(markers, '[退出清理]', logFn);
 }
 
 // 配置文本校验（供 UI 保存前检查与单测）：返回 { ok, error }
