@@ -287,6 +287,13 @@ let upstreamPort = 0;
     const gw = r.text.indexOf('    gateway:\n      displayName: DSH Model Gateway');
     assert.ok(pi >= 0 && gw > pi, 'gateway 条目必须位于 llm-pi-ai 段内：\n' + r.text);
     assert.ok(r.text.includes('baseURL: http://127.0.0.1:3099'), 'claude 仿真应写不带 /v1 的 baseURL');
+    // 2026-09-16：claude 仿真下每个模型必须带 compat.allowEmptySignature——
+    // 否则 pi-ai 把"无签名的 thinking"降级成 text，带 tool_use 的历史会被上游回
+    // 400「content[].thinking ... must be passed back」（air-outer/agentrouter 实测）
+    assert.ok(/^ {10}compat:\n {12}allowEmptySignature: true$/m.test(r.text),
+      '每个模型条目应带 compat.allowEmptySignature: true：\n' + r.text);
+    assert.strictEqual((r.text.match(/allowEmptySignature: true/g) || []).length,
+      (r.text.match(/^ {8}- id:/gm) || []).length, '模型数与 compat 声明数应一致');
   });
 
   t('write-dsh：providers 后跟同级键时不串层（P1-7 场景二）', () => {
@@ -337,6 +344,11 @@ let upstreamPort = 0;
       modelsStatus: opts.modelsStatus === undefined ? 200 : opts.modelsStatus,
       catalog: opts.catalog === undefined ? [{ id: 'test-model' }] : opts.catalog,
       status: opts.status === undefined ? 200 : opts.status,
+      sseErrorFirst: !!opts.sseErrorFirst,   // 200 + SSE 首事件即 error（api.chiyi.cc 实测形态）
+      thinkingPassback: !!opts.thinkingPassback,   // 400/500 要求 thinking 回传（air-outer/agentrouter 实测形态）
+      thinkingPassbackStatus: opts.thinkingPassbackStatus || 400,
+      failFirstN: opts.failFirstN || 0,            // 前 N 次请求直接销毁 socket（模拟网络抖动）
+      lastBody: null,
       errorBody: opts.errorBody === undefined ? { error: { message: 'upstream error' } } : opts.errorBody,
       delayMs: opts.delayMs || 0,
       // —— OpenAI Responses 协议仿真（见下方 handleResponses）——
@@ -431,16 +443,47 @@ let upstreamPort = 0;
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
         st.calls++;
+        // 网络抖动仿真：直接销毁连接（客户端侧表现为 fetch failed / ECONNRESET）
+        if (st.failFirstN > 0) { st.failFirstN--; req.socket.destroy(); return; }
         // 记录上游实际收到的 model（模型映射用例断言用：必须是该供应商的上游真实 ID）
+        let parsedBody = null;
         try {
-          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
-          st.lastModel = parsed.model;
-          st.models.push(parsed.model);
+          parsedBody = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+          st.lastModel = parsedBody.model;
+          st.models.push(parsedBody.model);
         } catch (_) { /* 忽略 */ }
+        st.lastBody = parsedBody;
         const send = () => {
+          // 实测形态（air-outer/agentrouter）：带 tool_use 的 assistant 轮缺 thinking 块 → 400
+          if (st.thinkingPassback && parsedBody) {
+            const missing = (parsedBody.messages || []).some((m) => m && m.role === 'assistant'
+              && Array.isArray(m.content)
+              && m.content.some((b) => b && b.type === 'tool_use')
+              && !m.content.some((b) => b && (b.type === 'thinking' || b.type === 'redacted_thinking')));
+            if (missing) {
+              res.writeHead(st.thinkingPassbackStatus, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({
+                error: {
+                  message: st.thinkingPassbackStatus === 400
+                    ? 'The `content[].thinking` in the thinking mode must be passed back to the API. [trace_id=test]'
+                    : 'Upstream rejected the request as invalid',   // agentrouter 的笼统措辞
+                  type: st.thinkingPassbackStatus === 400 ? '<nil>' : 'invalid_request_error',
+                },
+                type: 'error',
+              }));
+              return;
+            }
+          }
           if (st.status !== 200) {
             res.writeHead(st.status, { 'content-type': 'application/json' });
             res.end(JSON.stringify(st.errorBody));
+            return;
+          }
+          if (st.sseErrorFirst) {
+            // 实测形态（api.chiyi.cc）：HTTP 200 + text/event-stream，流里第一件事就是 error 事件
+            res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+            res.end(': keepalive\n\n'
+              + 'event: error\ndata: {"error":{"message":"Service temporarily unavailable","type":"api_error"},"type":"error"}\n\n');
             return;
           }
           res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
@@ -463,6 +506,7 @@ let upstreamPort = 0;
       enabled: true,
     };
     if (opts.reasoningEffortMap) p.reasoningEffortMap = opts.reasoningEffortMap;
+    if (opts.timeoutMs) p.timeoutMs = opts.timeoutMs;
     return p;
   }
 
@@ -782,6 +826,119 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
+  // ================= 2026-09-16 用户要求的三项优化 =================
+  // ① 候选顺序 = 配置数组顺序（priority 字段不再参与排序 —— 配置页 ▲▼ 只改顺序、不改优先级）
+  t('网关：候选顺序 = 配置数组顺序（priority 值不再参与排序）', async () => {
+    const upFirst = await startFakeUpstream({});
+    const upSecond = await startFakeUpstream({});
+    const gw = await startGatewayWith([
+      providerOf('arr-first', upFirst, { priority: 9, models: ['test-model'] }),    // 数组在前、priority 数字大
+      providerOf('arr-second', upSecond, { priority: 1, models: ['test-model'] }),  // 数组在后、priority 数字小
+    ], 'arrayorder');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      assert.strictEqual(upFirst.st.calls, 1, '应先发给数组第一位（priority 不参与排序），实际 ' + upFirst.st.calls);
+      assert.strictEqual(upSecond.st.calls, 0, '数组第二位不应被先发，实际 ' + upSecond.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/arr-first=models-declared arr-second=models-declared/.test(logText),
+        '日志候选顺序应为数组顺序：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(upFirst); closeUp(upSecond); }
+  });
+
+  // ② 多模态：带图片的请求只发给声明了图片能力的家（否则会被转给纯文本家，上游报错/丢图）
+  t('网关：带图片的请求只发给声明图片能力的家（vision: true）；纯文本请求照常走数组首位', async () => {
+    const upText = await startFakeUpstream({});
+    const upVision = await startFakeUpstream({});
+    const gw = await startGatewayWith([
+      providerOf('plain', upText, { models: ['test-model'] }),                        // 数组在前：纯文本
+      providerOf('vlm', upVision, { models: [{ id: 'test-model', vision: true }] }),  // 声明图片能力
+    ], 'visionroute');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // ① 纯文本请求 → 数组首位（纯文本家）
+      const a = await call({ port: gw.port, body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(a.status, 200, '实际 ' + a.status);
+      assert.strictEqual(upText.st.calls, 1, '纯文本请求应走数组首位，实际 ' + upText.st.calls);
+      assert.strictEqual(upVision.st.calls, 0, '实际 ' + upVision.st.calls);
+      // ② 带图片（Anthropic 形状）→ 只有声明了图片能力的家
+      const img = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 16,
+          messages: [{
+            role: 'user',
+            content: [
+              { type: 'text', text: '这张图里是什么？' },
+              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUg==' } },
+            ],
+          }],
+        },
+      });
+      assert.strictEqual(img.status, 200, '实际 ' + img.status + ' ' + img.text.slice(0, 160));
+      assert.strictEqual(upText.st.calls, 1, '纯文本家不得收到带图片的请求，实际 ' + upText.st.calls);
+      assert.strictEqual(upVision.st.calls, 1, '声明图片能力的家应收到，实际 ' + upVision.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/请求含图片 → 跳过未声明图片能力的 1 家/.test(logText), '日志应记录图片路由：' + logText.slice(-400));
+      // ③ 若没有任何候选声明图片能力 → 保持原候选（交给上游报错，不凭空 404）
+      const upPlain = await startFakeUpstream({});
+      const gw2 = await startGatewayWith([providerOf('only-plain', upPlain, { models: ['test-model'] })], 'visionnofallback');
+      try {
+        const b = await call({
+          port: gw2.port, p: '/v1/messages',
+          body: {
+            model: 'test-model', max_tokens: 16,
+            messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } }] }],
+          },
+        });
+        assert.strictEqual(b.status, 200, '无图片候选时应照常转发（不得凭空 404），实际 ' + b.status + ' ' + b.text.slice(0, 160));
+        assert.strictEqual(upPlain.st.calls, 1, '应转发给唯一候选，实际 ' + upPlain.st.calls);
+      } finally { killGw(gw2); closeUp(upPlain); }
+    } finally { killGw(gw); closeUp(upText); closeUp(upVision); }
+  });
+
+  // ③ /v1/models 按模型名排序（选择器列表不再随供应商配置顺序杂乱）
+  t('网关：/v1/models 按模型名排序输出', async () => {
+    const up = await startFakeUpstream({});
+    const gw = await startGatewayWith([providerOf('s1', up, { models: ['zeta-model', 'alpha-model', 'Beta-model'] })], 'modelsort');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, method: 'GET', p: '/v1/models', body: null });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      const ids = (JSON.parse(r.text).data || []).map((m) => m.id);
+      assert.deepStrictEqual(ids, ['alpha-model', 'Beta-model', 'zeta-model'],
+        '应按名排序（大小写不敏感）：' + JSON.stringify(ids));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('write-dsh：模型按名称排序写入 + 声明图片能力的模型写 input: [text, image]', () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'wd-vision-'));
+    const cfgPath = path.join(dir, 'gateway.config.json');
+    const setPath = path.join(dir, 'settings.yaml');
+    fs.writeFileSync(cfgPath, JSON.stringify({
+      port: 3099, apiKey: GATEWAY_KEY, clientProfile: 'claude',
+      providers: [
+        { id: 'p1', baseURL: 'https://a.example.org/v1', apiKey: 'sk-' + 'x'.repeat(20), enabled: true, models: ['zeta-model', { id: 'v/vision-up', as: 'alpha-model', vision: true }] },
+        { id: 'p2', baseURL: 'https://b.example.org/v1', apiKey: 'sk-' + 'y'.repeat(20), enabled: true, models: ['beta-model'] },
+      ],
+    }), 'utf8');
+    fs.writeFileSync(setPath, 'llm-pi-ai:\n  providers:\n', 'utf8');
+    const r = spawnSync(process.execPath, [MJS, '--write-dsh', '--config', cfgPath, '--settings', setPath,
+      '--credentials', path.join(dir, 'c.yaml'), '--port', '3099'], { stdio: 'ignore', windowsHide: true, timeout: 60000 });
+    assert.strictEqual(r.status, 0, 'write-dsh 应成功');
+    const text = fs.readFileSync(setPath, 'utf8');
+    const ids = [...text.matchAll(/^ {8}- id: '([^']+)'$/gm)].map((m) => m[1]);
+    assert.deepStrictEqual(ids, ['alpha-model', 'beta-model', 'zeta-model'],
+      '模型条目应按名称排序写入：' + JSON.stringify(ids));
+    const alpha = text.slice(text.indexOf("- id: 'alpha-model'"), text.indexOf("- id: 'beta-model'"));
+    assert.ok(/^ {10}input:$/m.test(alpha) && /^ {12}- image$/m.test(alpha),
+      'vision:true 的模型必须写 input（否则 dsh 拦下图片）：\n' + alpha);
+    const beta = text.slice(text.indexOf("- id: 'beta-model'"), text.indexOf("- id: 'zeta-model'"));
+    assert.ok(!/input:/.test(beta), '未声明图片能力的模型不得写 input：\n' + beta);
+    assert.ok(/allowEmptySignature: true/.test(alpha), 'compat 仍应写入：\n' + alpha);
+  });
+
   // ================= OpenAI Responses 协议支持（2026-09-11） =================
   // 背景：Responses 是**有状态**协议，客户端（Codex / OpenAI SDK / dsh 的 responses 模式）
   // 会在 POST /v1/responses 之后用 response.id 继续 GET/DELETE/cancel/input_items。
@@ -983,7 +1140,161 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
-  // ---- 修复项 3：熔断半开单飞 ----
+  t('网关：上游 HTTP 200 但 SSE 首事件是 error（chiyi-ds 形态）→ 判该家失败并换下一家（旧版记 ok 且把上游原文透传给客户端）', async () => {
+    const up1 = await startFakeUpstream({ sseErrorFirst: true });
+    const up2 = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('p1', up1, { priority: 1 }),
+      providerOf('p2', up2, { priority: 2 }),
+    ], 'sseerr');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '应换到第二家成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(/upstream-ok/.test(r.text), '客户端应拿到第二家的正常流：' + r.text.slice(0, 200));
+      assert.ok(!/Service temporarily unavailable/.test(r.text), '不得把上游错误原文透传给客户端：' + r.text.slice(0, 200));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/SSE 首事件是错误/.test(logText), '日志应记录该判定：' + logText.slice(-400));
+      // 用上游调用次数断言"确实换到了第二家"（日志里 served 行由网关在返回后写，存在毫秒级竞态）
+      assert.strictEqual(up2.st.calls, 1, '第二家应收到一次转发，实际 ' + up2.st.calls);
+      assert.ok(!/via=p1\b[^\n]*status=ok/.test(logText), '第一家不得被记成 ok：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('网关：唯一候选 200+SSE error → 回网关自己的 503（客户端不再看到上游原文）', async () => {
+    const up = await startFakeUpstream({ sseErrorFirst: true });
+    const gw = await startGatewayWith([providerOf('only', up, { priority: 1 })], 'sseerr2');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 503, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(!/Service temporarily unavailable/.test(r.text), '不得回显上游原文：' + r.text.slice(0, 200));
+      assert.ok(/all providers for model/.test(r.text), '应是网关自己的文案：' + r.text.slice(0, 200));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // ---- 2026-09-16 实测事故：Anthropic 协议下"带 tool_use 的 assistant 轮必须回传 thinking 块" ----
+  // air-outer / agentrouter 实测：历史里 assistant 只有 tool_use（或 text+tool_use）时回
+  // HTTP 400「The `content[].thinking` in the thinking mode must be passed back to the API」；
+  // 补一个空占位 thinking 块（thinking:'' + signature:''）即 200（上游只做结构检查）。
+  // 客户端（pi-ai）在 thinking 无签名时会把它降级成 text，正是这个 400 的来源，网关补位兜底。
+  const THINKING_HISTORY = [
+    { role: 'user', content: '北京天气？' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: { city: '北京' } }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: '晴 25℃' }] },
+  ];
+
+  t('网关：上游 400 要求 thinking 回传（air-outer 实测形态）→ 补空占位块重试一次并成功', async () => {
+    const up = await startFakeUpstream({ thinkingPassback: true });
+    const gw = await startGatewayWith([providerOf('th1', up, { priority: 1 })], 'thinking');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, messages: THINKING_HISTORY },
+      });
+      assert.strictEqual(r.status, 200, '补占位后应成功，实际 ' + r.status + ' ' + r.text.slice(0, 240));
+      assert.ok(/upstream-ok/.test(r.text), '客户端应拿到上游正常流：' + r.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 2, '应是"原样一次 + 补占位一次"共 2 次转发，实际 ' + up.st.calls);
+      const sent = up.st.lastBody.messages;
+      assert.strictEqual(sent[1].content[0].type, 'thinking', '补的占位块必须排在 tool_use 之前：'
+        + JSON.stringify(sent[1].content));
+      assert.strictEqual(sent[1].content[0].thinking, '', '占位块不得伪造推理正文');
+      assert.strictEqual(sent[1].content[1].type, 'tool_use', 'tool_use 必须保留');
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/补齐 1 处空占位 thinking 块后重试一次/.test(logText), '日志应记录补齐重试：' + logText.slice(-400));
+      assert.ok(!/status=ok[^\n]*HTTP 400/.test(logText), '不得把这次 400 记成成功');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：上游用笼统 500「Upstream rejected the request as invalid」表达同一 thinking 规则 → 同样补位重试', async () => {
+    // agentrouter 实测形态：不解释原因，HTTP 500 + 该措辞（同一请求体补空占位后即 200）
+    const up = await startFakeUpstream({ thinkingPassback: true, thinkingPassbackStatus: 500 });
+    const gw = await startGatewayWith([providerOf('th3', up, { priority: 1 })], 'thinking3');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, messages: THINKING_HISTORY },
+      });
+      assert.strictEqual(r.status, 200, '补占位后应成功，实际 ' + r.status + ' ' + r.text.slice(0, 240));
+      assert.ok(/upstream-ok/.test(r.text), '客户端应拿到上游正常流：' + r.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 2, '应是"原样一次 + 补占位一次"，实际 ' + up.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/补齐 1 处空占位 thinking 块后重试一次/.test(logText), '日志应记录补位重试：' + logText.slice(-400));
+      assert.ok(!/breaker OPEN/.test(logText), '该家不应因此被熔断（补位后已成功）：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：历史已带 thinking 块时不得多补（零副作用），且无 tool_use 的历史不触发补位', async () => {
+    const up = await startFakeUpstream({ thinkingPassback: true });
+    const gw = await startGatewayWith([providerOf('th2', up, { priority: 1 })], 'thinking2');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // ① 已带 thinking（空签名）→ 上游本就接受，应只转发一次、内容原样
+      const ok = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 64,
+          messages: [
+            { role: 'user', content: '北京天气？' },
+            { role: 'assistant', content: [{ type: 'thinking', thinking: '', signature: '' }, THINKING_HISTORY[1].content[0]] },
+            { role: 'user', content: THINKING_HISTORY[2].content },
+          ],
+        },
+      });
+      assert.strictEqual(ok.status, 200, '实际 ' + ok.status + ' ' + ok.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 1, '已有 thinking 块时不得重试（不产生额外计费），实际 ' + up.st.calls);
+      assert.strictEqual(up.st.lastBody.messages[1].content.length, 2, '不得插入多余占位块：'
+        + JSON.stringify(up.st.lastBody.messages[1].content));
+      // ② 纯文本历史（无 tool_use）→ 上游不报该错，同样只转发一次
+      const plain = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(plain.status, 200, '实际 ' + plain.status);
+      assert.strictEqual(up.st.calls, 2, '纯文本历史应只转发一次（累计 2），实际 ' + up.st.calls);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // ---- 2026-09-16：网络层错误可诊断性 + 瞬时抖动原地重试 ----
+  // 背景：日志里 170 条 "fetch failed" 完全无法定位（undici 把真正原因放在 e.cause）；
+  // 实测根因是本机代理/TUN 抖动导致的 ECONNRESET（5s 内快速失败）。
+  // 旧实现首次网络错即 90s 熔断——单候选模型（如 deepseek-v4.1-flash→chiyi-ds）整段不可用。
+  t('网关：瞬时网络错（socket 重置）→ 原地重试一次成功；日志含 ECONNRESET 原因且不熔断', async () => {
+    const up = await startFakeUpstream({ failFirstN: 1 });
+    const gw = await startGatewayWith([providerOf('net1', up, { priority: 1 })], 'netretry');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '重试应成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(/upstream-ok/.test(r.text), '客户端应拿到正常响应：' + r.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 2, '应是"首次失败 + 原地重试"共 2 次，实际 ' + up.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/upstream net1 网络错误（[^）]+，\d+ms）→ 原地重试一次/.test(logText),
+        '日志应记录网络错原因（cause 链）与重试动作：' + logText.slice(-400));
+      assert.ok(/upstream net1 重试成功/.test(logText), '日志应记录重试成功：' + logText.slice(-300));
+      assert.ok(!/breaker OPEN/.test(logText), '重试成功不得开启熔断：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网关：本地超时中止不参与原地重试（避免把等待翻倍）；provider.timeoutMs 生效', async () => {
+    const up = await startFakeUpstream({ delayMs: 3000 });
+    const gw = await startGatewayWith([providerOf('slow1', up, { priority: 1, timeoutMs: 400 })], 'noretry');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const started = Date.now();
+      const r = await call({ port: gw.port });
+      const dur = Date.now() - started;
+      assert.strictEqual(r.status, 503, '唯一候选超时后应回 503，实际 ' + r.status);
+      assert.strictEqual(up.st.calls, 1, '超时中止不得重试，实际 ' + up.st.calls);
+      assert.ok(dur < 2500, '应在上游 delay(3000ms) 之前就按 timeoutMs=400 中止，实际 ' + dur + 'ms');
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/request error/.test(logText), '应记录上游请求错误：' + logText.slice(-300));
+      assert.ok(!/原地重试一次/.test(logText), '超时中止不得触发原地重试：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
   t('网关：熔断期间不再打上游；冷却到点并发只放一个探测；上游恢复后能自愈（不永久卡死）', async () => {
     const up = await startFakeUpstream({ status: 401, modelsStatus: 401, delayMs: 400, errorBody: { error: { message: 'unauthorized' } } });
     const gw = await startGatewayWith([providerOf('bad', up, { priority: 1 })], 'breaker', {
@@ -1013,6 +1324,651 @@ let upstreamPort = 0;
         if (r.status === 200) served = 1;
       }
       assert.strictEqual(served, 1, '上游恢复后应能重新服务（熔断不得永久卡死）');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // ================= 2026-09-16：WorkBuddy 接入（协议翻译 / 供应商能力 / 凭据 / 账户池） =================
+
+  // 可编程"只支持 OpenAI chat"的假上游：记录路径/头/体，按脚本返回 402/12153/正常流
+  async function startFakeOpenAIUpstream(opts = {}) {
+    const st = {
+      calls: 0, paths: [], headers: [], bodies: [],
+      script: opts.script || null,        // 按调用序号决定行为（账户池测试用）
+      json: !!opts.json,                  // 返回非流式 JSON 而非 SSE
+      withToolCall: !!opts.withToolCall,
+      sseRaw: opts.sseRaw || null,        // 自定义 SSE 文本
+      toolNameLate: !!opts.toolNameLate,  // 工具名在**后续分片**才到（真实上游常见）
+    };
+    const server = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        st.calls++;
+        st.paths.push(req.url);
+        st.headers.push(req.headers);
+        let body = null;
+        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch { /* 忽略 */ }
+        st.bodies.push(body);
+        const behavior = st.script ? (st.script[st.calls - 1] || st.script[st.script.length - 1]) : (opts.behavior || 'ok');
+        // 刷新端点（WorkBuddy：POST {base}/plugin/auth/token/refresh）
+        if (/\/plugin\/auth\/token\/refresh$/.test(req.url)) {
+          st.refreshCalls = (st.refreshCalls || 0) + 1;
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ code: 0, msg: 'ok', data: { accessToken: 'AT-REFRESHED', refreshToken: 'rt-new', expiresIn: 3600, domain: 'codebuddy.cn' } }));
+          return;
+        }
+        if (behavior === 'credit') {
+          res.writeHead(402, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ code: 0, msg: 'insufficient credit: 积分不足' }));
+          return;
+        }
+        if (behavior === 'session') {
+          res.writeHead(401, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ code: 0, msg: 'Offline user session not found 12153' }));
+          return;
+        }
+        if (behavior === 'boom') {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'boom' } }));
+          return;
+        }
+        if (st.json) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({
+            id: 'chatcmpl-1', object: 'chat.completion', model: body && body.model,
+            choices: [{ index: 0, message: { role: 'assistant', content: '来自 OpenAI 上游的回复' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 11, completion_tokens: 7 },
+          }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        if (st.sseRaw) { res.end(st.sseRaw); return; }   // 自定义 SSE（如"首事件即 error"形态）
+        const chunk = (o) => res.write('data: ' + JSON.stringify(o) + '\n\n');
+        chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { reasoning_content: '先想一下' } }] });
+        chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { content: '你好' } }] });
+        chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { content: '，世界' } }] });
+        if (st.withToolCall) {
+          if (st.toolNameLate) {
+            // 真实上游常见形态：先给 id（无 name），名字与参数在后续分片到达
+            chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: '', arguments: '' } }] } }] });
+            chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'get_weather' } }] } }] });
+            chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '{"city":"北京"}' } }] } }] });
+          } else {
+            chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'get_weather', arguments: '{"city":' } }] } }] });
+            chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '"北京"}' } }] } }] });
+          }
+          chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] });
+        } else {
+          chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+        }
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    return { server, st, port: server.address().port };
+  }
+
+  /** 写一份 WorkBuddy 桌面凭据文件（形态与真实一致：{auth,account} 嵌套） */
+  function writeWorkBuddyAuth(dir, name, { token, uid, enterpriseId, domain, expiresInMs, refreshToken }) {
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, JSON.stringify({
+      auth: {
+        accessToken: token,
+        refreshToken: refreshToken === undefined ? 'rt-' + uid : refreshToken,
+        expiresAt: Date.now() + (expiresInMs === undefined ? 3600_000 : expiresInMs),
+        domain: domain === undefined ? 'codebuddy.cn' : domain,
+      },
+      account: { uid, enterpriseId, nickname: 'user-' + uid },
+    }), 'utf8');
+    return p;
+  }
+
+  const openaiProvider = (id, up, extra = {}) => Object.assign({
+    id,
+    baseURL: 'http://127.0.0.1:' + up.port + '/v2',   // 注意是 /v2 —— 旧 upstreamBase 只认 /v1
+    apiKey: UPSTREAM_KEY,
+    models: extra.models || ['test-model'],
+    enabled: true,
+    protocol: 'openai-chat',
+  }, extra);
+
+  t('协议翻译：Anthropic 客户端 → OpenAI 上游（system/工具/tool_result 改写 + /v2 路径）', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([openaiProvider('oai', up)], 'xlate1');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 64, stream: false,
+          system: '你是助手',
+          tools: [{ name: 'get_weather', description: '查天气', input_schema: { type: 'object', properties: { city: { type: 'string' } }, required: ['city'] } }],
+          messages: [
+            { role: 'user', content: '北京天气？' },
+            { role: 'assistant', content: [{ type: 'text', text: '我查一下' }, { type: 'tool_use', id: 'toolu_1', name: 'get_weather', input: { city: '北京' } }] },
+            { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: '晴 25℃' }] },
+          ],
+        },
+      });
+      assert.strictEqual(r.status, 200, '应成功，实际 ' + r.status + ' ' + r.text.slice(0, 240));
+      assert.strictEqual(up.st.paths[0], '/v2/chat/completions', '应打到 /v2：' + up.st.paths[0]);
+      const sent = up.st.bodies[0];
+      assert.strictEqual(sent.messages[0].role, 'system', 'system 应为首条消息：' + JSON.stringify(sent.messages[0]));
+      assert.strictEqual(sent.messages[0].content, '你是助手');
+      const assistant = sent.messages.find((m) => m.role === 'assistant');
+      assert.ok(Array.isArray(assistant.tool_calls) && assistant.tool_calls[0].function.name === 'get_weather',
+        'tool_use 应转 tool_calls：' + JSON.stringify(assistant));
+      assert.ok(sent.messages.some((m) => m.role === 'tool' && m.tool_call_id === 'toolu_1' && /晴 25℃/.test(m.content)),
+        'tool_result 应转 role:tool：' + JSON.stringify(sent.messages));
+      assert.strictEqual(sent.tools[0].type, 'function');
+      assert.strictEqual(sent.tools[0].function.parameters.required[0], 'city', 'input_schema → parameters');
+      const out = JSON.parse(r.text);
+      assert.strictEqual(out.type, 'message', '应答须为 Anthropic message：' + r.text.slice(0, 200));
+      assert.ok(out.content.some((b) => b.type === 'text' && /来自 OpenAI 上游的回复/.test(b.text)),
+        '文本应翻译回 Anthropic 内容块：' + JSON.stringify(out.content));
+      assert.strictEqual(out.stop_reason, 'end_turn');
+      assert.strictEqual(out.usage.input_tokens, 11, 'usage 应透传：' + JSON.stringify(out.usage));
+      assert.strictEqual(out.usage.output_tokens, 7);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('协议翻译：OpenAI SSE → Anthropic 事件流（thinking/text/tool_use + 结束事件）', async () => {
+    const up = await startFakeOpenAIUpstream({ withToolCall: true });
+    const gw = await startGatewayWith([openaiProvider('oai2', up, { quirks: ['force-stream'] })], 'xlate2');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      const text = r.text;
+      assert.ok(/event: message_start/.test(text), '缺 message_start：' + text.slice(0, 300));
+      assert.ok(/"type":"thinking_delta","thinking":"先想一下"/.test(text), 'reasoning_content → thinking_delta：' + text.slice(0, 400));
+      assert.ok(/"type":"text_delta","text":"你好"/.test(text), 'content → text_delta：' + text.slice(0, 400));
+      assert.ok(/"type":"tool_use"/.test(text) && /"name":"get_weather"/.test(text), 'tool_calls 应开 tool_use 块：' + text.slice(0, 600));
+      assert.ok(/input_json_delta/.test(text), 'arguments 分片应转 input_json_delta：' + text.slice(0, 600));
+      assert.ok(/event: content_block_stop/.test(text) && /event: message_delta/.test(text) && /event: message_stop/.test(text),
+        '应有 stop/delta/stop 收尾事件：' + text.slice(-300));
+      assert.ok(/"stop_reason":"tool_use"/.test(text), '有工具调用时 stop_reason=tool_use：' + text.slice(-300));
+      assert.strictEqual(up.st.bodies[0].stream, true, 'quirk force-stream 应强制 stream:true');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('协议翻译：客户端要非流式 + 上游强制流式 → 网关聚合 SSE 后回单条 message', async () => {
+    const up = await startFakeOpenAIUpstream({});
+    const gw = await startGatewayWith([openaiProvider('oai3', up, { quirks: ['force-stream'] })], 'xlate3');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, stream: false, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const out = JSON.parse(r.text);
+      assert.strictEqual(out.type, 'message', '应聚合为单条 message：' + r.text.slice(0, 240));
+      const textBlock = out.content.find((b) => b.type === 'text');
+      assert.ok(textBlock && /你好，世界/.test(textBlock.text), '聚合文本应完整：' + JSON.stringify(out.content));
+      assert.ok(out.usage.output_tokens > 0, '应给出 output_tokens：' + JSON.stringify(out.usage));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('供应商能力：自定义头 + tool_choice 摊平 + prepend-system', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([
+      openaiProvider('oai4', up, {
+        headers: { 'X-Product': 'SaaS', 'User-Agent': 'CLI/2.63.2 CodeBuddy/2.63.2' },
+        quirks: ['stringify-tool-choice', 'prepend-system'],
+      }),
+    ], 'cap1');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 32, stream: false,
+          tool_choice: { type: 'tool', name: 'get_weather' },
+          tools: [{ name: 'get_weather', input_schema: { type: 'object' } }],
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const h = up.st.headers[0];
+      assert.strictEqual(h['x-product'], 'SaaS', '自定义头应发出：' + JSON.stringify(h));
+      assert.strictEqual(h['user-agent'], 'CLI/2.63.2 CodeBuddy/2.63.2', 'UA 应可配置：' + h['user-agent']);
+      const sent = up.st.bodies[0];
+      assert.strictEqual(sent.tool_choice, 'get_weather', 'tool_choice 应摊平为字符串：' + JSON.stringify(sent.tool_choice));
+      assert.strictEqual(sent.messages[0].role, 'system', 'prepend-system 应补 system：' + JSON.stringify(sent.messages[0]));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('WorkBuddy 凭据：读桌面 auth 文件 → Bearer + 身份头（不再发 x-api-key）', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-auth-'));
+    const authFile = writeWorkBuddyAuth(dir, 'workbuddy-desktop.info', { token: 'AT-1', uid: 'u-1', enterpriseId: 'ent-1', domain: 'codebuddy.cn' });
+    const gw = await startGatewayWith([
+      openaiProvider('wb', up, { auth: 'workbuddy', accounts: [{ id: 'a1', authFile }] }),
+    ], 'wb1');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const h = up.st.headers[0];
+      assert.strictEqual(h.authorization, 'Bearer AT-1', '应用桌面凭据的 Bearer：' + JSON.stringify(h));
+      assert.strictEqual(h['x-user-id'], 'u-1', 'X-User-Id：' + JSON.stringify(h));
+      assert.strictEqual(h['x-enterprise-id'], 'ent-1', 'X-Enterprise-Id');
+      assert.strictEqual(h['x-domain'], 'codebuddy.cn', 'X-Domain');
+      assert.strictEqual(h.referer, 'https://www.codebuddy.cn/', 'Referer 应按区域：' + h.referer);
+      assert.ok(!('x-api-key' in h), 'WorkBuddy 路径不得再发 x-api-key');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('多账户池：额度耗尽 → 同供应商内切下一个账户（不换供应商）', async () => {
+    const upPool = await startFakeOpenAIUpstream({ script: ['credit', 'ok'], json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-pool-'));
+    const a1 = writeWorkBuddyAuth(dir, 'wb-a1.info', { token: 'AT-A1', uid: 'uid-a1' });
+    const a2 = writeWorkBuddyAuth(dir, 'wb-a2.info', { token: 'AT-A2', uid: 'uid-a2' });
+    const upFallback = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      openaiProvider('wbp', upPool, { auth: 'workbuddy', accounts: [{ id: 'a1', authFile: a1 }, { id: 'a2', authFile: a2 }] }),
+      providerOf('fallback', upFallback, { models: ['test-model'] }),
+    ], 'pool1');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '应切到第二个账户成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(upPool.st.calls, 2, '同供应商内应重试一次（换账户），实际 ' + upPool.st.calls);
+      assert.strictEqual(upFallback.st.calls, 0, '账户池仍有可用账户时不得换供应商，实际 ' + upFallback.st.calls);
+      const used = upPool.st.headers.map((h) => h.authorization);
+      assert.ok(used[0] !== used[1], '两次应使用不同账户 token：' + JSON.stringify(used));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/标记为 credit/.test(logText), '日志应记录账户被标记：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(upPool); closeUp(upFallback); }
+  });
+
+  t('多账户池：全部账户不可用 → 交给下一家供应商（不打死请求）', async () => {
+    const upPool = await startFakeOpenAIUpstream({ behavior: 'credit' });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-pool2-'));
+    const a1 = writeWorkBuddyAuth(dir, 'wb-b1.info', { token: 'AT-B1', uid: 'uid-b1' });
+    const a2 = writeWorkBuddyAuth(dir, 'wb-b2.info', { token: 'AT-B2', uid: 'uid-b2' });
+    const upFallback = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      openaiProvider('wbp2', upPool, { auth: 'workbuddy', accounts: [{ id: 'b1', authFile: a1 }, { id: 'b2', authFile: a2 }] }),
+      providerOf('fallback2', upFallback, { models: ['test-model'] }),
+    ], 'pool2');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '应由下一家供应商服务，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(upPool.st.calls, 2, '两个账户都应试过，实际 ' + upPool.st.calls);
+      assert.strictEqual(upFallback.st.calls, 1, '应切到备用供应商，实际 ' + upFallback.st.calls);
+    } finally { killGw(gw); closeUp(upPool); closeUp(upFallback); }
+  });
+
+  t('WorkBuddy 凭据：access token 临期 → 自动刷新（X-Refresh-Token）并用新 token 请求', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-refresh-'));
+    // expiresInMs 为负 → 已过期/临期，触发刷新
+    const authFile = writeWorkBuddyAuth(dir, 'wb-exp.info', { token: 'AT-OLD', uid: 'u-exp', expiresInMs: -60_000, refreshToken: 'RT-EXP' });
+    const gw = await startGatewayWith([
+      openaiProvider('wbr', up, { auth: 'workbuddy', accounts: [{ id: 'e1', authFile }] }),
+    ], 'wb2');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '刷新后应成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok((up.st.refreshCalls || 0) >= 1, '应调用过刷新端点，实际 ' + (up.st.refreshCalls || 0));
+      const refreshHdr = up.st.headers[up.st.paths.findIndex((p) => /token\/refresh$/.test(p))];
+      assert.strictEqual(refreshHdr['x-refresh-token'], 'RT-EXP', '刷新请求应带 X-Refresh-Token：' + JSON.stringify(refreshHdr));
+      assert.strictEqual(refreshHdr['x-auth-refresh-source'], 'workbuddy', '刷新请求应带 X-Auth-Refresh-Source');
+      const chatIdx = up.st.paths.findIndex((p) => /chat\/completions$/.test(p));
+      assert.strictEqual(up.st.headers[chatIdx].authorization, 'Bearer AT-REFRESHED',
+        'chat 请求应使用刷新后的 token：' + up.st.headers[chatIdx].authorization);
+      // 自留副本落在网关数据目录（不写桌面 App 的文件）
+      const ownDir = path.join(path.dirname(gw.logPath), 'workbuddy-auth');
+      assert.ok(fs.existsSync(ownDir), '应在网关数据目录留凭据副本：' + ownDir);
+      assert.strictEqual(JSON.parse(fs.readFileSync(authFile, 'utf8')).auth.accessToken, 'AT-OLD', '桌面 App 的凭据文件不得被改写');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('协议翻译：静态 key 的 OpenAI 上游 → 发 Bearer（而非 x-api-key），修 sensenova 类 401', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([openaiProvider('senselike', up)], 'xlate4');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const h = up.st.headers[0];
+      assert.strictEqual(h.authorization, 'Bearer ' + UPSTREAM_KEY, 'OpenAI 上游必须收 Bearer：' + JSON.stringify(h.authorization));
+      assert.ok(!('x-api-key' in h), '不得再发 x-api-key：' + JSON.stringify(Object.keys(h)));
+      assert.ok(!('anthropic-version' in h), '不得再发 anthropic-version');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('多账户池（直通路径）：/v1/chat/completions 也走账户池 —— 额度耗尽自动换账户', async () => {
+    // 上游：第 1 次 402（第一个账户额度耗尽）→ 第 2 次 SSE 成功
+    const upPool = await startFakeOpenAIUpstream({ script: ['credit', 'ok'], json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-pool3-'));
+    const a1 = writeWorkBuddyAuth(dir, 'wb-c1.info', { token: 'AT-C1', uid: 'uid-c1' });
+    const a2 = writeWorkBuddyAuth(dir, 'wb-c2.info', { token: 'AT-C2', uid: 'uid-c2' });
+    const gw = await startGatewayWith([
+      openaiProvider('wbp3', upPool, { auth: 'workbuddy', accounts: [{ id: 'c1', authFile: a1 }, { id: 'c2', authFile: a2 }] }),
+    ], 'pool3');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // 走 OpenAI 直通路径（客户端说 OpenAI 协议），验证账户池同样生效
+      const r = await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '应换账户后成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(upPool.st.calls, 2, '应换账户重试一次，实际 ' + upPool.st.calls);
+      const used = upPool.st.headers.map((h) => h.authorization);
+      assert.ok(used[0] && used[1] && used[0] !== used[1], '两次应使用不同账户 token：' + JSON.stringify(used));
+      assert.strictEqual(upPool.st.paths[0], '/v2/chat/completions', '仍应打 /v2：' + upPool.st.paths[0]);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/标记为 credit/.test(logText), '日志应记录账户被标记：' + logText.slice(-400));
+    } finally { killGw(gw); closeUp(upPool); }
+  });
+
+  t('账户池可见性：/health 列出全部账户与冷却状态；日志标注实际使用的账户（via=provider#acct）', async () => {
+    // 第 1 次 a1 额度耗尽 → 第 2 次 a2 成功
+    const up = await startFakeOpenAIUpstream({ script: ['credit', 'ok'], json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-vis-'));
+    const a1 = writeWorkBuddyAuth(dir, 'wb-d1.info', { token: 'AT-D1', uid: 'uid-d1' });
+    const a2 = writeWorkBuddyAuth(dir, 'wb-d2.info', { token: 'AT-D2', uid: 'uid-d2' });
+    const gw = await startGatewayWith([
+      openaiProvider('wbv', up, { auth: 'workbuddy', accounts: [{ id: 'd1', authFile: a1 }, { id: 'd2', authFile: a2 }] }),
+    ], 'vis1');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // ① 未失败前：两个账户都应在册且 state=ok
+      const h0 = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      assert.ok(Array.isArray(h0.accounts), '/health 应带 accounts 数组：' + JSON.stringify(h0));
+      assert.strictEqual(h0.accounts.length, 2, '应列出全部 2 个账户：' + JSON.stringify(h0.accounts));
+      assert.ok(h0.accounts.every((a) => a.state === 'ok'), '未失败时都应为 ok：' + JSON.stringify(h0.accounts));
+      assert.ok(h0.accounts.every((a) => a.provider === 'wbv'), '应标注所属供应商：' + JSON.stringify(h0.accounts));
+      // ② 触发一次额度耗尽 → 该账户应变为 credit 且带剩余冷却时间
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '应换账户后成功，实际 ' + r.status);
+      const h1 = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      const cooling = h1.accounts.filter((a) => a.state === 'credit');
+      assert.strictEqual(cooling.length, 1, '应有 1 个账户处于 credit 冷却：' + JSON.stringify(h1.accounts));
+      assert.ok(cooling[0].remainMs > 0, '应给出剩余冷却毫秒：' + JSON.stringify(cooling[0]));
+      assert.ok(cooling[0].reason && /credit|积分/.test(cooling[0].reason), '应带冷却原因：' + JSON.stringify(cooling[0]));
+      assert.ok(h1.accounts.some((a) => a.lastUsed === true), '应标注最近使用的账户：' + JSON.stringify(h1.accounts));
+      // ③ 日志里应能看到实际服务的账户
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/via=wbv#d2/.test(logText), '日志应标注实际账户（via=wbv#d2）：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('WorkBuddy 免路径：accounts 只写 { id } → 按平台默认位置自动发现凭据（LOCALAPPDATA/APPDATA）', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-auto-'));
+    const authFile = writeWorkBuddyAuth(dir, 'auto.info', { token: 'AT-AUTO', uid: 'uid-auto' });
+    // 通过环境变量把"平台默认探测路径"指到临时文件（等价于本机装了 WorkBuddy 并登录）
+    const gw = await startGatewayWith(
+      [openaiProvider('wba', up, { auth: 'workbuddy', accounts: [{ id: 'auto1' }] })],
+      'wbauto',
+      { LOCALAPPDATA: dir, APPDATA: dir },
+    );
+    // 上面 env 只改了 AppData 根；把凭据放到期望的子路径下，模拟真实布局
+    const rel = path.join(dir, 'CodeBuddyExtension', 'Data', 'Public', 'auth');
+    fs.mkdirSync(rel, { recursive: true });
+    fs.copyFileSync(authFile, path.join(rel, 'workbuddy-desktop.info'));
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '应自动发现凭据并成功，实际 ' + r.status + ' ' + r.text.slice(0, 240));
+      const h = up.st.headers[0];
+      assert.strictEqual(h.authorization, 'Bearer AT-AUTO', '应用自动发现的凭据：' + JSON.stringify(h.authorization));
+      assert.strictEqual(h['x-user-id'], 'uid-auto', '身份头应来自自动发现的凭据');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('协议翻译：上游 200 但 SSE 首事件是 error → 判该家失败并换下一家（不让客户端收空回复）', async () => {
+    const errSse = 'data: {"error":{"message":"Service temporarily unavailable","type":"api_error"}}\n\n';
+    const upBad = await startFakeOpenAIUpstream({ sseRaw: errSse });
+    const upGood = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([
+      openaiProvider('oaiBad', upBad),
+      openaiProvider('oaiGood', upGood),
+    ], 'xlate5');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 32, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '应换到家后成功，实际 ' + r.status);
+      assert.ok(!/Service temporarily unavailable/.test(r.text), '不得把上游错误原文透传：' + r.text.slice(0, 200));
+      assert.ok(/来自 OpenAI 上游的回复/.test(r.text), '应拿到第二家的正文：' + r.text.slice(0, 300));
+      assert.strictEqual(upBad.st.calls, 1, '第一家应被尝试一次，实际 ' + upBad.st.calls);
+      assert.strictEqual(upGood.st.calls, 1, '第二家应收到转发，实际 ' + upGood.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/SSE 首事件是错误/.test(logText), '日志应记录该判定：' + logText.slice(-400));
+    } finally { killGw(gw); closeUp(upBad); closeUp(upGood); }
+  });
+
+  t('协议翻译：唯一候选 200+SSE error → 回网关自己的 503（不写 200 空回复）', async () => {
+    const errSse = 'data: {"error":{"message":"Service temporarily unavailable"}}\n\n';
+    const up = await startFakeOpenAIUpstream({ sseRaw: errSse });
+    const gw = await startGatewayWith([openaiProvider('oaiOnly', up)], 'xlate6');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 503, '应回网关自己的 503，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.ok(!/Service temporarily unavailable/.test(r.text), '不得回显上游原文：' + r.text.slice(0, 200));
+      const out = JSON.parse(r.text);
+      assert.strictEqual(out.type, 'error', '应是 Anthropic 错误体：' + r.text.slice(0, 200));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('WorkBuddy 身份仿真：chat 用桌面形态 UA（WorkBuddy/<app> … CLI/<cli>），刷新用 CLI 形态 UA', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-ua-'));
+    // 合成一个"已安装的 WorkBuddy"：install-manifest.json 给 App 版本；
+    // cli/package.json 的 version 是 0.0.0 占位 → 必须回退到 publishConfig.customPackage.version
+    fs.mkdirSync(path.join(dir, 'resources', 'app.asar.unpacked', 'cli'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'resources', 'install-manifest.json'), JSON.stringify({ appVersion: '9.9.9' }), 'utf8');
+    fs.writeFileSync(path.join(dir, 'resources', 'app.asar.unpacked', 'cli', 'package.json'),
+      JSON.stringify({ version: '0.0.0', publishConfig: { customPackage: { version: '3.3.3' } } }), 'utf8');
+    // 临期 token → 同时触发刷新路径（用于断言刷新仍用 CLI 形态 UA）
+    const authFile = writeWorkBuddyAuth(dir, 'wb-ua.info', { token: 'AT-UA', uid: 'uid-ua', expiresInMs: -60_000 });
+    const gw = await startGatewayWith(
+      [openaiProvider('wbua', up, { auth: 'workbuddy', accounts: [{ id: 'u1', authFile }] })],
+      'wbua',
+      { WORKBUDDY_APP_DIR: dir },   // 让版本解析指向合成的安装目录
+    );
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const chatIdx = up.st.paths.findIndex((p) => /chat\/completions$/.test(p));
+      assert.ok(chatIdx >= 0, '应有 chat 请求：' + JSON.stringify(up.st.paths));
+      assert.strictEqual(up.st.headers[chatIdx]['user-agent'], 'WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/3.3.3',
+        'chat 必须是桌面客户端形态 UA：' + up.st.headers[chatIdx]['user-agent']);
+      const refreshIdx = up.st.paths.findIndex((p) => /token\/refresh$/.test(p));
+      assert.ok(refreshIdx >= 0, '临期账户应触发刷新：' + JSON.stringify(up.st.paths));
+      assert.strictEqual(up.st.headers[refreshIdx]['user-agent'], 'CLI/2.63.2 CodeBuddy/2.63.2',
+        '刷新路径保持 CLI 形态 UA（与插件一致）：' + up.st.headers[refreshIdx]['user-agent']);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('供应商能力（直通路径）：quirks 同样生效 —— tool_choice 摊平 / prepend-system / force-stream 聚合', async () => {
+    // 2026-09-16 实测：quirks 曾在**只有翻译路径**生效，OpenAI 客户端把 tool_choice 对象透传 →
+    // 上游 400「cannot unmarshal object into Go struct field Request.tool_choice of type string」
+    const up = await startFakeOpenAIUpstream({});   // 一直回 SSE（模拟只收流式的上游）
+    const gw = await startGatewayWith([
+      openaiProvider('qd', up, { quirks: ['stringify-tool-choice', 'prepend-system', 'force-stream'] }),
+    ], 'quirks1');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // 客户端要**非流式**：上游被强制 stream:true → 网关必须聚合后回单条 JSON
+      const r = await call({
+        port: gw.port, p: '/v1/chat/completions',
+        body: {
+          model: 'test-model', stream: false,
+          tool_choice: { type: 'function', function: { name: 'get_weather' } },
+          tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 240));
+      const sent = up.st.bodies[0];
+      assert.strictEqual(sent.tool_choice, 'get_weather', 'tool_choice 必须摊平成字符串：' + JSON.stringify(sent.tool_choice));
+      assert.strictEqual(sent.messages[0].role, 'system', 'prepend-system 应补 system：' + JSON.stringify(sent.messages[0]));
+      assert.strictEqual(sent.stream, true, 'force-stream 应强制上游 stream:true：' + sent.stream);
+      // 客户端拿到的是聚合后的单条 completion（不是 SSE）
+      const out = JSON.parse(r.text);
+      assert.strictEqual(out.object, 'chat.completion', '客户端应收到聚合后的 JSON：' + r.text.slice(0, 200));
+      assert.ok(/你好，世界/.test(out.choices[0].message.content), '聚合内容应完整：' + JSON.stringify(out.choices[0].message));
+      assert.strictEqual(out.choices[0].finish_reason, 'stop');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('供应商能力（直通路径）：force-stream 下客户端要流式 → 原样透传 SSE，不聚合', async () => {
+    const up = await startFakeOpenAIUpstream({});
+    const gw = await startGatewayWith([openaiProvider('qs', up, { quirks: ['force-stream'] })], 'quirks2');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', stream: true, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      assert.ok(/data: \{"id":"chatcmpl-1"/.test(r.text) && /\[DONE\]/.test(r.text), '流式客户端应拿到原始 SSE：' + r.text.slice(0, 200));
+      assert.strictEqual(up.st.bodies[0].stream, true, '上游仍应 stream:true');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('身份仿真边界：只有 workbuddy 用 WorkBuddy 身份；其余供应商仍按 clientProfile 仿真（claude/codex/自定义）', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-scope-'));
+    fs.mkdirSync(path.join(dir, 'resources', 'app.asar.unpacked', 'cli'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'resources', 'install-manifest.json'), JSON.stringify({ appVersion: '9.9.9' }), 'utf8');
+    fs.writeFileSync(path.join(dir, 'resources', 'app.asar.unpacked', 'cli', 'package.json'),
+      JSON.stringify({ version: '0.0.0', publishConfig: { customPackage: { version: '3.3.3' } } }), 'utf8');
+    const authFile = writeWorkBuddyAuth(dir, 'wb-scope.info', { token: 'AT-SCOPE', uid: 'uid-scope' });
+    const env = { WORKBUDDY_APP_DIR: dir };
+    const plain = (id) => ({ id, baseURL: 'http://127.0.0.1:' + up.port + '/v1', apiKey: UPSTREAM_KEY, models: ['test-model'], enabled: true });
+
+    // ① claude 仿真（默认 clientProfile）→ 普通供应商：UA 必须是 Claude Code 形态
+    let gw = await startGatewayWith([plain('n1')], 'scope1', env, { clientProfile: 'claude', clientUA: 'claude-cli/2.0.0 (external, cli)' });
+    try {
+      assert.ok(gw.ready);
+      await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(up.st.headers[0]['user-agent'], 'claude-cli/2.0.0 (external, cli)',
+        '普通供应商必须保持 Claude Code 仿真：' + up.st.headers[0]['user-agent']);
+      assert.ok(!/WorkBuddy/.test(up.st.headers[0]['user-agent']), '普通供应商绝不能带上 WorkBuddy 身份');
+    } finally { killGw(gw); }
+
+    // ② codex 仿真 → 普通供应商：UA 必须是 Codex 形态
+    gw = await startGatewayWith([plain('n2')], 'scope2', env, { clientProfile: 'codex' });
+    try {
+      assert.ok(gw.ready);
+      const before = up.st.calls;
+      await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.ok(/^codex\/0\.49\.0/.test(up.st.headers[before]['user-agent']),
+        'codex 配置下应发 Codex 形态 UA：' + up.st.headers[before]['user-agent']);
+      assert.ok(!/WorkBuddy/.test(up.st.headers[before]['user-agent']), '不得混入 WorkBuddy 身份');
+    } finally { killGw(gw); }
+
+    // ③ 供应商自带 User-Agent（配置覆盖）→ 只发这一个 UA（不得与 clientProfile 的 UA 拼接）
+    gw = await startGatewayWith([Object.assign(plain('n3'), { headers: { 'User-Agent': 'my-agent/1.0' } })], 'scope3', env,
+      { clientProfile: 'claude', clientUA: 'claude-cli/2.0.0 (external, cli)' });
+    try {
+      assert.ok(gw.ready);
+      const before = up.st.calls;
+      await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(up.st.headers[before]['user-agent'], 'my-agent/1.0',
+        '供应商配置的 UA 应生效且不被拼接：' + up.st.headers[before]['user-agent']);
+    } finally { killGw(gw); }
+
+    // ④ WorkBuddy 供应商（同一个网关配置里）→ 必须是桌面 WorkBuddy 身份
+    //    注意：普通供应商声明**别的模型**，否则它会先拿到请求（那样断言到的是它的头）
+    gw = await startGatewayWith([
+      Object.assign(plain('n4'), { models: ['other-model'] }),
+      openaiProvider('wbs', up, { auth: 'workbuddy', accounts: [{ id: 's1', authFile }] }),
+    ], 'scope4', env, { clientProfile: 'claude', clientUA: 'claude-cli/2.0.0 (external, cli)' });
+    try {
+      assert.ok(gw.ready);
+      const before = up.st.calls;
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      assert.strictEqual(up.st.calls, before + 1, '应只有 WorkBuddy 一家被调用');
+      const h = up.st.headers[before];
+      assert.strictEqual(h['user-agent'], 'WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/3.3.3',
+        'WorkBuddy 必须用桌面身份 UA：' + h['user-agent']);
+      assert.ok(!/claude-cli/.test(h['user-agent']), 'WorkBuddy 请求不得混入 claude-cli（旧 bug 会拼成两个 UA）');
+      assert.strictEqual(h['x-user-id'], 'uid-scope', 'WorkBuddy 身份头应存在');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('协议翻译：工具名在后续分片才到达时，客户端仍必须拿到非空的 tool_use 名字（真实事故回归）', async () => {
+    // 事故（2026-09-16）：上游先发 id、稍后才发 name，旧实现立刻开块 → 名字为空 →
+    // 客户端报 `unknown tool ""`，下一轮把空名 tool_use 回传 → 上游 400 打死整轮。
+    const up = await startFakeOpenAIUpstream({ withToolCall: true, toolNameLate: true });
+    const gw = await startGatewayWith([openaiProvider('late', up, { quirks: ['force-stream'] })], 'toollate');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      // 取出客户端实际收到的 tool_use 块（content_block_start 的 name 字段）
+      const starts = [...r.text.matchAll(/"content_block":\{"type":"tool_use"[^}]*"name":"([^"]*)"/g)].map((m) => m[1]);
+      assert.ok(starts.length >= 1, '应有 tool_use 块：' + r.text.slice(0, 400));
+      assert.strictEqual(starts[0], 'get_weather', '工具名必须非空且正确（旧实现为空串）：' + JSON.stringify(starts));
+      assert.ok(!/"name":""/.test(r.text), '不得出现空名 tool_use：' + r.text.slice(0, 400));
+      // 参数应完整补发（名字到达前缓冲的分片不能丢）——按 SSE 事件解析，避免转义引号截断正则
+      const events = r.text.split(/\n\n/).map((blk) => (/^data:\s*(.*)$/m.exec(blk) || [])[1]).filter(Boolean)
+        .map((d) => { try { return JSON.parse(d); } catch { return null; } }).filter(Boolean);
+      const partials = events.filter((e) => e.type === 'content_block_delta' && e.delta && e.delta.type === 'input_json_delta')
+        .map((e) => e.delta.partial_json);
+      assert.ok(partials.join('').includes('北京'), '缓冲的参数分片应完整补发：' + JSON.stringify(partials));
+      // 且 tool_use 块只应开一次（旧实现会开两次：空名一次 + 补名一次）
+      const toolStarts = events.filter((e) => e.type === 'content_block_start' && e.content_block && e.content_block.type === 'tool_use');
+      assert.strictEqual(toolStarts.length, 1, 'tool_use 块只应开一次：' + JSON.stringify(toolStarts.map((e) => e.content_block.name)));
+      // 聚合路径（非流式客户端）也要拿到名字
+      const up2 = await startFakeOpenAIUpstream({ withToolCall: true, toolNameLate: true });
+      const gw2 = await startGatewayWith([openaiProvider('late2', up2, { quirks: ['force-stream'] })], 'toollate2');
+      try {
+        const r2 = await call({ port: gw2.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 64, stream: false, messages: [{ role: 'user', content: 'hi' }] } });
+        const out = JSON.parse(r2.text);
+        const tu = out.content.find((b) => b.type === 'tool_use');
+        assert.ok(tu && tu.name === 'get_weather', '聚合路径同样要有正确的工具名：' + JSON.stringify(out.content));
+        assert.deepStrictEqual(tu.input, { city: '北京' }, '聚合路径参数应完整：' + JSON.stringify(tu.input));
+      } finally { killGw(gw2); closeUp(up2); }
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('协议翻译（防御）：历史里的空名 tool_use 及其 tool_result 必须被丢弃，不得让整轮 400', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([openaiProvider('def1', up)], 'def1');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 32, stream: false,
+          messages: [
+            { role: 'user', content: '北京天气？' },
+            // 修复前版本可能产生这种坏数据：tool_use 名字为空
+            { role: 'assistant', content: [{ type: 'text', text: '我查一下' }, { type: 'tool_use', id: 'bad_1', name: '', input: { city: '北京' } }] },
+            { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'bad_1', content: '晴 25℃' }] },
+            { role: 'user', content: '那就说不知道' },
+          ],
+        },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const sent = up.st.bodies[0];
+      const badCall = sent.messages.some((m) => Array.isArray(m.tool_calls)
+        && m.tool_calls.some((t) => !t.function || !String(t.function.name || '').trim()));
+      assert.ok(!badCall, '不得回传空名 tool_calls（上游会 400）：' + JSON.stringify(sent.messages));
+      const orphan = sent.messages.some((m) => m.role === 'tool' && m.tool_call_id === 'bad_1');
+      assert.ok(!orphan, '不得留下孤儿的 tool 消息：' + JSON.stringify(sent.messages));
+      assert.ok(sent.messages.some((m) => m.role === 'user' && /那就说不知道/.test(String(m.content))),
+        '其余历史必须保留：' + JSON.stringify(sent.messages));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/名字为空.*tool_use.*已丢弃/.test(logText), '应记录丢弃告警：' + logText.slice(-300));
     } finally { killGw(gw); closeUp(up); }
   });
 
