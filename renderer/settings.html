@@ -111,13 +111,21 @@
        上游 ID 1.3fr（更宽） | 映射为 1fr | 操作 64px（按钮定宽，不再拉伸）
      表头也改成 3 列并各就各位（旧版表头是 4 格，"操作"落进了 1fr 列 → 与内容错位）。 */
   .gw-map { display: block; margin-bottom: 14px; font-size: 12px; }
+  /* 高级能力摘要（protocol/auth/accounts/quirks/headers）：只读提示，实际在 JSON 里编辑 */
+  .gw-adv {
+    margin-bottom: 12px; padding: 7px 9px; border-radius: 6px; font-size: 11px; line-height: 1.5;
+    background: #1b212c; border: 1px solid #2c3546; color: #8fb8ff; word-break: break-all;
+  }
   .gw-map .map-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; font-size: 13px; }
   .gw-map .map-head > span:first-child { width: 130px; flex: none; color: #9aa7bc; }
   .gw-map .map-hd,
   .gw-map .map-row {
-    display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) 64px;
+    display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) 52px 64px;
     gap: 8px; align-items: center;
   }
+  /* 图片能力复选框列（2026-09-16）：勾选 = 该模型支持图片输入 */
+  .gw-map .map-row input[type=checkbox] { width: 15px; height: 15px; margin: 0 auto; display: block; cursor: pointer; }
+  .gw-map .map-hd .map-hd-img { text-align: center; }
   .gw-map .map-hd { padding: 0 0 5px; color: #8a93a3; font-size: 11px; }
   .gw-map .map-hd span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .gw-map .map-row { margin-bottom: 6px; }
@@ -258,9 +266,9 @@
     <div class="gw-wrap">
       <div class="gw-left">
         <div class="gw-tools">
-          <button type="button" id="btnGwUp" title="把选中的供应商上移一位（列表顺序 = 路由优先级）">▲ 上移</button>
-          <button type="button" id="btnGwDown" title="把选中的供应商下移一位（列表顺序 = 路由优先级）">▼ 下移</button>
-          <span class="gw-tools-hint">选中一行后用 ▲▼ 调整顺序 · 顺序即优先级 P1…Pn</span>
+          <button type="button" id="btnGwUp" title="把选中的供应商上移一位（列表顺序 = 网关取候选的顺序；不改动优先级字段）">▲ 上移</button>
+          <button type="button" id="btnGwDown" title="把选中的供应商下移一位（列表顺序 = 网关取候选的顺序；不改动优先级字段）">▼ 下移</button>
+          <span class="gw-tools-hint">选中一行后用 ▲▼ 调整顺序 · 顺序即选路顺序（#1 最先尝试）</span>
         </div>
         <div class="gw-tbl">
           <div id="gwRows"></div>
@@ -272,6 +280,7 @@
           <h3>供应商配置：<b id="gwEditId">（未选择）</b></h3>
           <div class="hint-empty" id="gwEditorEmpty">点击左侧供应商进行编辑；或点击「＋ 添加供应商」新增。</div>
           <div class="fields hidden" id="gwEditorFields">
+            <div class="gw-adv" id="gwAdv" style="display:none"></div>
             <div class="row"><label>ID</label><input type="text" id="eId" /></div>
             <div class="row"><label>Base URL</label><input type="text" id="eUrl" placeholder="https://api.example.com/v1" /></div>
             <div class="row"><label>API Key</label><input type="password" id="eKey" placeholder="sk-…" /></div>
@@ -284,12 +293,13 @@
               <div class="map-hd">
                 <span>上游模型 ID（真实）</span>
                 <span>映射为（网关路由名，留空=同名）</span>
+                <span class="map-hd-img" title="勾选 = 该模型支持图片输入（会写进 dsh 配置的 input: [text, image]，否则 dsh 会拦下图片）">图片</span>
                 <span>操作</span>
               </div>
               <div id="eModelRows"></div>
               <div class="map-foot">
                 <button type="button" id="btnModelAddRow">＋ 添加一行</button>
-                <span style="color:#8a93a3;font-size:11px;">「映射为」留空 = 与上游同名（写回配置为字符串）</span>
+                <span style="color:#8a93a3;font-size:11px;">「映射为」留空 = 与上游同名；「图片」勾选后才能向该模型发图（未勾选 = 纯文本）</span>
               </div>
               <details class="gw-paste">
                 <summary>批量粘贴（每行一条：上游ID 或 上游ID =&gt; 逻辑名）</summary>
@@ -304,7 +314,7 @@
               </details>
             </div>
             <div class="row"><label>优先级</label><input type="number" id="ePriority" min="1" value="1" style="width:90px;" />
-              <span style="color:#8a93a3;font-size:11px;">列表顺序即优先级（P1 最先尝试）；用左侧 ▲▼ 重排会自动重编号</span></div>
+              <span style="color:#8a93a3;font-size:11px;">保留字段（不再参与排序）：网关按左侧列表顺序取候选，▲▼ 移动不会改动这里的值</span></div>
             <div class="row"><label>启用</label><input type="checkbox" id="eEnabled" /></div>
             <div class="row">
               <label style="width:auto;"></label>
@@ -520,9 +530,11 @@
       try { $('gwConfig').value = JSON.stringify(gwCfg, null, 2); } finally { gwUpdating = false; }
     }
 
-    // 供应商重排（2026-09-15 加）：选中一行 → ▲/▼ 与相邻行交换。
-    // 关键：**列表顺序 = 路由优先级**——交换后把 priority 重编号为 1…N，否则网关仍按
-    // 旧的 priority 排序，界面看到的顺序与实际选路不一致（这正是用户困惑的来源）。
+    // 供应商重排（2026-09-15 加，2026-09-16 改）：选中一行 → ▲/▼ 与相邻行交换。
+    // 2026-09-16 用户要求：**移动只改先后顺序，不改动优先级配置**。
+    // 旧实现交换后把 priority 重编号为 1…N，等于静默改写用户手写的优先级字段；现在
+    // 列表顺序本身就是选路顺序（网关按 providers 数组顺序取候选，不再按 priority 排序），
+    // 因此 priority 字段原样保留、不再被重排触碰。
     function gwMoveSel(delta) {
       if (!gwCfg || !Array.isArray(gwCfg.providers)) return;
       const i = gwSel;
@@ -533,12 +545,10 @@
       const tmp = arr[i];
       arr[i] = arr[j];
       arr[j] = tmp;
-      // 重编号：列表第 n 行 → priority = n（P1 最高优先级，failover 从这里开始）
-      arr.forEach((p, n) => { p.priority = n + 1; });
       gwSel = j;
       gwSyncText();
       gwRenderRows();
-      gwOpenEditor(j);          // 编辑器里的「优先级」字段同步刷新
+      gwOpenEditor(j);          // 编辑器内容随选中行刷新
     }
 
     // 渲染供应商表格
@@ -558,12 +568,14 @@
         // 改为紧凑写法「3 模型 · 1 映射」；完整映射清单仍在 title 里（悬停可见）。
         const cntText = modelList.length + ' 模型' + (mapped ? '·' + mapped + '映射' : '');
         const cntTitle = gwNormalizeModels(modelList).map((r) => r.as + ' ← ' + r.up).join('\n');
+        // 序号 = **选路顺序**（2026-09-16 改）：网关按配置数组顺序取候选，priority 字段不再参与
+        // 排序，所以这里显示列表位置（旧版显示 P<priority>，与移动结果不符、且会误导）。
         row.innerHTML =
           '<span><input type="checkbox" ' + (p.enabled === false ? '' : 'checked') + ' title="启用"></span>' +
           '<span class="mono id" title="' + esc(p.id || '') + '">' + esc(p.id || '（未命名）') + '</span>' +
           '<span class="mono" title="' + esc(p.baseURL || '') + '">' + esc(p.baseURL || '—') + '</span>' +
           '<span class="cnt" title="' + esc(cntTitle) + '">' + esc(cntText) + '</span>' +
-          '<span class="cnt">P' + esc(String(p.priority || 1)) + '</span>' +
+          '<span class="cnt" title="' + esc('选路顺序 #' + (i + 1) + '（列表顺序即网关取候选的顺序）') + '">#' + (i + 1) + '</span>' +
           '<span><button data-i="' + i + '" data-act="edit">编辑</button> <button data-i="' + i + '" data-act="del">删除</button></span>';
         row.querySelector('input[type=checkbox]').onchange = (e) => {
           p.enabled = e.target.checked;
@@ -650,20 +662,50 @@
         const asRaw = gwFirstStr(m, ['as', 'alias', 'name']);
         const up = upRaw || model;
         const as = asRaw || model || up;
-        if (up) out.push({ up, as: as || up });
+        // 图片能力（2026-09-16）：vision: true 或 input 含 'image'（与网关 modelEntries 一致；
+        // 同样只在为真时附带该字段，保证"读入形状"与网关完全一致）
+        const vision = m.vision === true
+          || (Array.isArray(m.input) && m.input.map((x) => String(x).toLowerCase()).includes('image'));
+        // 上下文/输出上限（2026-09-16）：**必须原样保留** —— 旧版只带走 vision，
+        // 用户一旦在配置页保存，contextWindow/maxTokens 就被静默抹掉
+        //（dsh 会退回 1M 默认 → 长对话在上游直接超上下文）
+        const ctxWin = Number(m.contextWindow != null ? m.contextWindow : (m.context != null ? m.context : m.ctx));
+        const maxTok = Number(m.maxTokens != null ? m.maxTokens : (m.maxOutputTokens != null ? m.maxOutputTokens : m.max_output_tokens));
+        if (up) {
+          const row = { up, as: as || up };
+          if (vision) row.vision = true;
+          if (Number.isFinite(ctxWin) && ctxWin > 0) row.contextWindow = ctxWin;
+          if (Number.isFinite(maxTok) && maxTok > 0) row.maxTokens = maxTok;
+          out.push(row);
+        }
       });
       return out;
     }
 
     // 模型映射：写出序列化 → as 为空或等于 up 写字符串，否则写对象 {id, as}
+    // 图片能力（vision）/ 上下文上限（contextWindow/maxTokens）存在时**必须**写成对象形态
+    //（字符串形态表达不了这些字段）。
     function gwSerializeModels(rows) {
       const out = [];
       (Array.isArray(rows) ? rows : []).forEach((r) => {
         if (!r) return;
         const up = String(r.up == null ? '' : r.up).trim();
         const as = String(r.as == null ? '' : r.as).trim();
+        const vision = r.vision === true;
+        const ctxWin = Number(r.contextWindow);
+        const maxTok = Number(r.maxTokens);
+        const hasCtx = Number.isFinite(ctxWin) && ctxWin > 0;
+        const hasMax = Number.isFinite(maxTok) && maxTok > 0;
         if (!up) return;
-        out.push((!as || as === up) ? up : { id: up, as: as });
+        if (vision || hasCtx || hasMax) {
+          const entry = { id: up, as: as || up };
+          if (vision) entry.vision = true;
+          if (hasCtx) entry.contextWindow = ctxWin;
+          if (hasMax) entry.maxTokens = maxTok;
+          out.push(entry);
+        } else {
+          out.push((!as || as === up) ? up : { id: up, as: as });
+        }
       });
       return out;
     }
@@ -713,13 +755,34 @@
       // 读入约定：as === up 的行「映射为」显示为空（提示"留空 = 同名"）——写回时留空即写字符串
       const up = (r.up || '').trim();
       iAs.value = (r.as && r.as !== up) ? r.as : '';
+      // 图片能力复选框（2026-09-16）：勾选 → 该条写出 {id, as, vision:true}
+      const iVis = document.createElement('input');
+      iVis.type = 'checkbox';
+      iVis.className = 'm-vision';
+      iVis.checked = r.vision === true;
+      iVis.title = '该模型支持图片输入（dsh 收到图片时会检查这个声明；未勾选则图片入口被拦下）';
       const del = document.createElement('button');
       del.type = 'button';
       del.textContent = '删除';
       del.onclick = () => { wrap.remove(); gwSyncModelRowsHint(); };
       wrap.appendChild(iUp);
       wrap.appendChild(iAs);
-      wrap.appendChild(del);   // 3 列网格：上游 ID / 映射为 / 操作（旧版多挂了一个空 span，与表头错位）
+      wrap.appendChild(iVis);
+      wrap.appendChild(del);   // 4 列网格：上游 ID / 映射为 / 图片 / 操作
+      // 上下文/输出上限：界面上不设输入框（保持表格简洁），但**必须随行携带**，
+      // 否则保存一次就被抹掉。用 dataset 暂存 + title 展示（悬停可见）。
+      if (Number.isFinite(Number(r.contextWindow)) && Number(r.contextWindow) > 0) {
+        wrap.dataset.ctx = String(Number(r.contextWindow));
+      }
+      if (Number.isFinite(Number(r.maxTokens)) && Number(r.maxTokens) > 0) {
+        wrap.dataset.max = String(Number(r.maxTokens));
+      }
+      if (wrap.dataset.ctx || wrap.dataset.max) {
+        const hint = '上下文 ' + (wrap.dataset.ctx || '默认') + ' / 最大输出 ' + (wrap.dataset.max || '默认')
+          + '（在 JSON 里编辑；此处只做保留）';
+        iUp.title = iUp.title + '\n' + hint;
+        iAs.title = iAs.title + '\n' + hint;
+      }
       return wrap;
     }
 
@@ -746,14 +809,22 @@
       gwSyncModelRowsHint();
     }
 
-    // 模型映射：读表 —— 编辑器 → [{up, as}]（忽略上游 ID 为空的行）
+    // 模型映射：读表 —— 编辑器 → [{up, as, vision}]（忽略上游 ID 为空的行）
     function gwReadModelRows() {
       const box = $('eModelRows');
       if (!box) return [];
-      return Array.prototype.map.call(box.querySelectorAll('.map-row'), (row) => ({
-        up: (row.querySelector('.m-up').value || '').trim(),
-        as: (row.querySelector('.m-as').value || '').trim(),
-      })).filter((r) => r.up);
+      return Array.prototype.map.call(box.querySelectorAll('.map-row'), (row) => {
+        const vis = row.querySelector('.m-vision');
+        const out = {
+          up: (row.querySelector('.m-up').value || '').trim(),
+          as: (row.querySelector('.m-as').value || '').trim(),
+          vision: !!(vis && vis.checked),
+        };
+        // 上限字段随行携带（见 gwBuildModelRow），读回时一并带回，避免保存丢字段
+        if (row.dataset && row.dataset.ctx) out.contextWindow = Number(row.dataset.ctx);
+        if (row.dataset && row.dataset.max) out.maxTokens = Number(row.dataset.max);
+        return out;
+      }).filter((r) => r.up);
     }
 
     // 模型映射：批量粘贴「导入」——解析结果追加到映射表（空行已在解析里跳过）
@@ -780,6 +851,19 @@
       gwFillModelRows(p.models);
       $('ePriority').value = p.priority || 1;
       $('eEnabled').checked = p.enabled !== false;
+      // 高级能力摘要（2026-09-16）：protocol/auth/accounts/quirks/headers 目前只能在 JSON 里编辑，
+      // 但**必须在界面上可见** —— 否则用户会困惑"这家为什么不走我的 Key / 为什么有账户池"。
+      if ($('gwAdv')) {
+        const adv = [];
+        if (p.protocol) adv.push('协议=' + p.protocol);
+        if (p.auth) adv.push('凭据=' + p.auth);
+        if (Array.isArray(p.accounts) && p.accounts.length) adv.push('账户池 ' + p.accounts.length + ' 个');
+        if (p.quirks) adv.push('quirks=' + (Array.isArray(p.quirks) ? p.quirks.join(',') : p.quirks));
+        if (p.headers && typeof p.headers === 'object') adv.push('自定义头 ' + Object.keys(p.headers).length + ' 个');
+        if (p.timeoutMs) adv.push('timeoutMs=' + p.timeoutMs);
+        $('gwAdv').textContent = adv.length ? '高级配置（在 JSON 里编辑）：' + adv.join(' · ') : '';
+        $('gwAdv').style.display = adv.length ? '' : 'none';
+      }
       $('gwEditorEmpty').style.display = 'none';
       $('gwEditorFields').classList.remove('hidden');
     }
