@@ -140,6 +140,48 @@ function validateConfigText(text) {
         return { ok: false, error: who + ' 存在非法条目——每项应为字符串，或形如 { "id": "上游真实ID", "as": "逻辑模型名" } 的对象' };
       }
     }
+    // 2026-09-16：WorkBuddy 接入引入的字段也要在保存前校验 —— 写错时若不拦，
+    // 网关只会静默忽略（例如 protocol 拼错 → 仍按 Anthropic 转发 → 上游 404，很难排查）。
+    {
+      const who = '供应商 ' + (p.id || '?');
+      if (p.protocol !== undefined) {
+        const proto = String(p.protocol).trim().toLowerCase();
+        if (!['openai-chat', 'openai-completions', 'openai', 'anthropic', 'anthropic-messages'].includes(proto)) {
+          return { ok: false, error: who + ' 的 protocol 非法（可选：openai-chat / anthropic-messages）' };
+        }
+      }
+      if (p.quirks !== undefined) {
+        const known = ['force-stream', 'stringify-tool-choice', 'prepend-system'];
+        const list = Array.isArray(p.quirks) ? p.quirks : (typeof p.quirks === 'string' ? p.quirks.split(',') : null);
+        if (!list) return { ok: false, error: who + ' 的 quirks 必须是数组或逗号分隔字符串' };
+        for (const q of list) {
+          const v = String(q).trim().toLowerCase();
+          if (v && !known.includes(v)) return { ok: false, error: who + ' 的 quirks 含未知项 "' + q + '"（可用：' + known.join(' / ') + '）' };
+        }
+      }
+      if (p.headers !== undefined && (typeof p.headers !== 'object' || Array.isArray(p.headers) || p.headers === null)) {
+        return { ok: false, error: who + ' 的 headers 必须是对象（如 { "User-Agent": "…" }）' };
+      }
+      if (p.accounts !== undefined) {
+        if (!Array.isArray(p.accounts)) return { ok: false, error: who + ' 的 accounts 必须是数组（账户池）' };
+        // auth=workbuddy 时允许只写 { id }：凭据按平台默认位置**自动发现**（见网关 runtime 的
+        // findWorkbuddyAuthFile）。此前校验器漏了这一条，导致"免路径"写法在设置页保存时被误拒，
+        // 而运行期其实是合法的 —— 校验必须与运行期语义一致。
+        const workbuddyAuth = String(p.auth || '').trim().toLowerCase() === 'workbuddy';
+        for (const a of p.accounts) {
+          if (!a || typeof a !== 'object' || Array.isArray(a)) return { ok: false, error: who + ' 的 accounts 存在非对象条目' };
+          const hasFile = typeof a.authFile === 'string' && a.authFile.trim();
+          const hasKey = typeof a.apiKey === 'string' && a.apiKey.trim();
+          if (!hasFile && !hasKey && !workbuddyAuth) {
+            return { ok: false, error: who + ' 的 accounts 条目缺少 authFile 或 apiKey：' + JSON.stringify(a)
+              + '（若该供应商 auth 为 workbuddy，可只写 { "id": "…" }，凭据按默认位置自动发现）' };
+          }
+        }
+      }
+      if (p.auth !== undefined && !['workbuddy'].includes(String(p.auth).trim().toLowerCase())) {
+        return { ok: false, error: who + ' 的 auth 非法（当前支持：workbuddy）' };
+      }
+    }
   }
   return { ok: true, error: null };
 }
@@ -287,6 +329,43 @@ class GatewayManager extends EventEmitter {
     return this.detectProxy();
   }
 
+  /**
+   * 计算 NO_PROXY 直连清单（2026-09-16）。
+   *
+   * 背景（实测事故）：日志里 170 条 `upstream X request error: fetch failed` 全是本机
+   * clash 代理节点抖动导致——同一个域名经代理 5s 内 ECONNRESET，而**直连 0.6–1.4s 可达**
+   * （实测 ps.air-outer.com / api.chiyi.cc）。网关此前是"全有或全无"：proxy.enabled 一开，
+   * 所有上游都走代理，代理一抖全家熔断。
+   *
+   * 现在允许**按供应商**绕过代理（Node ≥24 的 EnvHttpProxyAgent 尊重 NO_PROXY）：
+   *   · 供应商条目 `"proxy": false` 或 `"noProxy": true` → 该家直连；
+   *   · 全局 `proxy.noProxy: ["host", ...]`（也接受逗号分隔字符串）→ 显式列域名。
+   * 返回逗号分隔的主机名列表；没有则返回 ''（保持全部走代理）。
+   */
+  computeNoProxy() {
+    try {
+      const cfg = JSON.parse(this.configText() || '{}');
+      const hosts = new Set();
+      const add = (v) => {
+        const s = String(v || '').trim();
+        if (!s) return;
+        // 允许写成 URL（取 hostname）或裸主机名
+        let host = s;
+        if (/^https?:\/\//i.test(s)) { try { host = new URL(s).hostname; } catch (_) { /* 原样 */ } }
+        host = host.replace(/^\./, '').replace(/\/.*$/, '');
+        if (host) hosts.add(host);
+      };
+      const list = cfg.proxy && cfg.proxy.noProxy;
+      if (Array.isArray(list)) list.forEach(add);
+      else if (typeof list === 'string') list.split(',').forEach(add);
+      for (const p of Array.isArray(cfg.providers) ? cfg.providers : []) {
+        if (!p || p.enabled === false) continue;
+        if (p.proxy === false || p.noProxy === true) add(p.baseURL);
+      }
+      return [...hosts].join(',');
+    } catch (_) { return ''; }
+  }
+
   // 检测本机代理（clash/v2ray 等）：返回 "http://host:port" 或 null。
   // 优先级：显式环境变量 > 系统代理(ProxyEnable=1) > 常用 clash 端口（**TCP 探测通过才用**）。
   // R25（审计阻断修复）：旧版对 7890 无条件兜底——未装 clash 的机器上 NODE_USE_ENV_PROXY
@@ -398,6 +477,19 @@ async waitPortFree(port, timeoutMs) {
       gwEnv.NODE_USE_ENV_PROXY = '1';
       gwEnv.HTTPS_PROXY = proxy;
       gwEnv.HTTP_PROXY = proxy;
+      // 2026-09-16 抗抖动：部分上游（air-outer/chiyi-ds/sensenova/amd…）国内直连更稳，
+      // 而 clash 代理节点抖动时经代理访问这些域名会 ECONNRESET（实测 5s 内失败，直连正常）。
+      // 用 NO_PROXY 让它们绕过代理直连（Node ≥24 的 EnvHttpProxyAgent 会尊重 NO_PROXY）：
+      //  · 供应商条目写 "proxy: false"（或 "noProxy: true"）→ 该家直连；
+      //  · 全局 proxy.noProxy: ["host1", ...] 显式列域名；
+      // 实测 NO_PROXY 按主机名生效（ps.air-outer.com / api.chiyi.cc 直连 0.6–1.4s 可达，
+      // 而经代理在故障窗口内 5s 重置）。
+      const noProxy = this.computeNoProxy();
+      if (noProxy) {
+        gwEnv.NO_PROXY = noProxy;
+        gwEnv.no_proxy = noProxy;
+        this.log('模型网关：NO_PROXY 直连 ' + noProxy);
+      }
       this.log('模型网关：网关进程走代理 ' + proxy);
     }
     this.proc = spawn(this.nodePath, [
