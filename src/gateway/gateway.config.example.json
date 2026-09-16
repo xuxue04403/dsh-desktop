@@ -1,4 +1,19 @@
 {
+  "_说明": [
+    "选路顺序 = providers 数组顺序（2026-09-16 起）；priority 为保留字段，不再参与排序——配置页 ▲▼ 只调顺序。",
+    "models 每项：字符串 = 上游 ID 与逻辑名相同；对象 = { id: 上游真实 ID, as: 逻辑名, vision?: true }。",
+    "vision: true 表示支持图片输入：会写进 dsh 配置的 input: [text, image]（否则 dsh 拦下图片），",
+    "并且带图片的请求只发给声明了 vision 的家。",
+    "代理：proxy.enabled / proxy.url 控制是否走代理；proxy.noProxy: [\"域名\"] 或供应商条目 \"proxy\": false",
+    "可让指定供应商绕过代理直连。",
+    "【上游线协议】protocol: \"openai-chat\" —— 该上游只会 OpenAI chat/completions；Anthropic 客户端",
+    "  （dsh 的 claude 仿真）的请求由网关翻译成 OpenAI 转发，再把响应/SSE 翻回 Anthropic。",
+    "【兼容开关】quirks: force-stream（上游只收流式）/ stringify-tool-choice（tool_choice 只能是字符串）/",
+    "  prepend-system（首条必须是 system）；headers 可加任意静态请求头（含伪装 UA）。",
+    "【账户池】accounts: [{ id, authFile | apiKey }] —— 多账户轮询；额度耗尽/会话失效/限流自动切下一个账户，",
+    "  全部不可用才交给下一家供应商。auth: \"workbuddy\" 时 authFile 指向 WorkBuddy 桌面 App 的登录凭据，",
+    "  网关自动解析 + 到期前刷新（只读该文件，刷新结果写在网关自己的目录）。"
+  ],
   "port": 3091,
   "apiKey": "dsh-gateway-change-me",
   "providers": [
@@ -6,7 +21,10 @@
       "id": "provider-a",
       "baseURL": "https://api.example.com/v1",
       "apiKey": "sk-xxxxxxxx",
-      "models": ["glm-5.2"],
+      "models": [
+        "glm-5.2",
+        { "id": "glm-5.3", "vision": true }
+      ],
       "priority": 1,
       "enabled": true
     },
@@ -16,11 +34,24 @@
       "apiKey": "sk-yyyyyyyy",
       "models": [
         "glm-5.2",
-        { "id": "deepseek-ai/deepseek-v4-flash", "as": "deepseek-v4-flash" },
+        { "id": "deepseek-ai/deepseek-v4-flash", "as": "deepseek-v4-flash", "vision": true },
         { "id": "deepseek-v4-flash0731", "as": "deepseek-v4-flash" }
       ],
       "priority": 2,
       "enabled": true
+    },
+    {
+      "id": "workbuddy",
+      "baseURL": "https://copilot.tencent.com/v2",
+      "protocol": "openai-chat",
+      "auth": "workbuddy",
+      "quirks": ["force-stream", "stringify-tool-choice"],
+      "headers": { "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2", "X-Product": "SaaS" },
+      "accounts": [
+        { "id": "acct1" }
+      ],
+      "models": ["glm-5.3", "glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash", "kimi-k3"],
+      "enabled": false
     }
   ]
 }
