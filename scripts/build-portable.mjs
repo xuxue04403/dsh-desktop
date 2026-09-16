@@ -269,6 +269,21 @@ writeFileSync(path.join(appDir, '使用说明.txt'),
   + '换机后需在新机器的设置页重新填写邮箱桥接密码、模型网关统一 Key（插件本体随本目录\r\n'
   + '自动安装，无需手工处理）；各供应商 API Key 在 data\\gateway.config.json 里随目录走。\r\n'
   + '\r\n'
+  + '—— 接入 WorkBuddy 内置模型（可选）————————————————\r\n'
+  + '前提：本机已安装并登录 WorkBuddy 桌面 App（网关只读取它的登录凭据，不改写）。\r\n'
+  + '步骤：编辑 data\\gateway.config.json，把 id 为 workbuddy 的供应商 enabled 改成 true 即可。\r\n'
+  + '  · 凭据自动发现：Windows 会依次探测 %LOCALAPPDATA%\\ 与 %APPDATA%\\CodeBuddyExtension\\Data\\\r\n'
+  + '    Public\\auth\\ 下的 workbuddy-desktop.info（国内版）与 workbuddy-desktop-ai.info（国际版），\r\n'
+  + '    macOS / Linux 亦各有默认位置；非标准安装位置可用环境变量 WORKBUDDY_AUTH_FILE 指定。\r\n'
+  + '  · 多账号轮询：在 accounts 数组里再加一条 { "id": "acct2", "authFile": "另一个账号的凭据文件" }，\r\n'
+  + '    额度耗尽 / 登录失效 / 限流时自动切到下一个账户；账户状态见 http://127.0.0.1:3091/health\r\n'
+  + '    的 accounts 字段（含各自冷却剩余时间），日志里的 via=workbuddy#acct2 表示实际用的账户。\r\n'
+  + '  · 网关会自动刷新过期 token（结果写在 data\\gateway\\workbuddy-auth\\，不碰 App 自己的文件）。\r\n'
+  + '  · WorkBuddy 只提供 OpenAI 线协议，网关会自动把 dsh 的 Anthropic 请求翻译成 OpenAI、\r\n'
+  + '    再把流式响应翻回 Anthropic —— 无需改 dsh 侧任何配置。\r\n'
+  + '  · 该功能依赖 WorkBuddy 客户端接口（非官方开放 API），上游改动可能使其失效；\r\n'
+  + '    请遵守 WorkBuddy 服务条款，仅用于个人账号在本机的合理使用。\r\n'
+  + '\r\n'
   + '加载超时/插件故障时应用会自动进入安全模式（见应用内提示与日志）。\r\n',
   'utf8');
 
