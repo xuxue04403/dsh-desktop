@@ -268,6 +268,36 @@ t('gateway：writeDsh 不再用 spawnSync 阻塞主进程', () => {
   assert.ok(!/const r = spawnSync\(\s*this\.nodePath/.test(src), '不得再用 spawnSync 跑 write-dsh');
 });
 
+t('gateway：computeNoProxy 按供应商 proxy:false + 全局 proxy.noProxy 生成直连清单（2026-09-16 抗抖动）', () => {
+  const dir = fs.mkdtempSync(path.join(tmpRoot, 'nop-'));
+  const gm = new GatewayManager({
+    userDataDir: dir, nodePath: 'node', settings: { data: {} }, logger: noopLog,
+  });
+  gm.init();
+  const cfg = {
+    port: 3091, apiKey: 'k',
+    proxy: { enabled: true, url: 'http://127.0.0.1:7890', noProxy: ['api.tokenrouter.com', 'https://token.sensenova.cn'] },
+    providers: [
+      { id: 'air-outer', baseURL: 'https://ps.air-outer.com/', apiKey: 'sk-1', models: ['m'], priority: 1, enabled: true, proxy: false },
+      { id: 'chiyi-ds', baseURL: 'https://api.chiyi.cc', apiKey: 'sk-2', models: ['m'], priority: 2, enabled: true, noProxy: true },
+      { id: 'x666', baseURL: 'https://x666.me', apiKey: 'sk-3', models: ['m'], priority: 3, enabled: true },  // 未设 → 走代理
+      { id: 'off', baseURL: 'https://off.example.org', apiKey: 'sk-4', models: ['m'], priority: 4, enabled: false, proxy: false },  // disabled → 忽略
+    ],
+  };
+  fs.writeFileSync(path.join(dir, 'gateway.config.json'), JSON.stringify(cfg), 'utf8');
+  const out = gm.computeNoProxy();
+  assert.ok(out.includes('ps.air-outer.com'), 'provider.proxy:false 应加入直连清单：' + out);
+  assert.ok(out.includes('api.chiyi.cc'), 'provider.noProxy:true 应加入直连清单：' + out);
+  assert.ok(out.includes('api.tokenrouter.com'), '全局 proxy.noProxy 数组项应加入：' + out);
+  assert.ok(out.includes('token.sensenova.cn'), '全局 proxy.noProxy 里的 URL 应取 hostname：' + out);
+  assert.ok(!out.includes('x666.me'), '未设 proxy:false 的家不得直连（保持走代理）：' + out);
+  assert.ok(!out.includes('off.example.org'), 'disabled 供应商不得加入：' + out);
+  // 清空 proxy 块时 computeNoProxy 应为空
+  const cfg2 = { port: 3091, apiKey: 'k', providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk-1', models: ['m'], priority: 1, enabled: true }] };
+  fs.writeFileSync(path.join(dir, 'gateway.config.json'), JSON.stringify(cfg2), 'utf8');
+  assert.strictEqual(gm.computeNoProxy(), '', '无 proxy 配置时不得输出 NO_PROXY');
+});
+
 // ================= 5. 主进程接线与 IPC 来源守卫 =================
 
 t('main.js：所有壳级 IPC 都经来源守卫注册（无逃逸的 ipcMain.handle）', () => {
@@ -633,6 +663,51 @@ t('网关：配置校验接受映射条目、拒绝非法条目', () => {
   assert.strictEqual(ok('x'), false, 'models 非数组非法');
 });
 
+t('网关：配置校验覆盖 WorkBuddy 新字段（protocol/quirks/headers/accounts/auth）', () => {
+  const { validateConfigText } = require(path.join(SRC, 'gateway-manager.js'));
+  const check = (extra) => validateConfigText(JSON.stringify({
+    port: 3091, apiKey: 'k',
+    providers: [Object.assign({ id: 'p', baseURL: 'https://copilot.tencent.com/v2', apiKey: 'sk-x', models: ['m'] }, extra)],
+  }));
+  // 合法：完整的 WorkBuddy 形态
+  assert.strictEqual(check({
+    protocol: 'openai-chat', auth: 'workbuddy', quirks: ['force-stream', 'stringify-tool-choice'],
+    headers: { 'X-Product': 'SaaS' }, accounts: [{ id: 'a1', authFile: 'C:/x.info' }, { id: 'a2', apiKey: 'sk-y' }],
+  }).ok, true, '完整 WorkBuddy 配置应合法');
+  // 非法：拼错的字段名/取值必须在保存前拦下（否则网关静默忽略 → 上游 404，极难排查）
+  assert.strictEqual(check({ protocol: 'openai_chat' }).ok, false, 'protocol 拼错应被拒（下划线）');
+  assert.strictEqual(check({ protocol: 'anthropic-messages' }).ok, true, 'anthropic-messages 合法');
+  assert.strictEqual(check({ quirks: ['force_strem'] }).ok, false, '未知 quirk 应被拒');
+  assert.strictEqual(check({ quirks: 'force-stream,prepend-system' }).ok, true, '逗号分隔字符串形式合法');
+  assert.strictEqual(check({ headers: ['a'] }).ok, false, 'headers 非对象应被拒');
+  assert.strictEqual(check({ accounts: { id: 'a1' } }).ok, false, 'accounts 非数组应被拒');
+  assert.strictEqual(check({ accounts: [{ id: 'a1' }] }).ok, false, '非 workbuddy 供应商的 accounts 条目缺 authFile/apiKey 应被拒');
+  // 免路径（2026-09-16 实测踩到的坑）：auth=workbuddy 时 accounts 只写 { id } 在**运行期是合法的**
+  //（凭据按平台默认位置自动发现），校验器必须一致，否则设置页保存会误拒合法配置。
+  assert.strictEqual(check({ auth: 'workbuddy', accounts: [{ id: 'a1' }] }).ok, true,
+    'auth=workbuddy 时 accounts 只写 { id } 应合法（凭据自动发现）');
+  assert.strictEqual(check({ auth: 'workbuddy', accounts: [{ id: 'a1' }, { id: 'a2', authFile: 'C:/x.info' }] }).ok, true,
+    '免路径与显式路径可混用');
+  assert.strictEqual(check({ auth: 'whatever' }).ok, false, '未知 auth 应被拒');
+});
+
+t('renderer：供应商编辑不丢高级字段（protocol/auth/accounts），并在界面显示摘要', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
+  // ① 就地修改已有对象 —— 否则保存后 protocol/auth/accounts/quirks/headers 会被静默抹掉
+  assert.ok(/const p = gwCfg\.providers\[gwSel\] \|\| \(gwCfg\.providers\[gwSel\] = \{\}\)/.test(html),
+    'gwApplyEditor 必须就地修改已有供应商对象（不能整体替换，否则丢高级字段）');
+  const applySeg = html.slice(html.indexOf('function gwApplyEditor()'), html.indexOf('function gwApplyEditor()') + 900);
+  assert.ok(!/delete p\./.test(applySeg), 'gwApplyEditor 不得删除供应商的其它字段：\n' + applySeg);
+  // ② 高级能力摘要必须在编辑器里可见（否则用户困惑"为什么不走我的 Key / 为什么有账户池"）
+  assert.ok(/id="gwAdv"/.test(html), '编辑器应有 #gwAdv 高级摘要容器');
+  for (const kw of ['协议=', '凭据=', '账户池 ', 'quirks=', '自定义头 ']) {
+    assert.ok(html.includes(kw), '高级摘要应包含 ' + kw);
+  }
+  // ③ 无高级字段的普通供应商不应显示该行（避免噪声）
+  assert.ok(/\$\('gwAdv'\)\.style\.display = adv\.length \? '' : 'none'/.test(html),
+    '无高级字段时应隐藏摘要行');
+});
+
 t('renderer：配置页的模型映射表读写与网关语义一致（真跑页面函数）', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
   // 结构：旧的一行式 models 输入已替换为映射表
@@ -673,6 +748,19 @@ t('renderer：配置页的模型映射表读写与网关语义一致（真跑页
   // 往返：读入 → 写出 保持原形态
   assert.strictEqual(J(ctx.__s(ctx.__n(['x', { id: 'a/b', as: 'c' }]))), J(['x', { id: 'a/b', as: 'c' }]),
     '往返幂等');
+  // 2026-09-16 实测踩到：旧版写出只保留 vision，配置页保存一次就把 contextWindow/maxTokens 抹掉
+  //（dsh 于是退回 1M 默认上下文 → 长对话在上游超限）
+  assert.strictEqual(J(ctx.__s([{ up: 'hy3', as: 'hy3', vision: true, contextWindow: 192000, maxTokens: 64000 }])),
+    J([{ id: 'hy3', as: 'hy3', vision: true, contextWindow: 192000, maxTokens: 64000 }]),
+    '上限字段必须随行写出');
+  assert.strictEqual(J(ctx.__s([{ up: 'm', as: 'm', contextWindow: 512000 }])),
+    J([{ id: 'm', as: 'm', contextWindow: 512000 }]), '仅上限（无 vision）也写对象形态');
+  assert.strictEqual(J(ctx.__n([{ id: 'hy3', vision: true, contextWindow: 192000, maxTokens: 64000 }])),
+    J([{ up: 'hy3', as: 'hy3', vision: true, contextWindow: 192000, maxTokens: 64000 }]), '读入带回上限字段');
+  assert.strictEqual(J(ctx.__s(ctx.__n([{ id: 'hy3', vision: true, contextWindow: 192000, maxTokens: 64000 }]))),
+    J([{ id: 'hy3', as: 'hy3', vision: true, contextWindow: 192000, maxTokens: 64000 }]), '读入→写出 往返保持上限');
+  assert.strictEqual(J(ctx.__n([{ id: 'x', maxOutputTokens: 32000 }])), J([{ up: 'x', as: 'x', maxTokens: 32000 }]),
+    'maxOutputTokens 同义键（与网关 modelEntries 一致）');
   // 批量解析：支持 => / -> / =，跳过空行与注释
   assert.strictEqual(J(ctx.__p('a=>b\nc -> d\n# 注释\n\ne=f\ng')),
     J([{ up: 'a', as: 'b' }, { up: 'c', as: 'd' }, { up: 'e', as: 'f' }, { up: 'g', as: '' }]),
@@ -1193,29 +1281,45 @@ t('main.js：收到 patch-unsupported 时自动退出安全模式（死锁逃生
 
 // ================= 13. 2026-09-15：配置页布局与供应商重排 =================
 
-t('renderer：供应商列表支持 ▲▼ 重排（顺序即优先级），两栏比例与映射表列宽已调整', () => {
+t('renderer：供应商 ▲▼ 只改先后顺序、不改优先级字段（2026-09-16 用户要求）；映射表含图片列', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
   // ① 重排按钮 + 逻辑
   assert.ok(/id="btnGwUp"/.test(html) && /id="btnGwDown"/.test(html), '应有 ▲上移 / ▼下移 按钮');
   assert.ok(/gw-tools/.test(html), '应有列表工具条容器');
   assert.ok(/function gwMoveSel\(delta\)/.test(html), '应有 gwMoveSel 重排函数');
   assert.ok(/function gwSyncMoveButtons\(\)/.test(html), '应有按钮可用状态同步（首/尾禁用）');
-  // 交换后必须把 priority 重编号为 1…N——否则列表顺序与实际路由顺序不一致（用户困惑的来源）
-  assert.ok(/arr\.forEach\(\(p, n\) => \{ p\.priority = n \+ 1; \}\)/.test(html),
-    '重排后必须按列表顺序重编号 priority');
+  // ② 2026-09-16 用户要求：移动**不得**改写 priority（旧实现重编号 1…N，静默覆盖用户配置）
+  assert.ok(!/arr\.forEach\(\(p, n\) => \{ p\.priority = n \+ 1; \}\)/.test(html),
+    '重排不得再重编号 priority（移动只改先后顺序）');
+  // 列表顺序 = 网关取候选的顺序，行内序号按列表位置显示（不再显示 P<priority>）
+  assert.ok(/选路顺序 #' \+ \(i \+ 1\)/.test(html) && /\+ \(i \+ 1\) \+ '<\/span>'/.test(html),
+    '行内应显示列表序号（选路顺序）');
+  assert.ok(!/'<span class="cnt">P' \+ esc\(String\(p\.priority/.test(html), '不应再显示 P<priority> 徽标');
   assert.ok(/gwMoveSel\(-1\)/.test(html) && /gwMoveSel\(1\)/.test(html), '按钮应绑定 ±1 位移');
-  // ② 两栏比例：左 44% / 右 56%（旧版 1.15:1，右侧被挤窄）
+  // ③ 两栏比例：左 44% / 右 56%（旧版 1.15:1，右侧被挤窄）
   assert.ok(/\.gw-left \{ flex: 1 1 44%/.test(html) && /\.gw-right \{ flex: 1 1 56%/.test(html),
     '两栏应改为 44% : 56%（左侧收窄、右侧加宽）');
-  // ③ 模型映射表：3 列（上游 ID 1.3fr / 映射为 1fr / 操作 64px），表头同为 3 格
-  assert.ok(/\.gw-map \.map-hd,[\s\S]{0,120}grid-template-columns: minmax\(0, 1\.3fr\) minmax\(0, 1fr\) 64px;/.test(html),
-    '映射表应为 1.3fr / 1fr / 64px 三列');
+  // ④ 模型映射表：4 列（上游 ID 1.3fr / 映射为 1fr / 图片 52px / 操作 64px），表头同为 4 格
+  assert.ok(/\.gw-map \.map-hd,[\s\S]{0,120}grid-template-columns: minmax\(0, 1\.3fr\) minmax\(0, 1fr\) 52px 64px;/.test(html),
+    '映射表应为 1.3fr / 1fr / 52px / 64px 四列（图片能力列）');
   const hd = /<div class="map-hd">([\s\S]*?)<\/div>/.exec(html);
   assert.ok(hd, '应能定位映射表表头');
-  assert.strictEqual((hd[1].match(/<span>/g) || []).length, 3,
-    '表头必须与内容同为 3 列（旧版多一个空 span → "操作"错位、删除按钮被拉满）');
+  assert.strictEqual((hd[1].match(/<span/g) || []).length, 4,
+    '表头必须与内容同为 4 列');
   assert.ok(!/wrap\.appendChild\(tail\)/.test(html), '映射行不应再挂多余的空 span');
-  // ④ 说明折叠、标签加宽（长标签不再折行）
+  // ⑤ 图片能力：编辑行有复选框、读表回填、序列化保留 vision（否则勾选后保存丢失）
+  assert.ok(/iVis\.type = 'checkbox'/.test(html) && /className = 'm-vision'/.test(html), '映射行应有图片复选框');
+  assert.ok(/vision: !!\(vis && vis\.checked\)/.test(html), '读表应带上 vision');
+  assert.ok(/if \(vision \|\| hasCtx \|\| hasMax\)/.test(html) && /if \(vision\) entry\.vision = true/.test(html),
+    'vision/上限存在时必须写对象形态（字符串表达不了）');
+  assert.ok(/const vision = m\.vision === true/.test(html), 'normalize 应识别 vision');
+  // 上限字段：读入带回、行内 dataset 携带、写出保留（2026-09-16 数据丢失回归）
+  assert.ok(/row\.contextWindow = ctxWin/.test(html) && /row\.maxTokens = maxTok/.test(html), 'normalize 应带回上限字段');
+  assert.ok(/wrap\.dataset\.ctx/.test(html) && /wrap\.dataset\.max/.test(html), '行内应以 dataset 携带上限字段');
+  assert.ok(/out\.contextWindow = Number\(row\.dataset\.ctx\)/.test(html), '读表应取回上限字段');
+  assert.ok(/if \(hasCtx\) entry\.contextWindow = ctxWin/.test(html) && /if \(hasMax\) entry\.maxTokens = maxTok/.test(html),
+    '写出必须保留上限字段（否则配置页保存一次即静默丢失）');
+  // ⑥ 说明折叠、标签加宽（长标签不再折行）
   assert.ok(/class="gw-hint-more"/.test(html) && /<summary>说明：/.test(html), '长说明应折叠为可展开块');
   assert.ok(/\.row label \{ width: 165px;/.test(html), '行标签宽度应加到 165px（130px 时"启动应用时自动启动服务"折行）');
 });
