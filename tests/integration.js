@@ -173,7 +173,8 @@ t('网关：forward 对 Anthropic 路径跳过 OpenAI 专用翻译（R14）', ()
   assert.ok(mjs.includes("const isAnthropicPath = upstreamPath === '/messages';"),
     'forward 应按路径识别 Anthropic 协议');
   // 协议分支（2026-09-11 起含 Responses 与 raw 资源子路由）：Anthropic 必须原样透传
-  const m = /const outBody = ([\s\S]*?);\s*\/\/ R5/.exec(mjs);
+  // 注：2026-09-16 起为 let（直通路径还要按 quirks 改写 body），语义不变
+  const m = /le?t outBody = ([\s\S]*?);\s*\/\/ R5/.exec(mjs);
   assert.ok(m, '应能定位 forward 里的 outBody 协议分支');
   const expr = m[1];
   assert.ok(/isAnthropicPath[\s\S]*?\?\s*body/.test(expr), 'Anthropic 路径应原样透传（不 translateBody）');
