@@ -4,8 +4,9 @@
  * OpenAI-compatible unified model proxy with multi-provider routing.
  *
  * Features:
- *  - GET  /v1/models            merged, de-duplicated model list from all providers
- *  - POST /v1/chat/completions  route by model availability -> priority -> failover
+ *  - GET  /v1/models            merged, de-duplicated model list from all providers (sorted by name)
+ *  - POST /v1/chat/completions  route by model availability -> provider list order -> failover
+ *  - POST /v1/messages          Anthropic protocol (same routing)
  *  - POST /v1/responses         passthrough (same routing)
  *  - GET  /health               liveness probe for the desktop assistant
  *  - unified Bearer auth (config.apiKey) on all /v1 routes
@@ -23,13 +24,15 @@
  *         "id": "provider-a",
  *         "baseURL": "https://example.com/v1",
  *         "apiKey": "sk-...",
- *         "models": ["deepseek-v4-flash", "glm-5.2"],
- *         "priority": 1,          // lower number = tried first
+ *         // 字符串 = 上游 ID 与逻辑名相同；对象 = 映射（as 为逻辑名）+ 可选 vision（图片输入）
+ *         "models": ["deepseek-v4-flash", { "id": "v/vision-up", "as": "deepseek-v4-flash", "vision": true }],
+ *         "priority": 1,          // 保留字段：**不再参与排序**（选路顺序 = 本数组顺序）
  *         "enabled": true
  *       }
  *     ]
  *   }
  *
+ * 选路顺序（2026-09-16 起）：**providers 数组顺序** = 候选尝试顺序；配置页 ▲▼ 只改顺序、不改 priority。
  * Config path: %APPDATA%\DSHDesktop\gateway.config.json (or DSH_GATEWAY_CONFIG).
  * A template is created on first run if the file is missing.
  */
@@ -42,7 +45,65 @@ import crypto from 'node:crypto';
 const APP_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), '.dsh'), 'DSHDesktop');
 let CONFIG_PATH = process.env.DSH_GATEWAY_CONFIG || path.join(APP_DIR, 'gateway.config.json');
 const MODEL_CACHE_TTL_MS = 60_000;
-const UPSTREAM_TIMEOUT_MS = 60_000;
+// 上游请求超时（time-to-headers）。可用 DSH_GATEWAY_UPSTREAM_TIMEOUT_MS 覆盖，
+// 或按供应商用配置项 timeoutMs 单独放宽（如 x666/amd 这类慢速中转）。
+const UPSTREAM_TIMEOUT_MS = (() => {
+  const n = Number(process.env.DSH_GATEWAY_UPSTREAM_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 60_000;
+})();
+/** 供应商级超时：provider.timeoutMs > 全局默认。 */
+function providerTimeoutMs(provider) {
+  const n = Number(provider && provider.timeoutMs);
+  return Number.isFinite(n) && n > 0 ? n : UPSTREAM_TIMEOUT_MS;
+}
+// 瞬时网络错重试（2026-09-16）：仅当失败**够快**时才重试——慢失败（如 60s 超时）重试只会翻倍等待
+const NET_RETRY_MAX_ELAPSED_MS = (() => {
+  const n = Number(process.env.DSH_GATEWAY_NET_RETRY_MAX_MS);
+  return Number.isFinite(n) && n > 0 ? n : 30_000;
+})();
+const TRANSIENT_NET_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ECONNABORTED', 'EPIPE', 'ETIMEDOUT',
+  'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH',
+  'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT',
+]);
+
+/**
+ * 把 fetch 的异常链压成一行可读文本（undici 的网络错误 message 恒为 "fetch failed"，
+ * 真正原因在 cause 链里：ECONNRESET / ENOTFOUND / UND_ERR_SOCKET / 代理连接失败…）。
+ */
+function describeFetchError(e) {
+  if (!e) return '';
+  const parts = [];
+  let cur = e.cause;
+  let depth = 0;
+  while (cur && depth < 3) {
+    const t = cur.code || cur.errno || cur.message || String(cur);
+    if (t) parts.push(String(t));
+    cur = cur.cause;
+    depth++;
+  }
+  return [...new Set(parts)].join(' < ');
+}
+
+/**
+ * 是否"瞬时网络层错误"（值得原地重试一次）。
+ * 排除我们自己的超时中止（AbortError）：那类失败重试只会把等待翻倍。
+ */
+function isTransientNetError(e) {
+  if (!e) return false;
+  const msg = String(e.message || '');
+  if (e.name === 'AbortError' || /aborted/i.test(msg)) return false;
+  if (/fetch failed|socket|network|ECONN|EPIPE|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|UND_ERR/i.test(msg)) return true;
+  let cur = e.cause;
+  let depth = 0;
+  while (cur && depth < 4) {
+    const code = String(cur.code || cur.errno || '');
+    if (TRANSIENT_NET_CODES.has(code)) return true;
+    cur = cur.cause;
+    depth++;
+  }
+  return false;
+}
 // R2 防封：catalog 探测失败后的冷却期（30s 内不重试探测，防请求风暴触发风控）
 const CATALOG_FAIL_COOLDOWN_MS = 30_000;
 let LOG_PATH = process.env.DSH_GATEWAY_LOG || path.join(APP_DIR, 'logs', 'gateway.log');
@@ -345,6 +406,23 @@ async function doFetchCatalog(provider, clientUA, clientProfile) {
     if (ids.size === 0) throw new Error('empty catalog');
     catalogCache.set(provider.id, { models: ids, ts: Date.now(), failed: false });
     log(`catalog ${provider.id}: ${ids.size} models`);
+    // 目录 × 配置声明 一致性提示（2026-09-15 实测事故：chiyi-ds 目录里只有 Claude 模型，
+    // 却声明了 deepseek-v4.1-flash → 每次请求都被上游拒（503/400），而配置页看不出问题）。
+    // 只记日志、不作拦截依据（上游目录常滞后/不完整，声明仍以配置为准）。
+    try {
+      const entries = modelEntries(provider);
+      const declared = logicalModelNames(provider);
+      if (entries.length && declared.length) {
+        const missing = declared.filter((as) => {
+          const ups = entries.filter((e) => e.as === as).map((e) => e.up);
+          return !ids.has(as) && !ups.some((u) => ids.has(u));   // 逻辑名或其上游 ID 都不在目录里
+        });
+        if (missing.length) {
+          log(`[提示] ${provider.id} 的上游目录里没有这些已声明模型：${missing.join(', ')}`
+            + '（目录可能滞后；若请求持续被上游拒绝，请核对该模型 ID 是否为其真实 ID）');
+        }
+      }
+    } catch { /* 提示失败不影响探测 */ }
     return ids;
   } catch (e) {
     // 失败冷却（R2 防封加固）：不立即删除缓存，而是缓存 30 秒的"失败态"，
@@ -448,10 +526,16 @@ function replyBodyError(res, req, e, anthropic) {
     : { error: { message: `invalid JSON body: ${e && e.message}` } });
 }
 
-function providersForModel(cfg, model) {
-  return cfg.providers
-    .filter((p) => p.enabled !== false)
-    .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
+/**
+ * 候选顺序 = **配置里 providers 数组的顺序**（2026-09-16 用户要求）。
+ *
+ * 旧实现按 `priority` 排序；配置页的 ▲▼ 为了"界面顺序 = 实际选路"而把 priority 重编号为 1…N，
+ * 于是用户手写的 priority 被静默改写（用户明确要求：移动只改先后顺序，不要动优先级配置）。
+ * 现在：**列表顺序就是选路顺序**，priority 保留为配置字段但不再参与排序（向后兼容旧配置，
+ * 只是不生效；界面按列表位置显示序号）。
+ */
+function providersForModel(cfg) {
+  return cfg.providers.filter((p) => p.enabled !== false);
 }
 
 /* ---------------- 模型映射（上游真实 ID ↔ 逻辑模型名） ----------------
@@ -481,7 +565,21 @@ function modelEntries(provider) {
       const up = String(m.id ?? m.up ?? m.upstream ?? m.model ?? '').trim();
       if (!up) continue;
       const as = String(m.as ?? m.alias ?? m.model ?? m.name ?? up).trim();
-      out.push({ up, as: as || up });
+      // 多模态声明（2026-09-16）：vision: true 或 input: ['text','image'] 都表示该条支持图片输入。
+      // 只会影响两件事：① 写进 dsh settings.yaml 的 input 字段（否则 harness 直接拦下图片：
+      // "当前模型不支持图片"）；② 带图片的请求只发给声明了图片的家。
+      // 只在为真时附带该字段——保持条目 JSON 形状稳定（既有调用方/测试按 {up, as} 比对）。
+      const vision = m.vision === true
+        || (Array.isArray(m.input) && m.input.map((x) => String(x).toLowerCase()).includes('image'));
+      const entry = { up, as: as || up };
+      if (vision) entry.vision = true;
+      // 上下文/输出上限（可选）：write-dsh 用它给 dsh 写准确的 contextWindow/maxTokens，
+      // 避免"全部按 1M 虚报"导致长对话在上游上下文超限。
+      const ctxWin = Number(m.contextWindow ?? m.context ?? m.ctx);
+      const maxTok = Number(m.maxTokens ?? m.maxOutputTokens ?? m.max_output_tokens);
+      if (Number.isFinite(ctxWin) && ctxWin > 0) entry.contextWindow = ctxWin;
+      if (Number.isFinite(maxTok) && maxTok > 0) entry.maxTokens = maxTok;
+      out.push(entry);
     }
   }
   return out;
@@ -560,6 +658,737 @@ function selectCandidates(candidates, catalogResults, model) {
 /** 该 provider 是否需要查上游目录才能判定候选（= 它一个模型都没配） */
 function needsCatalog(provider) {
   return modelEntries(provider).length === 0;
+}
+
+/* ---------------- 多模态（图片输入）支持判定 ----------------
+ * 背景（2026-09-16 用户反馈）：第三方 deepseek-v4.1-flash 本身支持图片，但 harness 仍拦下并提示
+ * "当前模型不支持图片"——因为写进 settings.yaml 的模型条目没有声明 input 能力，harness 按纯文本
+ * 处理（dsh-llm-pi-ai: `input: declaredInput(entry.input) ?? base?.input ?? defaultInput`，
+ * 遇到图片时 `!model.input.includes("image")` 直接抛 UNSUPPORTED_CONTENT）。
+ * 现在：provider.models 条目可写 `vision: true`（或 `input: ['text','image']`）显式声明；
+ * ① writeDshConfig 据此写 input；② 带图片的请求只发给声明了图片能力的家（避免路由到纯文本家后上游报错）。
+ */
+
+/** 该 provider 对该逻辑模型是否声明了图片能力 */
+function providerSupportsVision(provider, logical) {
+  return modelEntries(provider).some((e) => e.as === logical && e.vision === true);
+}
+
+/** 请求体里是否含图片块（兼容 Anthropic / OpenAI chat / Responses 三种形状） */
+function bodyHasImage(body) {
+  if (!body || typeof body !== 'object') return false;
+  const hasImg = (content) => Array.isArray(content) && content.some((b) => b && (
+    b.type === 'image' || b.type === 'image_url' || b.type === 'input_image' || b.image_url != null
+  ));
+  if (Array.isArray(body.messages) && body.messages.some((m) => m && hasImg(m.content))) return true;
+  if (Array.isArray(body.input) && body.input.some((m) => m && hasImg(m.content))) return true;   // Responses API
+  return false;
+}
+
+/**
+ * 带图片的请求：只保留声明了图片能力的候选。
+ * 若**没有任何候选声明图片能力**，则保持原候选（宁可原样转给上游拿明确报错，也不要凭空 404）。
+ */
+function filterVisionCandidates(eligible, reasons, model) {
+  const visionOk = eligible.filter((p) => providerSupportsVision(p, model));
+  if (visionOk.length === 0) return { eligible, reasons, dropped: 0 };
+  const dropped = eligible.length - visionOk.length;
+  const keptReasons = reasons.filter((r) => visionOk.some((p) => p.id === r.id));
+  return { eligible: visionOk, reasons: keptReasons, dropped };
+}
+
+/** 该逻辑模型是否**任一**启用的家声明了图片能力（writeDshConfig 写 input 用） */
+function logicalModelSupportsVision(cfg, logical) {
+  return (cfg.providers || []).some((p) => p && p.enabled !== false && providerSupportsVision(p, logical));
+}
+
+/* ================= 供应商能力 / 账户池 / WorkBuddy 凭据（2026-09-16） =================
+ * 背景：WorkBuddy（腾讯 CodeBuddy）桌面 App 的内置模型只有**客户端私有接口**可用：
+ *   POST {base}/v2/chat/completions            —— OpenAI chat 线格式，但强制 stream:true
+ *   POST {base}/v2/plugin/auth/token/refresh   —— 刷新 OAuth access token
+ *   GET  {base}/console/enterprises/personal/models
+ * 鉴权是**桌面 App 的 OAuth access token**（会过期）+ 一组身份头（X-User-Id / X-Enterprise-Id /
+ * X-Domain / X-Product: SaaS）。用户可能登录多个账号（多份凭据文件）→ 需要账户池：
+ * 轮询分配 + 额度耗尽/会话失效时切下一个账户。
+ *
+ * 全部以**可选配置项**提供，未配置的供应商行为完全不变：
+ *   "protocol": "openai-chat"        上游线协议（缺省 = 跟随客户端请求路径，现有行为）
+ *   "auth":     "workbuddy"          启用 WorkBuddy 凭据适配（解析 / 刷新 / 身份头）
+ *   "accounts": [{ "id": "a1", "authFile": "…workbuddy-desktop.info" }, { "id": "a2", "apiKey": "…" }]
+ *   "headers":  { "X-Product": "SaaS" }   附加静态头
+ *   "quirks":   ["force-stream", "stringify-tool-choice", "prepend-system"]
+ */
+
+/** 上游线协议：'openai-chat' | 'anthropic-messages' | null（null = 跟随客户端请求路径） */
+function providerProtocol(provider) {
+  const v = String((provider && provider.protocol) || '').trim().toLowerCase();
+  if (v === 'openai-chat' || v === 'openai-completions' || v === 'openai') return 'openai-chat';
+  if (v === 'anthropic' || v === 'anthropic-messages') return 'anthropic-messages';
+  return null;
+}
+
+/** 兼容性开关（quirk）集合 */
+function providerQuirks(provider) {
+  const raw = provider && provider.quirks;
+  const list = Array.isArray(raw) ? raw : (typeof raw === 'string' ? raw.split(',') : []);
+  return new Set(list.map((x) => String(x).trim().toLowerCase()).filter(Boolean));
+}
+
+/** 附加静态头（值必须是字符串/数字；其它类型忽略） */
+function providerExtraHeaders(provider) {
+  const raw = provider && provider.headers;
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [k, v] of Object.entries(raw)) {
+    if (v === null || v === undefined) continue;
+    if (typeof v !== 'string' && typeof v !== 'number' && typeof v !== 'boolean') continue;
+    out[String(k)] = String(v);
+  }
+  return out;
+}
+
+/** 账户池条目（id + authFile 或 apiKey）；无 accounts 时返回空数组（沿用顶层 apiKey） */
+function providerAccounts(provider) {
+  const raw = provider && provider.accounts;
+  const isWorkBuddy = String((provider && provider.auth) || '').toLowerCase() === 'workbuddy';
+  if (!Array.isArray(raw)) {
+    // auth=workbuddy 但没写 accounts → 视为"自动发现本机凭据"的单个账户（开箱即用）
+    return isWorkBuddy ? [{ id: 'auto', authFile: '', apiKey: '' }] : [];
+  }
+  const out = [];
+  raw.forEach((a, i) => {
+    if (!a || typeof a !== 'object') return;
+    const id = String(a.id || a.name || ('acct' + (i + 1))).trim();
+    const authFile = String(a.authFile || a.file || '').trim();
+    const apiKey = String(a.apiKey || '').trim();
+    // auth=workbuddy 时允许只写 { id }：authFile 留空 → 运行时按平台默认路径自动发现
+    if (!authFile && !apiKey && !isWorkBuddy) return;
+    out.push({ id, authFile, apiKey });
+  });
+  return out;
+}
+
+/**
+ * WorkBuddy 桌面 App 凭据文件的平台默认位置（按优先级）。
+ * 与插件实现一致：Windows 依次探测 Local/Roaming 两处 AppData；国内版与国际版文件名不同；
+ * macOS / Linux 各有一条兜底。这样配置里**不必写死用户名路径**，换机也不用改。
+ */
+function workbuddyDefaultAuthFiles() {
+  const home = os.homedir();
+  const rel = ['CodeBuddyExtension', 'Data', 'Public', 'auth'];
+  const local = process.env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+  const roaming = process.env.APPDATA || path.join(home, 'AppData', 'Roaming');
+  const names = ['workbuddy-desktop.info', 'workbuddy-desktop-ai.info'];   // 国内版 / 国际版
+  const out = [];
+  for (const root of [local, roaming]) for (const n of names) out.push(path.join(root, ...rel, n));
+  for (const n of names) out.push(path.join(home, 'Library', 'Application Support', ...rel, n));   // macOS
+  for (const n of names) out.push(path.join(home, '.config', ...rel, n));                          // Linux
+  return out;
+}
+
+/** 自动发现第一个存在的 WorkBuddy 凭据文件（找不到返回 null） */
+function findWorkbuddyAuthFile() {
+  // 1) 环境变量显式指定（与 dsh-workbuddy-connect 插件一致，便于非标准安装位置）
+  for (const name of ['WORKBUDDY_AUTH_FILE', 'WORKBUDDY_AI_AUTH_FILE']) {
+    const v = String(process.env[name] || '').trim();
+    if (!v) continue;
+    try { if (fs.statSync(v).isFile()) return v; } catch { /* 指了但不存在 → 继续探测 */ }
+  }
+  // 2) 平台默认位置
+  for (const p of workbuddyDefaultAuthFiles()) {
+    try { if (fs.statSync(p).isFile()) return p; } catch { /* 不存在 → 下一个 */ }
+  }
+  return null;
+}
+
+/* ---------------- 账户池状态（轮询 + 冷却） ---------------- */
+const accountPool = new Map();     // `${providerId}#${acctId}` → { state, until, reason, fails }
+const accountRR = new Map();       // providerId → 轮询游标
+const ACCOUNT_CREDIT_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_CREDIT_COOLDOWN_MS', 30 * 60_000);  // 额度耗尽：长冷却
+const ACCOUNT_SESSION_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_SESSION_COOLDOWN_MS', 60 * 60_000); // 会话失效：等重新登录
+const ACCOUNT_RATE_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_RATE_COOLDOWN_MS', 90_000);            // 限流：短冷却
+
+function accountKey(providerId, acctId) { return providerId + '#' + acctId; }
+
+/** 该账户当前是否可用（纯读；冷却到点即视为可用，不清状态） */
+function accountUsable(providerId, acct) {
+  const st = accountPool.get(accountKey(providerId, acct.id));
+  if (!st) return true;
+  if (st.state === 'ok') return true;
+  return Date.now() >= st.until;
+}
+
+/** 标记账户失败：额度耗尽 / 会话失效 / 限流 → 冷却并切下一个账户 */
+function markAccountFailure(providerId, acct, kind, detail) {
+  const ms = kind === 'credit' ? ACCOUNT_CREDIT_COOLDOWN_MS
+    : kind === 'session' ? ACCOUNT_SESSION_COOLDOWN_MS
+      : ACCOUNT_RATE_COOLDOWN_MS;
+  const key = accountKey(providerId, acct.id);
+  const prev = accountPool.get(key);
+  accountPool.set(key, {
+    state: kind, until: Date.now() + ms, fails: (prev ? prev.fails : 0) + 1,
+    reason: String(detail || kind).replace(/\s+/g, ' ').slice(0, 120),
+  });
+  log(`account ${providerId}#${acct.id} 标记为 ${kind}（冷却 ${Math.round(ms / 1000)}s）：${String(detail || '').slice(0, 120)}`);
+}
+
+/** 账户成功一次 → 清掉失败状态 */
+function markAccountOk(providerId, acct) {
+  if (acct && accountPool.has(accountKey(providerId, acct.id))) accountPool.delete(accountKey(providerId, acct.id));
+}
+
+/** 最近一次实际使用的账户（providerId → acctId）；日志里以 `#acct` 标注，便于核对多账户分流 */
+const accountLastUsed = new Map();
+
+/** 日志用的 via 标签：provider 无账户池时就是 provider id；有则附上本次账户 `provider#acct` */
+function viaTag(providerId) {
+  const acct = accountLastUsed.get(providerId);
+  return acct ? `${providerId}#${acct}` : providerId;
+}
+
+/**
+ * 账户池快照（诊断用：/health 的 accounts 字段）。
+ * 不仅列出"冷却中"的，而是**按配置列出全部账户**及其当前状态 —— 多账户场景下
+ * "到底有几个账户、哪个被额度耗尽、还剩多久恢复"必须一眼可见。
+ * @param {object} [cfg] 传入配置则连同未进入过冷却的账户一起列出（state='ok'）
+ */
+function accountPoolSnapshot(cfg) {
+  const out = [];
+  const seen = new Set();
+  if (cfg && Array.isArray(cfg.providers)) {
+    for (const p of cfg.providers) {
+      if (!p || p.enabled === false) continue;
+      for (const acct of providerAccounts(p)) {
+        const key = accountKey(p.id, acct.id);
+        seen.add(key);
+        const st = accountPool.get(key);
+        const usable = accountUsable(p.id, acct);
+        out.push({
+          key,
+          provider: p.id,
+          id: acct.id,
+          state: st && !usable ? st.state : 'ok',
+          remainMs: st && !usable ? Math.max(0, st.until - Date.now()) : 0,
+          ...(st && !usable ? { reason: st.reason } : {}),
+          ...(accountLastUsed.get(p.id) === acct.id ? { lastUsed: true } : {}),
+        });
+      }
+    }
+  }
+  // 兜底：配置里已删除、但进程内仍有冷却记录的账户也列出来（便于发现"配置改了仍被冷却"）
+  for (const [key, st] of accountPool) {
+    if (seen.has(key)) continue;
+    out.push({
+      key,
+      state: st.state,
+      remainMs: Math.max(0, st.until - Date.now()),
+      reason: st.reason,
+      orphan: true,
+    });
+  }
+  return out;
+}
+
+/**
+ * 取该供应商本次要用的账户（轮询）。
+ * 返回 null 表示"无账户池"（沿用顶层 apiKey 的旧路径）；返回 {accounts:[], allCooling:true}
+ * 由调用方决定是否整体跳过。
+ */
+function pickAccount(provider) {
+  const accounts = providerAccounts(provider);
+  if (accounts.length === 0) return { acct: null, accounts, cooling: 0 };
+  const usable = accounts.filter((a) => accountUsable(provider.id, a));
+  if (usable.length === 0) return { acct: null, accounts, cooling: accounts.length };
+  const n = accountRR.get(provider.id) || 0;
+  accountRR.set(provider.id, n + 1);
+  return { acct: usable[n % usable.length], accounts, cooling: 0 };
+}
+
+/* ---------------- WorkBuddy 凭据：解析 / 刷新 / 身份头 ---------------- */
+
+/** 解析桌面 App 的 auth 文件（两种形态：{auth,account} 嵌套 与 扁平） */
+function parseWorkBuddyAuth(text) {
+  let doc;
+  try { doc = JSON.parse(text); } catch { return null; }
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return null;
+  const nested = doc.auth && typeof doc.auth === 'object' && !Array.isArray(doc.auth);
+  const auth = nested ? doc.auth : doc;
+  const account = nested && doc.account && typeof doc.account === 'object' ? doc.account : doc;
+  const accessToken = typeof auth.accessToken === 'string' ? auth.accessToken : '';
+  if (!accessToken) return null;
+  const toMs = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return n > 1e12 ? n : n * 1000;   // 秒 / 毫秒两种上游写法
+  };
+  const str = (v) => (typeof v === 'string' && v !== '' ? v : undefined);
+  return {
+    accessToken,
+    refreshToken: typeof auth.refreshToken === 'string' ? auth.refreshToken : '',
+    expiresAtMs: toMs(auth.expiresAt ?? auth.expires_at),
+    refreshExpiresAtMs: toMs(auth.refreshExpiresAt),
+    domain: str(auth.domain) || '',
+    uid: str(account.uid) || '',
+    enterpriseId: str(account.enterpriseId),
+    nickname: str(account.nickname),
+  };
+}
+
+/** 自留副本路径（网关自己的目录，绝不写桌面 App 的文件） */
+function workbuddyOwnPath(provider, acct) {
+  const dir = path.join(path.dirname(CONFIG_PATH), 'workbuddy-auth');
+  const safe = (s) => String(s).replace(/[^A-Za-z0-9_.-]/g, '_');
+  return path.join(dir, `${safe(provider.id)}-${safe(acct.id)}.json`);
+}
+
+function readJsonSafe(p) {
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+/** 该凭据是否需要在本次请求前刷新（5 分钟余量） */
+const WORKBUDDY_REFRESH_MARGIN_MS = 5 * 60_000;
+function workbuddyNeedsRefresh(cred) {
+  if (!cred || cred.expiresAtMs <= 0) return true;
+  return Date.now() + WORKBUDDY_REFRESH_MARGIN_MS >= cred.expiresAtMs;
+}
+
+/** 刷新 OAuth token：POST {base}/plugin/auth/token/refresh（base 已含 /v2） */
+async function refreshWorkBuddyToken(provider, acct, cred) {
+  if (!cred.refreshToken) throw new Error('无 refreshToken，需在 WorkBuddy 桌面 App 重新登录');
+  const base = upstreamBase(provider.baseURL);
+  const origin = workbuddyOrigin(cred.domain);
+  const res = await fetch(`${base}/plugin/auth/token/refresh`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json, text/plain, */*',
+      'X-Requested-With': 'XMLHttpRequest',
+      Origin: origin,
+      Referer: origin + '/',
+      'User-Agent': providerExtraHeaders(provider)['User-Agent'] || 'CLI/2.63.2 CodeBuddy/2.63.2',
+      'X-Refresh-Token': cred.refreshToken,
+      'X-Auth-Refresh-Source': 'workbuddy',
+      ...(cred.enterpriseId ? { 'X-Enterprise-Id': cred.enterpriseId } : {}),
+    },
+    signal: AbortSignal.timeout(30_000),
+  });
+  const text = await res.text();
+  let doc = null;
+  try { doc = JSON.parse(text); } catch { /* 非 JSON：下面按失败处理 */ }
+  const data = doc && typeof doc === 'object' && doc.data && typeof doc.data === 'object' ? doc.data : {};
+  const accessToken = typeof data.accessToken === 'string' ? data.accessToken : '';
+  if (!res.ok || (doc && typeof doc.code === 'number' && doc.code !== 0) || !accessToken) {
+    const msg = (doc && typeof doc.msg === 'string' && doc.msg) || text.slice(0, 160);
+    throw new Error(`刷新失败（HTTP ${res.status}）：${msg}`);
+  }
+  const next = {
+    ...cred,
+    accessToken,
+    refreshToken: typeof data.refreshToken === 'string' && data.refreshToken ? data.refreshToken : cred.refreshToken,
+    expiresAtMs: typeof data.expiresIn === 'number' && data.expiresIn > 0 ? Date.now() + data.expiresIn * 1000 : cred.expiresAtMs,
+    domain: typeof data.domain === 'string' && data.domain ? data.domain : cred.domain,
+  };
+  try {
+    fs.mkdirSync(path.dirname(workbuddyOwnPath(provider, acct)), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(workbuddyOwnPath(provider, acct), JSON.stringify({ version: 1, credential: next }, null, 2), { mode: 0o600 });
+  } catch (e) {
+    log(`account ${provider.id}#${acct.id} 凭据副本写入失败（不影响本次使用）：${e && e.message}`);
+  }
+  return next;
+}
+
+const workbuddyCredCache = new Map();      // key → { cred, ts }
+const workbuddyInflight = new Map();       // key → Promise（单飞：并发请求共享一次刷新）
+
+/** 解析该账户当前可用的凭据（缓存 → 自留副本 → 桌面 auth 文件），必要时单飞刷新 */
+async function resolveWorkBuddyCredential(provider, acct) {
+  if (acct.apiKey) return { accessToken: acct.apiKey, refreshToken: '', expiresAtMs: Date.now() + 3600_000, domain: '', uid: '' };
+  const key = accountKey(provider.id, acct.id);
+  const cached = workbuddyCredCache.get(key);
+  if (cached && !workbuddyNeedsRefresh(cached.cred)) return cached.cred;
+  if (workbuddyInflight.has(key)) return workbuddyInflight.get(key);
+  const task = (async () => {
+    const ownRaw = readJsonSafe(workbuddyOwnPath(provider, acct));
+    const own = ownRaw && ownRaw.credential ? ownRaw.credential : null;
+    let desktop = null;
+    // authFile 留空 → 按平台默认位置自动发现（配置里不必写死机器相关路径）
+    const authFile = acct.authFile || findWorkbuddyAuthFile();
+    try {
+      if (authFile) desktop = parseWorkBuddyAuth(fs.readFileSync(authFile, 'utf8'));
+    } catch (e) {
+      if (!own) throw new Error(`读凭据文件失败：${authFile}（${e && e.message}）`);
+    }
+    // 身份优先：桌面文件是"当前登录的是谁"的权威；自留副本可能是旧账号
+    let cred = desktop || own;
+    if (!cred) {
+      throw new Error(authFile
+        ? `账户 ${acct.id} 无可用凭据：${authFile} 未登录或已失效`
+        : `账户 ${acct.id} 未找到 WorkBuddy 登录凭据——请先安装并登录 WorkBuddy 桌面 App`
+          + `（已探测：${workbuddyDefaultAuthFiles().slice(0, 2).join('、')} 等）`);
+    }
+    if (desktop && own && desktop.uid !== own.uid) cred = desktop;
+    if (workbuddyNeedsRefresh(cred)) {
+      try {
+        cred = await refreshWorkBuddyToken(provider, acct, cred);
+      } catch (e) {
+        if (cred.expiresAtMs > Date.now() + 30_000) {
+          log(`account ${provider.id}#${acct.id} 刷新失败但 token 未过期，继续使用：${e && e.message}`);
+        } else {
+          throw e;
+        }
+      }
+    }
+    workbuddyCredCache.set(key, { cred, ts: Date.now() });
+    return cred;
+  })().finally(() => workbuddyInflight.delete(key));
+  workbuddyInflight.set(key, task);
+  return task;
+}
+
+/** WorkBuddy 的区域 origin（身份头 Origin/Referer 用） */
+function workbuddyOrigin(domain) {
+  const d = String(domain || '').toLowerCase();
+  return d === 'workbuddy.ai' || d.endsWith('.workbuddy.ai') ? 'https://www.workbuddy.ai' : 'https://www.codebuddy.cn';
+}
+
+/* ---------------- WorkBuddy 客户端身份仿真（2026-09-16） ----------------
+ * 官方桌面客户端的 chat 请求带 `WorkBuddy/<appVer> WorkBuddy/<appVer> CLI/<cliVer>` 形态 UA
+ *（国际版产品名 `WorkBuddy AI`），而刷新/目录接口用 CLI 形态 UA。上游按客户端身份套用不同的
+ * 模型能力/参数规则 —— 用 CLI 形态打 chat 会被判"参数不符合模型要求"
+ *（实测 HTTP 400 code 11133 model_param_invalid）。这里按本机真实版本合成桌面 UA。
+ * 版本来源（沿用 dsh-workbuddy-connect 的取值规则，并补上 Windows 路径）：
+ *   · App：<安装目录>\resources\install-manifest.json 的 appVersion（Windows 实测可得）
+ *   · CLI：<安装目录>\resources\app.asar.unpacked\cli\package.json —— version 为 0.0.0 占位时
+ *     取 publishConfig.customPackage.version
+ * 读不到就退回 CLI 形态常量（不阻塞请求），与插件"降级但不失败"的策略一致。
+ */
+const WORKBUDDY_FALLBACK_APP_VERSION = '5.5.6';           // 与插件 FALLBACK_CN_APP_VERSION 一致
+const WORKBUDDY_CLI_UA = 'CLI/2.63.2 CodeBuddy/2.63.2';   // 刷新/目录用（插件同款常量）
+
+/** 候选安装目录（Windows / macOS），env WORKBUDDY_APP_DIR 可覆盖 */
+function workbuddyAppDirs() {
+  const out = [];
+  const env = String(process.env.WORKBUDDY_APP_DIR || '').trim();
+  if (env) out.push(env);
+  if (process.platform === 'win32') {
+    for (const root of [process.env.LOCALAPPDATA, process.env.ProgramFiles, process.env['ProgramFiles(x86)']]) {
+      if (root) out.push(path.join(root, 'Programs', 'WorkBuddy'), path.join(root, 'WorkBuddy'));
+    }
+  } else {
+    out.push(path.join(os.homedir(), 'Applications', 'WorkBuddy.app'), '/Applications/WorkBuddy.app');
+  }
+  return out;
+}
+
+const workbuddyVersionCache = new Map();   // dir → { appVersion, cliVersion }
+
+/** 读一个安装目录里的 App / CLI 版本 */
+function readWorkbuddyVersions(dir) {
+  if (workbuddyVersionCache.has(dir)) return workbuddyVersionCache.get(dir);
+  let appVersion = '';
+  let cliVersion = '';
+  const resDir = path.join(dir, 'resources');
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(resDir, 'install-manifest.json'), 'utf8'));
+    if (manifest && typeof manifest.appVersion === 'string' && /^\d+(\.\d+){1,3}$/.test(manifest.appVersion)) {
+      appVersion = manifest.appVersion;
+    }
+  } catch { /* 该目录没有 → 试下一个 */ }
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(resDir, 'app.asar.unpacked', 'cli', 'package.json'), 'utf8'));
+    const declared = typeof pkg.version === 'string' ? pkg.version : '';
+    const custom = pkg.publishConfig && pkg.publishConfig.customPackage
+      && typeof pkg.publishConfig.customPackage.version === 'string' ? pkg.publishConfig.customPackage.version : '';
+    const valid = (v) => /^\d{1,6}(?:\.\d{1,6}){1,3}(?:-[0-9A-Za-z.]+)?$/.test(v);
+    if (valid(declared) && declared !== '0.0.0') cliVersion = declared;
+    else if (valid(custom)) cliVersion = custom;
+  } catch { /* CLI 版本可选 */ }
+  const out = { appVersion, cliVersion };
+  workbuddyVersionCache.set(dir, out);
+  return out;
+}
+
+/** 本机 WorkBuddy 的 App / CLI 版本（找不到返回空串） */
+function workbuddyVersions() {
+  for (const dir of workbuddyAppDirs()) {
+    const v = readWorkbuddyVersions(dir);
+    if (v.appVersion) return v;
+  }
+  return { appVersion: '', cliVersion: '' };
+}
+
+/** 合成 chat 的桌面身份 UA：`WorkBuddy/<app> WorkBuddy/<app> [CLI/<cli>]` */
+function workbuddyChatUserAgent(domain) {
+  const { appVersion, cliVersion } = workbuddyVersions();
+  if (!appVersion) return WORKBUDDY_CLI_UA;
+  const d = String(domain || '').toLowerCase();
+  const product = (d === 'workbuddy.ai' || d.endsWith('.workbuddy.ai')) ? 'WorkBuddy AI' : 'WorkBuddy';
+  const parts = [`WorkBuddy/${appVersion}`, `${product}/${appVersion}`];
+  if (cliVersion) parts.push(`CLI/${cliVersion}`);
+  return parts.join(' ');
+}
+
+/**
+ * 用凭据构造上游请求头（Authorization + 身份头 + 客户端仿真头）
+ * @param {boolean} [forChat] true = chat 请求（用桌面身份 UA）；缺省 = 刷新/目录（CLI 形态 UA）
+ */
+function workbuddyHeaders(provider, cred, extra, forChat) {
+  const origin = workbuddyOrigin(cred.domain);
+  const h = {
+    Accept: 'application/json, text/plain, */*',
+    'X-Requested-With': 'XMLHttpRequest',
+    Origin: origin,
+    Referer: origin + '/',
+    'Content-Type': 'application/json',
+    'X-Product': 'SaaS',
+    Authorization: 'Bearer ' + cred.accessToken,
+    ...(cred.uid ? { 'X-User-Id': cred.uid } : { 'X-No-User-Id': '1' }),
+    ...(cred.enterpriseId ? { 'X-Enterprise-Id': cred.enterpriseId } : { 'X-No-Enterprise-Id': '1' }),
+    ...(cred.domain ? { 'X-Domain': cred.domain } : { 'X-No-Department-Info': '1' }),
+    ...(extra || {}),
+  };
+  // 身份仿真（关键）：chat 用桌面形态 UA；刷新/目录保持 CLI 形态。
+  // 配置里的 headers.User-Agent 只作为刷新路径的覆盖，不参与 chat（chat 必须是桌面身份）。
+  if (forChat) h['User-Agent'] = workbuddyChatUserAgent(cred.domain);
+  else h['User-Agent'] = WORKBUDDY_CLI_UA;
+  return h;
+}
+
+/**
+ * 由网关独占的"凭据/身份"类请求头（大小写不敏感）。
+ * 翻译路径重建上游头时先剔除它们，避免与账户凭据头重复（重复会变成 "Bearer A, Bearer B" 的坏值）。
+ */
+const RESERVED_UPSTREAM_HEADERS = new Set([
+  'authorization', 'x-api-key', 'anthropic-version',
+  'x-user-id', 'x-enterprise-id', 'x-domain', 'x-product',
+  'x-no-user-id', 'x-no-enterprise-id', 'x-no-department-info',
+  'origin', 'referer', 'x-requested-with',
+]);
+
+/** 大小写不敏感地删除某个头（Node 会把大小写不同的同名头用 ", " 合并成脏值） */
+function dropHeaderCI(obj, name) {
+  for (const k of Object.keys(obj)) if (k.toLowerCase() === name) delete obj[k];
+}
+/** 大小写不敏感地取某个头 */
+function pickHeaderCI(obj, name) {
+  for (const [k, v] of Object.entries(obj || {})) if (k.toLowerCase() === name) return v;
+  return undefined;
+}
+
+/**
+ * 构造"用某个账户发上游请求"的完整请求头（翻译路径与直通路径共用，避免两处漂移）：
+ *  ① 剔除网关独占的凭据/身份头（防重复 Authorization）；
+ *  ② auth=workbuddy → 解析凭据 + 身份头 + **桌面客户端形态 UA**（chat）/CLI 形态 UA（刷新）；
+ *  ③ 否则用账户自带 apiKey（OpenAI 线上游发 Bearer；Anthropic 线上游发 x-api-key）；
+ *  ④ 合并供应商 `headers` 自定义头。
+ * 凭据不可用时抛错，由调用方决定"换账户"还是"放弃该供应商"。
+ */
+async function accountUpstreamHeaders(provider, acct, baseHeaders, { anthropicUpstream }) {
+  const extra = providerExtraHeaders(provider);
+  const base = { ...(baseHeaders || {}) };
+  for (const k of Object.keys(base)) {
+    if (RESERVED_UPSTREAM_HEADERS.has(k.toLowerCase())) delete base[k];
+  }
+  // User-Agent 必须**只有一个**：供应商显式配置优先，其次沿用 base（Claude 仿真）；
+  // 先记录再删除所有大小写变体，最后由下面按需写回唯一一个（WorkBuddy 分支写桌面身份）。
+  const ua = pickHeaderCI(extra, 'user-agent') ?? pickHeaderCI(base, 'user-agent');
+  const out = { ...base, ...extra };
+  dropHeaderCI(out, 'user-agent');
+  if (acct && acct.id) accountLastUsed.set(provider.id, acct.id);   // 日志/health 标注本次账户
+  if (String(provider.auth || '').toLowerCase() === 'workbuddy') {
+    const cred = await resolveWorkBuddyCredential(provider, acct || { id: 'default' });
+    Object.assign(out, workbuddyHeaders(provider, cred, out, true));   // 内部设置唯一的桌面身份 UA
+    return out;
+  }
+  if (ua) out['User-Agent'] = ua;
+  const key = (acct && acct.apiKey) || provider.apiKey;
+  if (key) {
+    if (anthropicUpstream) {
+      out['x-api-key'] = key;
+      out['anthropic-version'] = out['anthropic-version'] || '2023-06-01';
+    } else {
+      out.authorization = 'Bearer ' + key;
+    }
+  }
+  return out;
+}
+
+/**
+ * 带账户池的上游转发（2026-09-16）：供应商配了 accounts 时，先用轮询选中的账户发；
+ * 若失败属于**账户级**（额度耗尽 / 会话失效 / 限流），标记该账户并换下一个账户重试；
+ * 全部账户都不可用（或失败与账户无关）才按 forward() 的原契约返回，交给下一家供应商。
+ *
+ * 实现要点：不改写 forward() 的主流程，只借 opts.failureSink 拿回"上游状态码 + 错误体"，
+ * 由本函数做账户级判定 —— 这样流式透传 / SSE 首事件嗅探 / 熔断等既有行为完全复用。
+ */
+async function forwardWithAccounts(provider, upstreamPath, baseHeaders, body, res, opts) {
+  const accounts = providerAccounts(provider);
+  // 无账户池：仍要走一遍账户头构造 —— 否则供应商 `headers`（自定义 UA/品牌头）在直通路径上会被丢掉
+  if (accounts.length === 0) {
+    const anthropicUpstream = upstreamPath === '/messages' || upstreamPath === '/v1/messages';
+    let headers = baseHeaders;
+    try {
+      headers = await accountUpstreamHeaders(provider, null, baseHeaders, { anthropicUpstream });
+    } catch (e) {
+      log(`provider ${provider.id} 头部构造失败：${e && e.message}`);
+      return false;
+    }
+    return forward(provider, upstreamPath, headers, body, res, opts);
+  }
+  const usable = accounts.filter((a) => accountUsable(provider.id, a));
+  if (usable.length === 0) {
+    log(`provider ${provider.id}: ${accounts.length} 个账户全部冷却中 → 交给下一家`);
+    return false;
+  }
+  // 轮询起点（与翻译路径共用同一游标，保证多账户分流均匀）
+  const n = accountRR.get(provider.id) || 0;
+  accountRR.set(provider.id, n + 1);
+  const ordered = [...usable.slice(n % usable.length), ...usable.slice(0, n % usable.length)];
+  const anthropicUpstream = upstreamPath === '/messages' || upstreamPath === '/v1/messages';
+  let lastOut = false;
+  for (let i = 0; i < ordered.length; i++) {
+    const acct = ordered[i];
+    let headers;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      headers = await accountUpstreamHeaders(provider, acct, baseHeaders, { anthropicUpstream });
+    } catch (e) {
+      log(`account ${provider.id}#${acct.id} 凭据不可用：${e && e.message}`);
+      markAccountFailure(provider.id, acct, 'session', e && e.message);
+      continue;
+    }
+    const sink = {};
+    // eslint-disable-next-line no-await-in-loop
+    const out = await forward(provider, upstreamPath, headers, body, res, { ...(opts || {}), failureSink: sink, accountScoped: true });
+    if (out === true) { markAccountOk(provider.id, acct); return true; }
+    if (res.headersSent) return out;                     // 已经写给客户端了，不能再重试
+    const kind = classifyAccountFailure(sink.status || 0, sink.detail || '');
+    if (kind && i + 1 < ordered.length) {
+      markAccountFailure(provider.id, acct, kind, sink.detail);
+      continue;                                          // 换下一个账户
+    }
+    if (kind) markAccountFailure(provider.id, acct, kind, sink.detail);   // 最后一个账户也要标记
+    lastOut = out;
+    if (!kind) return out;                               // 与账户无关的失败 → 原样返回
+  }
+  return lastOut;
+}
+
+/**
+ * 直通路径（客户端说 OpenAI 协议）也要应用供应商 quirks —— 2026-09-16 实测：
+ * 同一份配置里的 `stringify-tool-choice` 只在**翻译路径**生效，于是 OpenAI 客户端把
+ * `tool_choice` 以对象形态透传，上游直接 400
+ *（`11101: cannot unmarshal object into Go struct field Request.tool_choice of type string`）。
+ * 这里统一在发请求前改写 body；返回 { body, forceStreamForNonStream } 供调用方决定是否聚合流。
+ */
+function applyOpenAIQuirks(body, provider) {
+  const quirks = providerQuirks(provider);
+  if (!body || typeof body !== 'object' || quirks.size === 0) return { body, needAggregate: false };
+  let out = body;
+  const detach = () => { if (out === body) out = { ...body }; return out; };
+  // ① tool_choice 必须是字符串（对象形态会被上游拒绝）
+  if (quirks.has('stringify-tool-choice') && out.tool_choice && typeof out.tool_choice === 'object') {
+    const tc = detach().tool_choice;
+    out.tool_choice = (tc.function && tc.function.name) || tc.name || 'auto';
+  }
+  // ② 首条必须是 system：缺失时补一条（仅当确实没有 system 时才补，顺序不动）
+  if (quirks.has('prepend-system')) {
+    const msgs = Array.isArray(out.messages) ? out.messages : null;
+    if (msgs && !(msgs[0] && msgs[0].role === 'system')) {
+      detach().messages = [{ role: 'system', content: 'You are a helpful assistant.' }, ...msgs];
+    }
+  }
+  // ③ 上游只接受流式：强制 stream=true；客户端要非流式 → 由调用方聚合后回单条 JSON
+  let needAggregate = false;
+  if (quirks.has('force-stream') && out.stream !== true) {
+    needAggregate = !out.stream;   // 客户端本来要非流式 → 需要聚合
+    detach().stream = true;
+  }
+  return { body: out, needAggregate };
+}
+
+/**
+ * OpenAI SSE → 单个 chat.completion（聚合）：用于"上游强制流式、而客户端要非流式"的直通路径。
+ * 只聚合文本/推理/工具调用分片与 finish_reason/usage，不做协议翻译。
+ */
+async function aggregateOpenAIStream(upstream, headBytes) {
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let id = '';
+  let model = '';
+  let content = '';
+  let reasoning = '';
+  let finish = null;
+  let usage = null;
+  const toolCalls = new Map();
+  const feed = (text) => {
+    buf += text;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).replace(/\r$/, '');
+      buf = buf.slice(nl + 1);
+      const m = /^data:\s*(.*)$/.exec(line);
+      if (!m) continue;
+      const payload = m[1].trim();
+      if (payload === '[DONE]') continue;
+      let json = null;
+      try { json = JSON.parse(payload); } catch { continue; }
+      if (json.id) id = json.id;
+      if (json.model) model = json.model;
+      if (json.usage) usage = json.usage;
+      const choice = (Array.isArray(json.choices) ? json.choices[0] : null) || {};
+      const d = choice.delta || {};
+      if (typeof d.content === 'string') content += d.content;
+      if (typeof d.reasoning_content === 'string') reasoning += d.reasoning_content;
+      for (const call of Array.isArray(d.tool_calls) ? d.tool_calls : []) {
+        const idx = Number.isInteger(call.index) ? call.index : 0;
+        const entry = toolCalls.get(idx) || { id: '', type: 'function', function: { name: '', arguments: '' } };
+        if (call.id) entry.id = call.id;
+        if (call.function && call.function.name) entry.function.name = call.function.name;
+        if (call.function && call.function.arguments) entry.function.arguments += call.function.arguments;
+        toolCalls.set(idx, entry);
+      }
+      if (choice.finish_reason) finish = choice.finish_reason;
+    }
+  };
+  try {
+    // 注意：forward() 为识别"首事件即错误"已偷看过首个事件，那些字节必须原样喂回来，否则丢内容
+    if (headBytes && headBytes.length) feed(Buffer.from(headBytes).toString('utf8'));
+    for (;;) {
+      // eslint-disable-next-line no-await-in-loop
+      const { done, value } = await reader.read();
+      if (done) break;
+      feed(decoder.decode(value, { stream: true }));
+    }
+  } catch (e) {
+    log(`上游流聚合失败：${e && e.message}`);
+  } finally {
+    try { reader.releaseLock(); } catch { /* 忽略 */ }
+  }
+  const message = { role: 'assistant', content: content === '' && toolCalls.size ? null : content };
+  if (reasoning) message.reasoning_content = reasoning;
+  if (toolCalls.size) message.tool_calls = [...toolCalls.values()].map((t) => ({
+    ...t, id: t.id || 'call_' + Math.random().toString(36).slice(2, 10),
+  }));
+  return {
+    id: id || 'chatcmpl-' + crypto.randomUUID().replace(/-/g, '').slice(0, 20),
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, message, finish_reason: finish || 'stop' }],
+    ...(usage ? { usage } : {}),
+  };
+}
+
+/** 账户级失败判定（额度耗尽 / 会话失效 / 限流）——决定"换账户"而不是"换供应商" */
+const WORKBUDDY_CREDIT_RE = /insufficient credit|no credit|credit exhausted|credits exhausted|out of credit|quota exceeded|quota exhaust|payment required|credit not enough|not enough credit|积分不足|额度不足|余额不足|积分用完|额度用尽|没有积分/i;
+const WORKBUDDY_SESSION_RE = /Offline user session not found|12153|session not found|login expired|重新登录/i;
+function classifyAccountFailure(status, detail) {
+  if (status === 402) return 'credit';
+  if (WORKBUDDY_CREDIT_RE.test(detail)) return 'credit';
+  if (WORKBUDDY_SESSION_RE.test(detail)) return 'session';
+  if (status === 429) return 'rate';
+  return null;
 }
 
 /** 每个 provider 的判定原因（日志/错误详情用；只含网关自身的判定码，不含上游内容）。 */
@@ -1006,6 +1835,54 @@ const PROVIDER_SIDE_4XX_RE = /credit|balance|insufficient|quota|deposit|billing|
 const PERSISTENT_ACCOUNT_RE = /credit|balance|deposit|billing|unpaid|arrears|欠费|余额|充值/i;
 
 /**
+ * thinking 回传要求（2026-09-16 实测事故：air-outer / agentrouter）。
+ *
+ * Claude 的扩展思考语义：请求开了 thinking（或历史里出现过 thinking）时，**带 tool_use 的
+ * assistant 轮必须把 thinking 块一起回传**，否则上游回
+ *   HTTP 400 {"error":{"message":"The `content[].thinking` in the thinking mode must be
+ *   passed back to the API. ..."}}
+ * 实测触发条件（见下）与内容无关，**只看结构**：
+ *   · assistant 轮里只有 tool_use（或 text+tool_use）→ 400；
+ *   · 补一个 thinking 块（哪怕 thinking:'' + signature:''，甚至不带 signature 字段）→ 200。
+ * 客户端（pi-ai）在"thinking 无签名"时会把该块降级成普通 text（allowEmptySignature 未开），
+ * 于是上游只看到 text+tool_use → 400。两条对应修复：
+ *   ① 客户端侧：dsh settings.yaml 的模型加 compat.allowEmptySignature: true（writeDshConfig 写入）；
+ *   ② 网关侧：命中该 400 时补空占位 thinking 块重试一次（下面的 withThinkingPlaceholders），
+ *      兜住任何未开该开关的客户端。实测 chiyi-ds / amd 等不要求该结构的家接受占位块，无副作用。
+ */
+const THINKING_PASSBACK_RE = /content\[\]\.thinking|thinking[^.\n]{0,40}must be passed back|thinking mode must be passed back/i;
+
+/**
+ * 同一规则的**另一种上游措辞**（2026-09-16 实测补充）：agentrouter 不解释原因，只回
+ *   HTTP 500 {"error":{"message":"Upstream rejected the request as invalid","type":"invalid_request_error"}}
+ * 实测同一请求体（带 tool_use 的 assistant 轮缺 thinking 块）补空占位后即 200，故该措辞也纳入
+ * 补位触发条件。**注意**：该措辞本身很泛，所以只在"确实存在可补位的轮次"
+ *（withThinkingPlaceholders 返回非 null）时才真正重试，不会对无关的 500 盲目重发。
+ */
+const THINKING_REJECTED_GENERIC_RE = /rejected the request as invalid/i;
+
+/**
+ * 给"带 tool_use 但缺 thinking 块"的 assistant 轮补一个空占位 thinking 块。
+ * 只做**结构性补齐**：thinking 正文与签名都为空（不伪造推理内容）。
+ * @returns {{body:object, repaired:number}|null} 无需修复时返回 null。
+ */
+function withThinkingPlaceholders(body) {
+  if (!body || !Array.isArray(body.messages)) return null;
+  let repaired = 0;
+  const messages = body.messages.map((msg) => {
+    if (!msg || msg.role !== 'assistant' || !Array.isArray(msg.content)) return msg;
+    if (msg.content.some((b) => b && (b.type === 'thinking' || b.type === 'redacted_thinking'))) return msg;
+    const firstTool = msg.content.findIndex((b) => b && b.type === 'tool_use');
+    if (firstTool < 0) return msg;
+    const content = msg.content.slice();
+    content.splice(firstTool, 0, { type: 'thinking', thinking: '', signature: '' });
+    repaired++;
+    return { ...msg, content };
+  });
+  return repaired ? { body: { ...body, messages }, repaired } : null;
+}
+
+/**
  * 确定性 4xx 的客户端文案：**不回显上游错误体原文**（防泄露上游信息/供应商指纹），
  * 只说明"请求本身有问题 + 已停止 failover（重发给别家不会有帮助）"。
  */
@@ -1117,10 +1994,14 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     log(`skip ${provider.id} (breaker: cooldown or half-open probe already in flight)`);
     return false;
   }
+  const startedAt = Date.now();   // 网络错"够快才重试"的判定基准
+  const timeoutMs = providerTimeoutMs(provider);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   let upstream;
+  let init = null;   // 首次请求的 fetch init（网络错原地重试用；见下方 catch）
   let firstDetail = null;   // 首次响应体（若已读取，后续分支复用，避免 body 二次消费报错）
+  let needAggregate = false;   // 上游被强制流式、客户端要非流式 → 成功路径需聚合（见 applyOpenAIQuirks）
   try {
     // baseURL 允许“带 /v1”或“不带 /v1”两种写法（OpenAI SDK 惯例 / 用户习惯）：
     // upstreamBase() 统一规范化，upstreamPath 始终是相对 /v1 的路径（如 /chat/completions、/messages）
@@ -1131,12 +2012,19 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     // 导致"关闭推理"失效——上游收到非 Anthropic 字段而按默认开推理处理）。
     // Anthropic 请求的 R9 打码已在 handleMessages 完成，这里原样透传。
     const isAnthropicPath = upstreamPath === '/messages';
-    const outBody = rawMode ? null
+    let outBody = rawMode ? null
       : (isAnthropicPath
         ? body
         : (responsesMode ? translateResponsesBody(body, provider) : translateBody(body, provider)));   // R5：role 兼容 + 推理档位翻译（Responses 走对应实现）
+    // 直通路径也要应用供应商 quirks（2026-09-16 实测：stringify-tool-choice 只在翻译路径生效，
+    // OpenAI 客户端把 tool_choice 对象透传 → 上游 11101 拒绝）
+    if (!rawMode && !isAnthropicPath && !responsesMode) {
+      const q = applyOpenAIQuirks(outBody, provider);
+      outBody = q.body;
+      needAggregate = q.needAggregate;
+    }
     // raw 模式不带 body：显式传 undefined，避免 fetch 在没有 content-length 时挂起等待请求体
-    const init = { method, headers: upstreamHeaders, signal: controller.signal };
+    init = { method, headers: upstreamHeaders, signal: controller.signal };
     if (!rawMode) init.body = JSON.stringify(outBody);
     upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, init);
     clearTimeout(timer);
@@ -1150,7 +2038,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         if (deBody !== outBody) {
           log(`upstream ${provider.id} 内容拦截，已降敏重试一次…`);
           const c2 = new AbortController();
-          const t2 = setTimeout(() => c2.abort(), UPSTREAM_TIMEOUT_MS);
+          const t2 = setTimeout(() => c2.abort(), timeoutMs);
           try {
             upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
               method: 'POST',
@@ -1164,15 +2052,74 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
           }
           firstDetail = null;   // 换了新响应，detail 需重读
         }
+      } else if (isAnthropicPath
+        && (THINKING_PASSBACK_RE.test(firstDetail) || THINKING_REJECTED_GENERIC_RE.test(firstDetail))) {
+        // Anthropic 协议专属：上游要求"带 tool_use 的 assistant 轮必须回传 thinking 块"。
+        // 客户端没开 allowEmptySignature 时会把无签名的 thinking 降级成 text → 上游只看到
+        // text+tool_use → 报错。这里补空占位块重试一次（实测上游只做结构检查，空占位即可通过）。
+        // 两种上游措辞：明确点名 thinking 的 400；以及 agentrouter 的笼统 500
+        // "Upstream rejected the request as invalid"（同一规则，实测补位后即 200）。
+        // 笼统措辞下**只有确实存在可补位轮次时才重试**（fix 非空），避免无谓重发。
+        const fix = withThinkingPlaceholders(body);
+        if (fix) {
+          log(`upstream ${provider.id} 要求 thinking 回传（HTTP ${upstream.status}）`
+            + ` → 补齐 ${fix.repaired} 处空占位 thinking 块后重试一次`);
+          const c3 = new AbortController();
+          const t3 = setTimeout(() => c3.abort(), timeoutMs);
+          try {
+            const retried = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
+              method: 'POST',
+              headers: upstreamHeaders,
+              body: JSON.stringify(fix.body),
+              signal: c3.signal,
+            });
+            upstream = retried;
+            firstDetail = null;   // 换了新响应，detail 需重读
+          } catch (e) {
+            // 重试本身失败：保留原始 4xx 响应与已读到的 detail，走下面的既有判定
+            log(`upstream ${provider.id} thinking 占位重试失败: ${e.message}`);
+          } finally {
+            clearTimeout(t3);
+          }
+        }
       }
     }
   } catch (e) {
     clearTimeout(timer);
-    // R3 防封：失败冷却而非立即删缓存（防每个请求都重试上游形成风暴）
-    catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-    breakerRecordFail(provider.id, 0);   // V2：网络错误 → 短熔断 5 分钟
-    log(`upstream ${provider.id} request error: ${e.message}`);
-    return rawMode ? { retryable: 0 } : false;
+    // 2026-09-16 修复（日志可诊断性）：undici 的网络层错误 message 恒为 "fetch failed"，
+    // 真正的原因在 e.cause（ECONNRESET / ENOTFOUND / UND_ERR_SOCKET / 代理连接失败…）。
+    // 旧实现只记 e.message → 一整天 170 条 "fetch failed" 完全无法定位（实测根因是本机
+    // Clash TUN 的 TLS 被重置，日志里看不出来）。现在把 cause 链一并落盘。
+    const causeText = describeFetchError(e);
+    // 2026-09-16 修复（瞬时网络错重试）：实测 clash/代理节点抖动会让**单次**请求
+    // ECONNRESET（5s 内失败），而同一家下一次就好。旧实现首次失败即 90s 熔断 ——
+    // 单候选模型（如 deepseek-v4.1-flash → chiyi-ds）会因此整段不可用 1.5 分钟。
+    // 现在：**仅对"快速失败的网络层错误"重试一次**（本地超时中止不重试，否则白白翻倍等待）。
+    const elapsed = Date.now() - startedAt;
+    if (isTransientNetError(e) && elapsed < NET_RETRY_MAX_ELAPSED_MS) {
+      log(`upstream ${provider.id} 网络错误（${causeText}，${elapsed}ms）→ 原地重试一次`);
+      const c2 = new AbortController();
+      const t2 = setTimeout(() => c2.abort(), providerTimeoutMs(provider));
+      try {
+        const retried = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
+          ...init,
+          signal: c2.signal,
+        });
+        upstream = retried;
+        log(`upstream ${provider.id} 重试成功（网络抖动已恢复）`);
+      } catch (e2) {
+        log(`upstream ${provider.id} 重试仍失败：${describeFetchError(e2)}`);
+      } finally {
+        clearTimeout(t2);
+      }
+    }
+    if (!upstream) {
+      // R3 防封：失败冷却而非立即删缓存（防每个请求都重试上游形成风暴）
+      catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+      breakerRecordFail(provider.id, 0);   // V2：网络错误 → 短熔断
+      log(`upstream ${provider.id} request error: ${e.message}${causeText ? ' (' + causeText + ')' : ''}`);
+      return rawMode ? { retryable: 0 } : false;
+    }
   }
   clearTimeout(timer);
   if (!upstream.ok) {
@@ -1183,6 +2130,21 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       detail = await readTextWithTimeout(upstream, 5000, 500);
     }
     log(`upstream ${provider.id} HTTP ${upstream.status}: ${maskSecrets(detail)}`);   // V1：日志脱敏
+    // 账户池（2026-09-16）：把状态码与错误体回传给包装函数，由它判定"该换账户还是换供应商"
+    if (opts && opts.failureSink) {
+      opts.failureSink.status = upstream.status;
+      opts.failureSink.detail = detail;
+    }
+    // 账户池场景（opts.accountScoped）：额度耗尽 / 会话失效 / 限流属于**账户**问题，不是供应商问题 ——
+    // 直接交回账户池换账户，**不计供应商熔断**（否则第一次额度耗尽就会把整家熔断 30 分钟，
+    // 换账户的重试会被 breakerAcquire 挡在门外 → 客户端拿到 503，账户池形同虚设）。
+    if (opts && opts.accountScoped) {
+      const acctKind = classifyAccountFailure(upstream.status, detail);
+      if (acctKind) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为账户级失败（${acctKind}）→ 交回账户池处理（不计供应商熔断）`);
+        return rawMode ? { retryable: upstream.status } : false;
+      }
+    }
     const contentBlocked = CONTENT_BLOCK_RE.test(detail);
     // R8：上游内容拦截时，把触发请求的"结构摘要"落盘（不含明文 key、不含原文前缀），
     // 用于定位是什么特征触发了上游过滤（sensitive words / content-blocked）。
@@ -1240,10 +2202,62 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     return false;
   }
   breakerRecordSuccess(provider.id);   // V1：成功清零熔断计数
+  const bodyStream = upstream.body;
+  const ctype = String(upstream.headers.get('content-type') || 'application/json');
+  // —— SSE「首事件就是错误」识别（2026-09-15 实测事故）——
+  // 部分上游（实测 api.chiyi.cc）对失败的请求回 **HTTP 200 + text/event-stream**，流里第一件事
+  // 就是 `event: error` + `data: {"error":{"message":"Service temporarily unavailable",...}}`。
+  // 旧实现按"成功"直接透传：日志记 status=ok（说谎）、不计熔断、不 failover，客户端拿到的是
+  // **上游的错误原文**（用户看到的那句就是这个）。
+  // 现在：写响应头之前先偷看首个 SSE 事件——若它是 error，就当作该供应商失败（冷却+熔断+换下一家）。
+  // 关键点：此时**还没向客户端写任何字节**，所以 failover 是安全的（客户端最终收到的是
+  // 下一家的正常流，或全部失败时网关自己的 503 文案）。
+  let pendingHead = null;   // 偷看得到的首事件字节（未判失败时原样补发给客户端）
+  if (bodyStream && /event-stream/i.test(ctype)) {
+    try {
+      const peekReader = bodyStream.getReader();
+      const chunks = [];
+      let total = 0;
+      while (total < 8192) {
+        // eslint-disable-next-line no-await-in-loop
+        const { done, value } = await peekReader.read();
+        if (done) break;
+        const buf = Buffer.from(value);
+        chunks.push(buf);
+        total += buf.length;
+        const txt = Buffer.concat(chunks).toString('utf8');
+        if (/\n\n|\r\n\r\n/.test(txt)) break;   // 首个事件已完整
+      }
+      const head = Buffer.concat(chunks).toString('utf8');
+      pendingHead = Buffer.concat(chunks);
+      const hasRealEvent = /event:\s*(message_start|content_block_start|content_block_delta|response\.created|response\.in_progress|response\.output_item)/i.test(head)
+        || /"type"\s*:\s*"(message_start|content_block_start|response\.created)"/.test(head);
+      const looksError = !hasRealEvent && (/event:\s*error/i.test(head) || /"type"\s*:\s*"error"/.test(head.slice(0, 2048)));
+      if (looksError) {
+        const detail = head.replace(/\s+/g, ' ').slice(0, 200);
+        log(`upstream ${provider.id} HTTP 200 但 SSE 首事件是错误 → 判定该家失败并换下一家：${maskSecrets(detail)}`);
+        catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+        breakerRecordFail(provider.id, 0);   // 短熔断（连续 3 次 / 或半开探测失败）
+        try { await peekReader.cancel(); } catch { /* 忽略 */ }
+        return rawMode ? { retryable: 0 } : false;
+      }
+      peekReader.releaseLock();   // 未判失败：把流交回下面的正常消费路径
+    } catch (peekErr) {
+      log(`upstream ${provider.id} 首事件偷看失败（按正常流继续）：${peekErr && peekErr.message}`);
+      pendingHead = null;
+    }
+  }
+  // 上游被强制流式、而客户端要非流式 → 聚合后回单条 JSON（2026-09-16：直通路径补齐 quirk 语义）
+  if (needAggregate && bodyStream && /event-stream/i.test(ctype)) {
+    const completion = await aggregateOpenAIStream(upstream, pendingHead);
+    if (res.destroyed || res.writableEnded) return false;
+    json(res, 200, completion);
+    return true;
+  }
   // success: stream through
   try {
     res.writeHead(upstream.status, {
-      'content-type': upstream.headers.get('content-type') || 'application/json',
+      'content-type': ctype,
       'cache-control': 'no-cache',
       'access-control-allow-origin': '*',
     });
@@ -1253,7 +2267,13 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     res.destroy();
     return false;
   }
-  const bodyStream = upstream.body;
+  if (pendingHead && pendingHead.length) {
+    // 偷看过的首事件原样补发（客户端不该察觉这一步）
+    if (opts && typeof opts.onSniff === 'function') {
+      try { opts.onSniff(pendingHead.toString('utf8')); } catch { /* 忽略 */ }
+    }
+    try { res.write(pendingHead); } catch { /* 客户端可能已断开，下面循环会兜住 */ }
+  }
   if (bodyStream) {
     const reader = bodyStream.getReader();
     // R7 强壮性：读流加"空闲超时"——上游已连接但长时间不吐数据（挂起/代理卡死）时
@@ -1329,6 +2349,579 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     res.end();
   } catch { }
   return true;
+}
+
+/* ================= 协议翻译：Anthropic ↔ OpenAI（2026-09-16） =================
+ * 用途：客户端（dsh，clientProfile=claude）说 Anthropic 协议，而部分上游只会 OpenAI chat
+ *（WorkBuddy 的 /v2/chat/completions；sensenova 也是——它此前每次 401，正是因为网关把
+ * /v1/messages 原样转给了只认 OpenAI 路径的上游）。
+ * 声明方式：供应商配置 `"protocol": "openai-chat"` —— 只影响该供应商，其它家不变。
+ */
+
+/** Anthropic content 块数组 → OpenAI content 部分（text / image_url） */
+function anthropicPartsToOpenAI(content) {
+  const parts = [];
+  for (const b of Array.isArray(content) ? content : []) {
+    if (!b || typeof b !== 'object') continue;
+    if (b.type === 'text' && typeof b.text === 'string') parts.push({ type: 'text', text: b.text });
+    else if (b.type === 'image' && b.source && typeof b.source === 'object') {
+      const src = b.source;
+      const url = src.type === 'base64'
+        ? `data:${src.media_type || 'image/png'};base64,${src.data || ''}`
+        : (typeof src.url === 'string' ? src.url : '');
+      if (url) parts.push({ type: 'image_url', image_url: { url } });
+    }
+  }
+  return parts;
+}
+
+/** tool_result 的 content（字符串 / 块数组）→ 纯文本 */
+function toolResultText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map((b) => (b && b.type === 'text' && typeof b.text === 'string' ? b.text : '')).join('');
+  }
+  return '';
+}
+
+/**
+ * Anthropic Messages 请求体 → OpenAI chat/completions 请求体。
+ * 覆盖：system、多模态 content、tool_use/tool_result ↔ tool_calls/role:tool、tools、tool_choice、
+ * stop_sequences、thinking(budget)→reasoning_effort（再交由 translateBody 按家映射档位）。
+ */
+function anthropicToOpenAIRequest(body, provider) {
+  const messages = [];
+  // 2026-09-16 防御：历史里若存在**名字为空的 tool_use**（修复前产生的坏数据、或上游协议异常），
+  // 原样回传会让上游 400（`tool_calls[].function.name` 非法）→ 之后每一轮都被打死。
+  // 这里把这类 tool_use 连同它对应的 tool_result 一起丢弃（保留其余历史），并记一条日志。
+  const droppedToolIds = new Set();
+  let droppedCount = 0;
+  const sysText = typeof body.system === 'string'
+    ? body.system
+    : (Array.isArray(body.system) ? body.system.map((b) => (b && b.type === 'text' ? b.text : '')).join('') : '');
+  if (sysText.trim()) messages.push({ role: 'system', content: sysText });
+
+  for (const msg of Array.isArray(body.messages) ? body.messages : []) {
+    if (!msg || typeof msg !== 'object') continue;
+    const role = msg.role === 'assistant' ? 'assistant' : 'user';
+    const content = msg.content;
+    if (typeof content === 'string') { messages.push({ role, content }); continue; }
+    if (!Array.isArray(content)) continue;
+
+    if (role === 'assistant') {
+      const text = content.filter((b) => b && b.type === 'text').map((b) => b.text).join('');
+      const calls = [];
+      for (const b of content) {
+        if (!b || b.type !== 'tool_use') continue;
+        const name = String(b.name || '').trim();
+        if (!name) {   // 空名工具调用：丢弃（连它的 tool_result 一起），否则整轮 400
+          if (b.id) droppedToolIds.add(String(b.id));
+          droppedCount++;
+          continue;
+        }
+        calls.push({
+          id: String(b.id || 'call_' + Math.random().toString(36).slice(2, 10)),
+          type: 'function',
+          function: { name, arguments: JSON.stringify(b.input === undefined ? {} : b.input) },
+        });
+      }
+      const out = { role: 'assistant', content: text === '' && calls.length ? null : text };
+      if (calls.length) out.tool_calls = calls;
+      if (calls.length || text !== '') messages.push(out);
+      continue;
+    }
+    // user：tool_result 必须拆成独立的 role:'tool' 消息（顺序要紧：紧跟发起调用的 assistant 轮）
+    for (const b of content) {
+      if (b && b.type === 'tool_result') {
+        if (droppedToolIds.has(String(b.tool_use_id || ''))) continue;   // 对应的 tool_use 已被丢弃 → 不留孤儿子消息
+        messages.push({
+          role: 'tool',
+          tool_call_id: String(b.tool_use_id || ''),
+          content: toolResultText(b.content),
+        });
+      }
+    }
+    const parts = anthropicPartsToOpenAI(content);
+    if (parts.length) {
+      messages.push({ role: 'user', content: parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts });
+    }
+  }
+
+  const out = {
+    model: body.model,
+    max_tokens: body.max_tokens,
+    messages,
+  };
+  if (droppedCount) {
+    log(`翻译告警：历史里有 ${droppedCount} 个**名字为空**的 tool_use（及其 tool_result）已丢弃——`
+      + '否则回传给上游会 400（该轮可能由此前版本的空名 bug 产生）');
+  }
+  if (Array.isArray(body.tools) && body.tools.length) {
+    out.tools = body.tools.map((t) => ({
+      type: 'function',
+      function: {
+        name: String(t && t.name || ''),
+        ...(t && t.description ? { description: String(t.description) } : {}),
+        parameters: (t && t.input_schema) || { type: 'object', properties: {} },
+      },
+    }));
+  }
+  if (body.tool_choice && typeof body.tool_choice === 'object') {
+    const tc = body.tool_choice;
+    if (tc.type === 'auto') out.tool_choice = 'auto';
+    else if (tc.type === 'any') out.tool_choice = 'required';
+    else if (tc.type === 'none') out.tool_choice = 'none';
+    else if (tc.type === 'tool' && tc.name) out.tool_choice = { type: 'function', function: { name: String(tc.name) } };
+  }
+  if (typeof body.temperature === 'number') out.temperature = body.temperature;
+  if (typeof body.top_p === 'number') out.top_p = body.top_p;
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) out.stop = body.stop_sequences;
+  // thinking(budget_tokens) → reasoning_effort 粗映射；再由 translateBody 按 provider.reasoningEffortMap 归一
+  const th = body.thinking;
+  if (th && typeof th === 'object' && th.type !== 'disabled') {
+    const budget = Number(th.budget_tokens) || 0;
+    out.reasoning_effort = budget >= 16384 ? 'max' : budget >= 8192 ? 'high' : budget >= 2048 ? 'medium' : 'low';
+  }
+  return out;
+}
+
+/** Anthropic stop_reason 映射（OpenAI finish_reason → Anthropic） */
+function stopReasonFromFinish(finish) {
+  switch (String(finish || '').toLowerCase()) {
+    case 'tool_calls': case 'function_call': return 'tool_use';
+    case 'length': return 'max_tokens';
+    case 'content_filter': return 'refusal';
+    default: return 'end_turn';
+  }
+}
+
+/** 粗略 token 估算（上游不给 usage 时兜底：约 4 字符/token）——好过报 0 让客户端以为上下文为空 */
+const estimateTokens = (s) => Math.max(1, Math.ceil(String(s || '').length / 4));
+
+/** OpenAI 非流式响应 → Anthropic message */
+function openaiToAnthropicMessage(json, model, fallbackInTokens) {
+  const choice = (json && Array.isArray(json.choices) ? json.choices[0] : null) || {};
+  const msg = choice.message || {};
+  const content = [];
+  if (typeof msg.reasoning_content === 'string' && msg.reasoning_content) {
+    content.push({ type: 'thinking', thinking: msg.reasoning_content, signature: '' });
+  }
+  if (typeof msg.content === 'string' && msg.content) content.push({ type: 'text', text: msg.content });
+  for (const call of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
+    let input = {};
+    try { input = JSON.parse((call.function && call.function.arguments) || '{}'); } catch { input = {}; }
+    content.push({
+      type: 'tool_use',
+      id: String(call.id || 'call_' + Math.random().toString(36).slice(2, 10)),
+      name: String((call.function && call.function.name) || ''),
+      input,
+    });
+  }
+  const usage = json && json.usage ? json.usage : {};
+  const inTok = Number(usage.prompt_tokens) > 0 ? Number(usage.prompt_tokens) : (fallbackInTokens || 0);
+  const outTok = Number(usage.completion_tokens) > 0
+    ? Number(usage.completion_tokens)
+    : estimateTokens(content.map((c) => c.text || c.thinking || JSON.stringify(c.input || '')).join(''));
+  return {
+    id: (json && json.id) || ('msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24)),
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: content.length ? content : [{ type: 'text', text: '' }],
+    stop_reason: stopReasonFromFinish(choice.finish_reason),
+    stop_sequence: null,
+    usage: { input_tokens: inTok, output_tokens: outTok },
+  };
+}
+
+/** 写一个 Anthropic SSE 事件 */
+function sseWrite(res, type, payload) {
+  try {
+    res.write(`event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`);
+  } catch { /* 客户端已断开：由调用方的写失败检查兜住 */ }
+}
+
+/**
+ * OpenAI SSE → Anthropic SSE 流翻译。
+ * 逐块解析 `data: {...}`，把 delta.content / delta.reasoning_content / delta.tool_calls 映射成
+ * Anthropic 的 content_block_start/delta/stop 事件序列。
+ * @param {object} o { res, upstream, model, inputTokens, onDone }
+ * @returns {Promise<{ok:boolean, usage?:object, text?:string}>} 聚合结果（非流式客户端用它拼完整消息）
+ */
+async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTokens, aggregateOnly, headBytes }) {
+  const reader = upstream.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let started = false;
+  let blockIndex = -1;          // 当前打开的 content block 下标
+  let openKind = null;          // 'text' | 'thinking' | 'tool_use'
+  let finished = false;
+  let stopReason = 'end_turn';
+  let outText = '';
+  let outThinking = '';
+  const toolCalls = new Map();  // index → { id, name, args }
+  let usage = null;
+
+  const startBlock = (kind, block) => {
+    blockIndex++;
+    openKind = kind;
+    if (!aggregateOnly) {
+      sseWrite(res, 'content_block_start', { type: 'content_block_start', index: blockIndex, content_block: block });
+    }
+  };
+  const closeBlock = () => {
+    if (openKind === null) return;
+    if (!aggregateOnly) sseWrite(res, 'content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    openKind = null;
+  };
+  const ensureStart = () => {
+    if (started) return;
+    started = true;
+    if (!aggregateOnly) {
+      sseWrite(res, 'message_start', {
+        type: 'message_start',
+        message: {
+          id: 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24),
+          type: 'message', role: 'assistant', model,
+          content: [], stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: inputTokens || 0, output_tokens: 0 },
+        },
+      });
+    }
+  };
+
+  const handleChunk = (json) => {
+    ensureStart();
+    if (json && json.usage && (json.usage.prompt_tokens || json.usage.completion_tokens)) usage = json.usage;
+    const choice = (Array.isArray(json.choices) ? json.choices[0] : null) || {};
+    const delta = choice.delta || {};
+    if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+      if (openKind !== 'thinking') { closeBlock(); startBlock('thinking', { type: 'thinking', thinking: '' }); }
+      outThinking += delta.reasoning_content;
+      if (!aggregateOnly) {
+        sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'thinking_delta', thinking: delta.reasoning_content } });
+      }
+    }
+    if (typeof delta.content === 'string' && delta.content) {
+      if (openKind !== 'text') { closeBlock(); startBlock('text', { type: 'text', text: '' }); }
+      outText += delta.content;
+      if (!aggregateOnly) {
+        sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: delta.content } });
+      }
+    }
+    for (const call of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
+      const idx = Number.isInteger(call.index) ? call.index : 0;
+      let entry = toolCalls.get(idx);
+      if (!entry) {
+        // 关键（2026-09-16 真实事故回归）：**不要立刻开块**——很多上游先发 id、名字在后续分片才到；
+        // 若此时开块，客户端记录到的 tool_use 名字就是空串（pi-ai 只认 content_block_start 里的 name），
+        // 表现为 `unknown tool ""`，下一轮再把空名工具回传 → 上游 400 打死整轮。
+        // 现在：先缓冲 id/名字/参数，**拿到非空名字才开块**，并一次性补发已缓冲的参数分片。
+        entry = { id: call.id || ('call_' + Math.random().toString(36).slice(2, 10)), name: '', args: '', started: false, sent: 0 };
+        toolCalls.set(idx, entry);
+      }
+      if (call.id) entry.id = call.id;
+      if (call.function && typeof call.function.name === 'string' && call.function.name) entry.name = call.function.name;
+      const frag = (call.function && call.function.arguments) || '';
+      if (frag) entry.args += frag;
+      if (!entry.started && entry.name) {
+        closeBlock();
+        startBlock('tool_use', { type: 'tool_use', id: entry.id, name: entry.name, input: {} });
+        entry.started = true;
+        if (entry.args) {   // 名字到达前缓冲的参数分片在此一次性补发（不能丢）
+          if (!aggregateOnly) {
+            sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: entry.args } });
+          }
+          entry.sent = entry.args.length;
+        }
+      } else if (entry.started && entry.args.length > entry.sent) {
+        const chunkText = entry.args.slice(entry.sent);
+        entry.sent = entry.args.length;
+        if (!aggregateOnly) {
+          sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: chunkText } });
+        }
+      }
+    }
+    if (choice.finish_reason) { stopReason = stopReasonFromFinish(choice.finish_reason); finished = true; }
+  };
+
+  /** 流结束时仍未开块的工具调用（上游始终没给名字）：兜底开块并补发参数，绝不静默丢调用 */
+  const flushPendingToolCalls = () => {
+    for (const [idx, entry] of [...toolCalls.entries()].sort((a, b) => a[0] - b[0])) {
+      if (entry.started) continue;
+      if (!entry.name) log(`上游工具调用缺少 name（index=${idx}）→ 以空名透传（上游协议异常）`);
+      closeBlock();
+      startBlock('tool_use', { type: 'tool_use', id: entry.id, name: entry.name, input: {} });
+      entry.started = true;
+      if (entry.args && !aggregateOnly) {
+        sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: entry.args } });
+        entry.sent = entry.args.length;
+      }
+    }
+  };
+
+  let clientGone = false;
+  const onClose = () => { clientGone = true; try { reader.cancel(); } catch { /* 忽略 */ } };
+  try { res.once('close', onClose); } catch { /* 忽略 */ }
+  // 把"行切分 + data: 解析"抽成闭包：偷看过的首事件字节（headBytes）先喂进来，再读流
+  const feed = (text) => {
+    buf += text;
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).replace(/\r$/, '');
+      buf = buf.slice(nl + 1);
+      const m = /^data:\s*(.*)$/.exec(line);
+      if (!m) continue;
+      const payload = m[1].trim();
+      if (payload === '[DONE]') { finished = true; continue; }
+      try { handleChunk(JSON.parse(payload)); } catch { /* 非 JSON 心跳/注释：跳过 */ }
+    }
+  };
+  try {
+    if (headBytes && headBytes.length) feed(Buffer.from(headBytes).toString('utf8'));
+    for (;;) {
+      if (clientGone || res.destroyed || res.writableEnded) { try { await reader.cancel(); } catch { /* 忽略 */ } return { ok: false }; }
+      // eslint-disable-next-line no-await-in-loop
+      const { done, value } = await reader.read();
+      if (done) break;
+      feed(decoder.decode(value, { stream: true }));
+    }
+  } catch (e) {
+    log(`流翻译读取失败：${e && e.message}`);
+  } finally {
+    try { res.removeListener('close', onClose); } catch { /* 忽略 */ }
+    try { reader.releaseLock(); } catch { /* 忽略 */ }
+  }
+  if (clientGone) return { ok: false };
+
+  ensureStart();
+  flushPendingToolCalls();   // 兜底：名字始终没到的调用也要开块（流式会写事件；聚合只补数据），绝不静默丢调用
+  closeBlock();
+  const outTok = usage && Number(usage.completion_tokens) > 0
+    ? Number(usage.completion_tokens)
+    : estimateTokens(outText + outThinking + [...toolCalls.values()].map((t) => t.args).join(''));
+  if (!aggregateOnly) {
+    sseWrite(res, 'message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: toolCalls.size && stopReason === 'end_turn' ? 'tool_use' : stopReason, stop_sequence: null },
+      usage: { output_tokens: outTok },
+    });
+    sseWrite(res, 'message_stop', { type: 'message_stop' });
+    try { res.end(); } catch { /* 忽略 */ }
+  }
+  return {
+    ok: true,
+    usage: { input_tokens: (usage && Number(usage.prompt_tokens)) || inputTokens || 0, output_tokens: outTok },
+    stopReason: toolCalls.size && stopReason === 'end_turn' ? 'tool_use' : stopReason,
+    text: outText,
+    thinking: outThinking,
+    toolCalls: [...toolCalls.values()],
+    finished,
+  };
+}
+
+/**
+ * 把"Anthropic 协议的客户端请求"转发给"只支持 OpenAI chat 的上游"。
+ * 返回值与 forward() 契约一致：true / false / {stop:{status,upstreamStatus}}。
+ * 账户池：额度耗尽 / 会话失效 / 限流 → 换**同供应商的下一个账户**；全部不可用才交给下一家供应商。
+ */
+async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, res, opts) {
+  if (!breakerAcquire(provider.id)) {
+    log(`skip ${provider.id} (breaker: cooldown or half-open probe already in flight)`);
+    return false;
+  }
+  const quirks = providerQuirks(provider);
+  const wantsStream = !!body.stream;
+  const picked = pickAccount(provider);
+  if (picked.acct === null && picked.cooling > 0) {
+    log(`provider ${provider.id}: ${picked.cooling} 个账户全部冷却中 → 交给下一家`);
+    return false;
+  }
+  const attemptAccounts = picked.acct ? [picked.acct, ...picked.accounts.filter((a) => a !== picked.acct && accountUsable(provider.id, a))] : [null];
+  const upstreamPath = '/chat/completions';
+  let lastDetail = '';
+  let lastStatus = 0;
+
+  for (const acct of attemptAccounts) {
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), providerTimeoutMs(provider));
+    let headers;
+    try {
+      // 与直通路径共用同一套账户头构造（凭据 / 身份头 / Bearer / 自定义头，避免两处漂移）
+      headers = await accountUpstreamHeaders(provider, acct, upstreamBaseHeaders, { anthropicUpstream: false });
+    } catch (e) {
+      log(`provider ${provider.id} 凭据不可用（${acct ? acct.id : '-'}）：${e && e.message}`);
+      if (acct) { clearTimeout(timer); markAccountFailure(provider.id, acct, 'session', e && e.message); continue; }
+      clearTimeout(timer);
+      breakerRecordFail(provider.id, 401);
+      return false;
+    }
+
+    const openaiBody = anthropicToOpenAIRequest(body, provider);
+    if (quirks.has('force-stream')) openaiBody.stream = true;
+    else openaiBody.stream = wantsStream;
+    if (quirks.has('stringify-tool-choice') && openaiBody.tool_choice && typeof openaiBody.tool_choice === 'object') {
+      openaiBody.tool_choice = (openaiBody.tool_choice.function && openaiBody.tool_choice.function.name) || 'auto';
+    }
+    if (quirks.has('prepend-system') && Array.isArray(openaiBody.messages)
+      && !(openaiBody.messages[0] && openaiBody.messages[0].role === 'system')) {
+      openaiBody.messages.unshift({ role: 'system', content: 'You are a helpful assistant.' });
+    }
+    // 复用 OpenAI 路径的角色/推理档位归一（developer→system、reasoning_effort 按家映射）
+    const finalBody = translateBody(openaiBody, provider);
+
+    let upstream = null;
+    try {
+      upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
+        method: 'POST', headers, body: JSON.stringify(finalBody), signal: controller.signal,
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      const causeText = describeFetchError(e);
+      const elapsed = Date.now() - startedAt;
+      if (isTransientNetError(e) && elapsed < NET_RETRY_MAX_ELAPSED_MS) {
+        log(`upstream ${provider.id} 网络错误（${causeText}，${elapsed}ms）→ 原地重试一次`);
+        const c2 = new AbortController();
+        const t2 = setTimeout(() => c2.abort(), providerTimeoutMs(provider));
+        try {
+          upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
+            method: 'POST', headers, body: JSON.stringify(finalBody), signal: c2.signal,
+          });
+        } catch (e2) {
+          log(`upstream ${provider.id} 重试仍失败：${describeFetchError(e2)}`);
+        } finally { clearTimeout(t2); }
+      }
+      if (!upstream) {
+        log(`upstream ${provider.id} request error: ${e.message}${causeText ? ' (' + causeText + ')' : ''}`);
+        catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+        breakerRecordFail(provider.id, 0);
+        return false;
+      }
+    }
+    clearTimeout(timer);
+
+    if (!upstream.ok) {
+      lastStatus = upstream.status;
+      lastDetail = await readTextWithTimeout(upstream, 5000, 500);
+      log(`upstream ${provider.id} HTTP ${upstream.status}: ${maskSecrets(lastDetail)}`);
+      const acctKind = acct ? classifyAccountFailure(upstream.status, lastDetail) : null;
+      if (acctKind) {
+        markAccountFailure(provider.id, acct, acctKind, lastDetail);
+        continue;   // 换下一个账户（此时尚未向客户端写任何字节）
+      }
+      if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429 || upstream.status >= 500) {
+        catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+        breakerRecordFail(provider.id, upstream.status);
+        return false;
+      }
+      breakerRecordSuccess(provider.id);
+      if (PROVIDER_SIDE_4XX_RE.test(lastDetail)) {
+        catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+        breakerRecordFail(provider.id, PERSISTENT_ACCOUNT_RE.test(lastDetail) ? 403 : 0);
+        return false;
+      }
+      const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
+      log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 终止 failover（回 ${status}，不回显上游原文）`);
+      return { stop: { status, upstreamStatus: upstream.status } };
+    }
+
+    // 成功：OpenAI 响应 → Anthropic
+    if (acct) markAccountOk(provider.id, acct);
+    breakerRecordSuccess(provider.id);
+    const ctype = String(upstream.headers.get('content-type') || '');
+    const inputTokens = estimateTokens(JSON.stringify(finalBody.messages || []));
+    try {
+      if (/event-stream/i.test(ctype)) {
+        // —— SSE「首事件就是 error」识别（2026-09-16，与 forward() 同规则）——
+        // 实测部分上游/中转对失败请求回 HTTP 200 + text/event-stream，流里第一件事就是
+        // `data: {"error":…}`（chiyi-ds 形态）。若不识别就按成功往客户端写头，客户端会拿到
+        // 一条**空回复**而不是"换下一家"。这里在写响应头之前偷看首个事件：是错误就当作该家失败，
+        // 依账户池/供应商顺序继续；此时尚未向客户端写任何字节，failover 是安全的。
+        let headBytes = null;
+        try {
+          const peekReader = upstream.body.getReader();
+          const chunks = [];
+          let total = 0;
+          while (total < 8192) {
+            // eslint-disable-next-line no-await-in-loop
+            const { done, value } = await peekReader.read();
+            if (done) break;
+            const buf = Buffer.from(value);
+            chunks.push(buf);
+            total += buf.length;
+            if (/\n\n|\r\n\r\n/.test(Buffer.concat(chunks).toString('utf8'))) break;
+          }
+          headBytes = Buffer.concat(chunks);
+          const head = headBytes.toString('utf8');
+          const looksError = /"error"\s*:/.test(head) && !/"choices"\s*:/.test(head);
+          if (looksError) {
+            const detail = head.replace(/\s+/g, ' ').slice(0, 200);
+            log(`upstream ${provider.id} HTTP 200 但 SSE 首事件是错误 → 判定该家失败并换下一家：${maskSecrets(detail)}`);
+            const kind = acct ? classifyAccountFailure(200, detail) || classifyAccountFailure(402, detail) : null;
+            if (acct && kind) { markAccountFailure(provider.id, acct, kind, detail); }
+            catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+            breakerRecordFail(provider.id, 0);
+            try { await peekReader.cancel(); } catch { /* 忽略 */ }
+            return false;   // 未写任何字节 → 交给账户池/下一家供应商
+          }
+          peekReader.releaseLock();
+        } catch (peekErr) {
+          log(`上游首事件偷看失败（按正常流继续）：${peekErr && peekErr.message}`);
+          headBytes = null;
+        }
+        if (wantsStream && !opts?.aggregateOnly) {
+          res.writeHead(200, {
+            'content-type': 'text/event-stream; charset=utf-8',
+            'cache-control': 'no-cache',
+            'access-control-allow-origin': '*',
+          });
+          const r = await translateOpenAIStreamToAnthropic({ res, upstream, model: body.model, inputTokens, aggregateOnly: false, headBytes });
+          return r.ok ? true : false;
+        }
+        // 客户端要非流式（或下游是 Responses 聚合）：把流收完再回一条完整 message
+        const agg = await translateOpenAIStreamToAnthropic({ res, upstream, model: body.model, inputTokens, aggregateOnly: true, headBytes });
+        if (!agg.ok) return false;
+        const content = [];
+        if (agg.thinking) content.push({ type: 'thinking', thinking: agg.thinking, signature: '' });
+        if (agg.text) content.push({ type: 'text', text: agg.text });
+        for (const t of agg.toolCalls || []) {
+          let input = {};
+          try { input = JSON.parse(t.args || '{}'); } catch { input = {}; }
+          content.push({ type: 'tool_use', id: t.id, name: t.name, input });
+        }
+        json(res, 200, {
+          id: 'msg_' + crypto.randomUUID().replace(/-/g, '').slice(0, 24),
+          type: 'message', role: 'assistant', model: body.model,
+          content: content.length ? content : [{ type: 'text', text: '' }],
+          stop_reason: agg.stopReason, stop_sequence: null,
+          usage: agg.usage,
+        });
+        return true;
+      }
+      const text = await readTextWithTimeout(upstream, 30_000, 4 * 1024 * 1024);
+      let parsed = null;
+      try { parsed = JSON.parse(text); } catch { /* 非 JSON：按失败处理 */ }
+      if (!parsed) {
+        log(`upstream ${provider.id} 非 JSON 响应（anthropic→openai 翻译路径）`);
+        return false;
+      }
+      json(res, 200, openaiToAnthropicMessage(parsed, body.model, inputTokens));
+      return true;
+    } catch (e) {
+      log(`anthropic→openai 响应翻译失败：${e && e.message}`);
+      if (!res.headersSent) return false;
+      try { res.destroy(); } catch { /* 忽略 */ }
+      return false;
+    }
+  }
+  // 所有账户都不行：把最后一次的失败按供应商级处理
+  log(`provider ${provider.id} 全部账户不可用（最后 HTTP ${lastStatus}）：${maskSecrets(lastDetail).slice(0, 160)}`);
+  if (lastStatus === 401 || lastStatus === 403 || lastStatus === 429 || lastStatus >= 500) {
+    catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+    breakerRecordFail(provider.id, lastStatus);
+  }
+  return false;
 }
 
 // 诊断 dump（R8）：env DSH_GATEWAY_DUMP_BODY=<dir> 时，把每个 chat/messages 请求的
@@ -1439,7 +3032,17 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
   const catalogResults = await Promise.all(candidates.map((p) => (needsCatalog(p)
     ? fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)
     : null)));
-  const { eligible, reasons, tierSizes } = selectCandidates(candidates, catalogResults, model);
+  let { eligible, reasons, tierSizes } = selectCandidates(candidates, catalogResults, model);
+  // 多模态（2026-09-16）：请求里带图片时，只保留声明了图片能力的候选
+  //（否则会被路由到纯文本家，上游报错或图片被忽略）
+  if (bodyHasImage(body)) {
+    const vf = filterVisionCandidates(eligible, reasons, model);
+    if (vf.dropped > 0) {
+      log(`[route] ${model}: 请求含图片 → 跳过未声明图片能力的 ${vf.dropped} 家`);
+      eligible = vf.eligible;
+      reasons = vf.reasons;
+    }
+  }
   const reasonsText = routeReasonsText(reasons);
   // 选路决策日志（2026-09-15 加）：**每次请求都记**——"为什么发给了这家"必须能在日志里
   // 直接看到（此前只在失败时才记原因，用户遇到"该走 A 却走了 B"时无从判断）。
@@ -1519,16 +3122,16 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
         return true;
       },
     } : undefined;
-    const out = await forward(p, upstreamPath.replace(/^\/v1/, '') + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, cfg.clientProfile), attemptBody, res, fwdOpts);
+    const out = await forwardWithAccounts(p, upstreamPath.replace(/^\/v1/, '') + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, cfg.clientProfile), attemptBody, res, fwdOpts);
     if (out === true) {
-      log(`served ${model} via ${p.id}`);
-      logCall(`via=${p.id}`, 'ok');
+      log(`served ${model} via ${viaTag(p.id)}`);
+      logCall(`via=${viaTag(p.id)}`, 'ok');
       return;
     }
     // 审计修复（P1，本次）：确定性 4xx → 立即终止 failover，按映射后的状态码回复客户端
     if (out && out.stop) {
       log(`failover stopped (${model} via ${p.id} HTTP ${out.stop.upstreamStatus} → ${out.stop.status})`);
-      logCall(`via=${p.id}`, 'fail:' + out.stop.status);
+      logCall(`via=${viaTag(p.id)}`, 'fail:' + out.stop.status);
       return json(res, out.stop.status, { error: { message: stopFailoverMessage(p.id, model, out.stop.upstreamStatus) } });
     }
     // R25（审计修复）：响应头已发出（流中途失败/客户端断开）→ failover 无意义，
@@ -1582,10 +3185,8 @@ async function handleResponsesResource(cfg, req, res, url, tail) {
   }
 
   const readOnly = method === 'GET';
-  // 候选供应商：与模型路由一致按 priority 排序（priority 缺省 99）
-  const enabled = (cfg.providers || [])
-    .filter((p) => p && p.enabled !== false)
-    .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99));
+  // 候选供应商：与模型路由一致，按**配置数组顺序**（列表顺序即选路顺序；priority 不参与排序）
+  const enabled = (cfg.providers || []).filter((p) => p && p.enabled !== false);
   let targets = null;
   const owner = affinityGet(id);
   if (owner) {
@@ -1730,7 +3331,16 @@ async function handleMessages(cfg, req, res, body) {
   const catalogResults = await Promise.all(candidates.map((p) => (needsCatalog(p)
     ? fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)
     : null)));
-  const { eligible, reasons, tierSizes } = selectCandidates(candidates, catalogResults, model);
+  let { eligible, reasons, tierSizes } = selectCandidates(candidates, catalogResults, model);
+  // 多模态（2026-09-16）：请求里带图片时，只保留声明了图片能力的候选
+  if (bodyHasImage(body)) {
+    const vf = filterVisionCandidates(eligible, reasons, model);
+    if (vf.dropped > 0) {
+      log(`[route] ${model}: 请求含图片 → 跳过未声明图片能力的 ${vf.dropped} 家`);
+      eligible = vf.eligible;
+      reasons = vf.reasons;
+    }
+  }
   const reasonsText = routeReasonsText(reasons);
   // 选路决策日志（2026-09-15 加）：**每次请求都记**——"为什么发给了这家"必须能在日志里
   // 直接看到（此前只在失败时才记原因，用户遇到"该走 A 却走了 B"时无从判断）。
@@ -1777,18 +3387,23 @@ async function handleMessages(cfg, req, res, body) {
     // 模型映射：逻辑名 → 该供应商的上游真实 ID（Anthropic 路径同样处理）
     const attemptBody = bodyForProvider(outBody, p, model);
     const upModel = attemptBody.model;
-    log(`try ${p.id} for ${model} (anthropic)${upModel !== model ? ' → ' + upModel : ''}`);
-    const out = await forward(p, '/messages', upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, true, cfg.clientProfile), attemptBody, res);
+    // 上游线协议：声明 openai-chat 的家走协议翻译（客户端说 Anthropic，上游只会 OpenAI）
+    const toOpenAI = providerProtocol(p) === 'openai-chat';
+    log(`try ${p.id} for ${model} (${toOpenAI ? 'anthropic→openai' : 'anthropic'})${upModel !== model ? ' → ' + upModel : ''}`);
+    const baseHeaders = upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, !toOpenAI, cfg.clientProfile);
+    const out = toOpenAI
+      ? await forwardAnthropicViaOpenAI(p, baseHeaders, attemptBody, res, undefined)
+      : await forwardWithAccounts(p, '/messages', baseHeaders, attemptBody, res);
     if (out === true) {
-      log(`served ${model} via ${p.id} (anthropic)`);
-      logCall(`via=${p.id}`, 'ok');
+      log(`served ${model} via ${viaTag(p.id)} (anthropic)`);
+      logCall(`via=${viaTag(p.id)}`, 'ok');
       return;
     }
     // 审计修复（P1，本次）：确定性 4xx → 立即终止 failover，按映射后的状态码回复客户端
     //（Anthropic 错误体形状：{type:'error',error:{type,message}}；不回显上游原文）
     if (out && out.stop) {
       log(`failover stopped (${model} via ${p.id} HTTP ${out.stop.upstreamStatus} → ${out.stop.status}, anthropic)`);
-      logCall(`via=${p.id}`, 'fail:' + out.stop.status);
+      logCall(`via=${viaTag(p.id)}`, 'fail:' + out.stop.status);
       return json(res, out.stop.status, { type: 'error', error: {
         type: 'invalid_request_error',
         message: stopFailoverMessage(p.id, model, out.stop.upstreamStatus),
@@ -1829,6 +3444,8 @@ async function handleModels(cfg, req, res) {
     const alias = new Map(modelEntries(p).map((e) => [e.up, e.as]));
     for (const id of entry.models) push(alias.get(id) || id, p.id);
   }
+  // 2026-09-16：按模型名排序输出（选择器/客户端列表不再杂乱无章；此前是"供应商配置顺序+去重"）
+  rows.sort((a, b) => String(a.id).localeCompare(String(b.id), 'en', { numeric: true, sensitivity: 'base' }));
   json(res, 200, { object: 'list', data: rows });
 }
 
@@ -1844,9 +3461,10 @@ function trimSlash(u) { return u.replace(/\/+$/, ''); }
 function upstreamBase(baseURL) {
   let b = trimSlash(String(baseURL || ''));
   if (!b) return b;
-  // 若以 /v1 结尾（或已是 /v1/xxx 形式）→ 收敛；否则补 /v1
-  const m = b.match(/\/v1(?:\/.*)?$/i);
-  if (m) return b.slice(0, b.length - m[0].length + 3); // 保留 /v1 前缀
+  // 2026-09-16：泛化到任意 /vN —— WorkBuddy 的接口在 /v2（旧实现只认 /v1，会拼成 /v1/chat/completions）。
+  // 带版本号（/v1、/v2…）→ 收敛到该版本；不带 → 补 /v1（OpenAI SDK 惯例，保持旧行为）。
+  const m = b.match(/\/(v\d+)(?:\/.*)?$/i);
+  if (m) return b.slice(0, b.length - m[0].length + m[1].length + 1);
   return b + '/v1';
 }
 
@@ -1922,7 +3540,12 @@ async function routeRequest(cfg, req, res) {
       return;
     }
     const p = url.pathname;
-    if (p === '/health') { json(res, 200, { ok: true }); return; }
+    if (p === '/health') {
+      // 账户池可见性（2026-09-16）：WorkBuddy 这类按账户计费/限流的供应商，出问题时必须能
+      // 一眼看出"哪个账户在冷却、为什么"。无账户池时该字段为空数组，不影响旧客户端解析。
+      json(res, 200, { ok: true, accounts: accountPoolSnapshot(cfg) });
+      return;
+    }
 
     if (p.startsWith('/v1/')) {
       const anthropicRoute = (p === '/v1/messages');
@@ -2108,7 +3731,7 @@ function writeDshConfig(args) {
     if (p.enabled === false) continue;
     for (const as of logicalModelNames(p)) if (!modelMap.has(as)) modelMap.set(as, as);
   }
-  const models = [...modelMap.values()];
+  const models = [...modelMap.values()].sort((a, b) => String(a).localeCompare(String(b), 'en', { numeric: true, sensitivity: 'base' }));
   if (models.length === 0) {
     console.error('[write-dsh] no models in gateway config providers');
     process.exit(1);
@@ -2122,8 +3745,48 @@ function writeDshConfig(args) {
   // R12：模型条目统一声明 reasoningEfforts（否则 pi-ai 回退已安装目录能力——
   // glm-5.3 等无 max 档会报 "does not support reasoning effort max"）。
   // off=null（不发字段）、其余档位 wire 值同档名；声明后选择器提供全部档位。
+  // 2026-09-16 实测修复（air-outer / agentrouter 的 thinking 回传 400）：
+  // 上游对"带 tool_use 的 assistant 轮"要求必须回传 thinking 块。pi-ai 在 thinking **无签名**
+  // 时（上游不回 signature_delta，或流被中断）默认把该块降级成普通 text，于是下一轮请求里
+  // 只剩 text+tool_use → 上游 400「content[].thinking ... must be passed back」。
+  // compat.allowEmptySignature: true 让 pi-ai 保留为 thinking 块（签名为空），实测上游接受。
+  // 该字段由 dsh-llm-pi-ai 的 COMPAT_GATES["anthropic-messages"] 门控为 "offer"（本版本支持）。
+  const compatLines = wireApi === 'anthropic-messages'
+    ? `\n          compat:\n            allowEmptySignature: true`
+    : '';
+  // 2026-09-16 用户反馈修复（图片输入被拦）：harness 按模型条目的 input 判断能否收图，
+  // 未声明即按纯文本处理 → 附件入口直接提示"当前模型不支持图片，请切换支持图片的模型"。
+  // 这里对**任一启用供应商声明了图片能力（vision: true / input: ['text','image']）**的逻辑模型
+  // 写出 input: [text, image]；其余不写（保持纯文本，避免"声称能收图但上游不支持"）。
+  const inputLines = (m) => (logicalModelSupportsVision(cfg, m)
+    ? `\n          input:\n            - text\n            - image`
+    : '');
+  // 2026-09-16：模型条目可显式声明 contextWindow / maxTokens —— 各家上游实际窗口差异很大
+  //（WorkBuddy 实测：hy3 192K、minimax-m3 512K、glm-5.3 1M…）。对全部模型统一写 1M 属于**虚报**，
+  // 会让 dsh 以为还能塞很多 → 长对话在上游直接报上下文超限。取该逻辑模型在所有启用供应商里的
+  // **最小值**（保守：任一家装不下就按装不下的算），没声明才退回默认。
+  const modelLimits = (() => {
+    const ctx = new Map();
+    const out = new Map();
+    for (const p of cfg.providers || []) {
+      if (!p || p.enabled === false) continue;
+      for (const e of modelEntries(p)) {
+        const c = Number(e.contextWindow) > 0 ? Number(e.contextWindow) : 0;
+        const o = Number(e.maxTokens) > 0 ? Number(e.maxTokens) : 0;
+        if (c) ctx.set(e.as, ctx.has(e.as) ? Math.min(ctx.get(e.as), c) : c);
+        if (o) out.set(e.as, out.has(e.as) ? Math.min(out.get(e.as), o) : o);
+      }
+    }
+    return { ctx, out };
+  })();
   const modelLines = models
-    .map((m) => `        - id: ${yamlQuote(m)}\n          name: ${yamlQuote(m)}\n          contextWindow: 1024000\n          reasoningEfforts:\n            off: null\n            low: low\n            medium: medium\n            high: high\n            max: max`)
+    .map((m) => {
+      const ctxWin = modelLimits.ctx.get(m) || 1024000;
+      const maxTok = modelLimits.out.get(m);
+      return `        - id: ${yamlQuote(m)}\n          name: ${yamlQuote(m)}\n          contextWindow: ${ctxWin}`
+        + (maxTok ? `\n          maxTokens: ${maxTok}` : '')
+        + `\n          reasoningEfforts:\n            off: null\n            low: low\n            medium: medium\n            high: high\n            max: max${inputLines(m)}${compatLines}`;
+    })
     .join('\n');
   const block =
 `    gateway:
