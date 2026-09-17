@@ -161,7 +161,7 @@ function validateConfigText(text) {
         }
       }
       if (p.quirks !== undefined) {
-        const known = ['force-stream', 'stringify-tool-choice', 'prepend-system'];
+        const known = ['force-stream', 'stringify-tool-choice', 'prepend-system', 'drop-thinking'];
         const list = Array.isArray(p.quirks) ? p.quirks : (typeof p.quirks === 'string' ? p.quirks.split(',') : null);
         if (!list) return { ok: false, error: who + ' 的 quirks 必须是数组或逗号分隔字符串' };
         for (const q of list) {
