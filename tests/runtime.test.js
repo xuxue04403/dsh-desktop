@@ -292,10 +292,39 @@ t('gateway：computeNoProxy 按供应商 proxy:false + 全局 proxy.noProxy 生�
   assert.ok(out.includes('token.sensenova.cn'), '全局 proxy.noProxy 里的 URL 应取 hostname：' + out);
   assert.ok(!out.includes('x666.me'), '未设 proxy:false 的家不得直连（保持走代理）：' + out);
   assert.ok(!out.includes('off.example.org'), 'disabled 供应商不得加入：' + out);
-  // 清空 proxy 块时 computeNoProxy 应为空
+  // v1.8.2：回环**永远**直连 + 国内端点默认直连（事故修复，见下一条用例）
+  assert.ok(out.includes('127.0.0.1') && out.includes('localhost'), '回环必须永远直连：' + out);
+  assert.ok(out.includes('copilot.tencent.com') && out.includes('workbuddy.cn'), 'WorkBuddy 国内端点默认直连：' + out);
+  // 清空 proxy 块：仍须保留回环直连（旧实现返回 '' → 回环被塞进代理 → 自检自杀）
   const cfg2 = { port: 3091, apiKey: 'k', providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk-1', models: ['m'], priority: 1, enabled: true }] };
   fs.writeFileSync(path.join(dir, 'gateway.config.json'), JSON.stringify(cfg2), 'utf8');
-  assert.strictEqual(gm.computeNoProxy(), '', '无 proxy 配置时不得输出 NO_PROXY');
+  const bare = gm.computeNoProxy();
+  assert.ok(/127\.0\.0\.1/.test(bare) && /localhost/.test(bare), '无 proxy 配置也必须保住回环直连：' + bare);
+});
+
+t('gateway：NO_PROXY 加固（v1.8.2 事故）——回环恒直连、forceProxy 可剔国内端点但剔不掉回环', () => {
+  const dir = fs.mkdtempSync(path.join(tmpRoot, 'nop2-'));
+  const gm = new GatewayManager({
+    userDataDir: dir, nodePath: 'node', settings: { data: {} }, logger: noopLog,
+  });
+  gm.init();
+  const cfg = {
+    port: 3091, apiKey: 'k',
+    proxy: {
+      enabled: true, url: 'http://127.0.0.1:7890',
+      // 用户明确要求 workbuddy 走端口代理（例如海外网络直连不通）
+      forceProxy: ['copilot.tencent.com'],
+    },
+    providers: [{ id: 'workbuddy', baseURL: 'https://copilot.tencent.com/v2', apiKey: 'sk-1', models: ['m'], priority: 1, enabled: true }],
+  };
+  fs.writeFileSync(path.join(dir, 'gateway.config.json'), JSON.stringify(cfg), 'utf8');
+  const out = gm.computeNoProxy();
+  assert.ok(!out.includes('copilot.tencent.com'), 'forceProxy 应能剔除默认直连的国内端点：' + out);
+  assert.ok(out.includes('127.0.0.1'), 'forceProxy 不得剔掉回环（本机自检绝不允许被代理）：' + out);
+  // 配置非法（JSON 坏）时也必须返回回环清单，不能返回空串
+  fs.writeFileSync(path.join(dir, 'gateway.config.json'), '{ 坏 JSON', 'utf8');
+  const bad = gm.computeNoProxy();
+  assert.ok(/127\.0\.0\.1/.test(bad), '配置解析失败时仍须保住回环直连：' + JSON.stringify(bad));
 });
 
 // ================= 5. 主进程接线与 IPC 来源守卫 =================
@@ -689,6 +718,97 @@ t('网关：配置校验覆盖 WorkBuddy 新字段（protocol/quirks/headers/acc
   assert.strictEqual(check({ auth: 'workbuddy', accounts: [{ id: 'a1' }, { id: 'a2', authFile: 'C:/x.info' }] }).ok, true,
     '免路径与显式路径可混用');
   assert.strictEqual(check({ auth: 'whatever' }).ok, false, '未知 auth 应被拒');
+  // 2026-09-17 新增：同一供应商多把 Key（设置页「多 Key」→ apiKeys）。校验必须放行，
+  // 否则保存被误拒（同类事故：workbuddy 免路径条目曾被误拒）。
+  assert.strictEqual(check({ apiKeys: ['sk-a', 'sk-b'] }).ok, true, 'apiKeys 字符串数组应合法');
+  assert.strictEqual(check({ apiKeys: 'sk-a, sk-b' }).ok, true, 'apiKeys 逗号分隔字符串也接受（运行期会切分）');
+  assert.strictEqual(check({ apiKeys: ['sk-a', 123] }).ok, false, 'apiKeys 含非字符串应被拒');
+  assert.strictEqual(check({ apiKeys: { k: 1 } }).ok, false, 'apiKeys 非数组/字符串应被拒');
+});
+
+t('renderer：设置页左侧分区导航（快速定位 + 滚动高亮，2026-09-17）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
+
+  // ① 导航项与分区 id 一一对应（顺序即页面顺序）
+  const anchors = [...html.matchAll(/class="nav-item" href="#([a-z-]+)"/g)].map((m) => m[1]);
+  assert.deepStrictEqual(anchors, ['card-service', 'card-window', 'card-gateway', 'card-market', 'card-diag'],
+    '导航项应为 服务/窗口/模型网关/插件市场/更新与诊断，实际 ' + JSON.stringify(anchors));
+  for (const id of anchors) assert.ok(html.includes('id="' + id + '"'), '分区容器必须存在：' + id);
+
+  // ② 每个配置块都必须带 id —— 否则新增区块时导航会漏（这条断言就是防漏的）
+  const cards = [...html.matchAll(/<div class="card"([^>]*)>\s*<h2>([^<]+)<\/h2>/g)];
+  assert.strictEqual(cards.length, 5, '应有 5 个配置块，实际 ' + cards.length);
+  for (const m of cards) {
+    assert.ok(/id="card-[a-z-]+"/.test(m[1]), '配置块「' + m[2] + '」必须带 id="card-…"（供左侧导航定位）');
+  }
+
+  // ③ 布局包裹与闭合顺序（内容区必须在 <script> 之前闭合）
+  assert.ok(/<div class="layout">[\s\S]{0,400}<nav class="sidenav"/.test(html), '应有 .layout 两列布局与 .sidenav');
+  assert.ok(/<main class="content">/.test(html), '应有用例内容区 <main class="content">');
+  assert.ok(/<\/main>\s*<\/div>\s*<script>/.test(html), '内容区必须在 <script> 之前闭合');
+
+  // ④ 样式与交互（二稿：宽度自适应内容 + 字号加大，与右侧表单同体量）
+  assert.ok(/\.sidenav\s*\{[^}]*position:\s*sticky/.test(html), '左侧导航应 sticky 固定');
+  assert.ok(/\.sidenav\s*\{[^}]*min-width:\s*1\d\dpx/.test(html), '导航宽度应自适应内容（min-width 而非定宽 150px）');
+  assert.ok(/\.nav-item\s*\{[^}]*font-size:\s*14/.test(html), '导航字号应与表单同体量（≥14px，首版 13px 被反馈"不搭"）');
+  assert.ok(/\.nav-item\.active\s*\{/.test(html), '应有当前分区高亮样式');
+  assert.ok(/scroll-behavior:\s*smooth/.test(html), '应有平滑滚动');
+  assert.ok(/function initSideNav/.test(html), '应有导航初始化函数');
+  assert.ok(/scrollIntoView\(\{ behavior: 'smooth', block: 'start' \}\)/.test(html), '点击导航项应平滑滚动到分区');
+  assert.ok(/addEventListener\('scroll', spy/.test(html), '应监听滚动更新高亮');
+  assert.ok(/offsetParent !== null/.test(html), '隐藏的分区不得参与高亮判定（否则 rect.top 恒 0）');
+  assert.ok(/@media \(max-width: 820px\)[\s\S]{0,300}\.sidenav\s*\{[^}]*position:\s*static/.test(html),
+    '窄窗口/大缩放应退化为横向药丸标签条（不遮挡内容）');
+  assert.ok(/border-radius:\s*999px/.test(html), '窄窗口下导航项应为药丸形态');
+});
+
+t('renderer：供应商「API Key」合一框（每行一把）与明文开关（2026-09-17 二稿）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
+
+  // ① 控件形态：不再有独立的单 Key password 输入框（用户反馈：支持多 Key 后它没存在意义）；
+  //    一个 textarea 吃下所有 Key（第 1 行 = 主 Key），配 👁 明文开关；统一 Key 也有 👁。
+  assert.ok(!/id="eKey"/.test(html), '旧的单 Key 输入框 #eKey 应已移除（合一到 #eKeys）');
+  assert.ok(/<textarea id="eKeys"[^>]*class="keys masked"/.test(html), 'API Key 应是掩码 textarea（每行一把）');
+  assert.ok(/id="eKeysEye"/.test(html), 'API Key 应有明文开关按钮');
+  assert.ok(/id="gwApiKeyEye"/.test(html), '统一 Key 也应有明文开关');
+  assert.ok(!/id="eKeyEye"/.test(html), '旧 #eKeyEye 绑定应已移除');
+  assert.ok(/-webkit-text-security:\s*disc/.test(html), 'textarea 掩码样式必须存在');
+  assert.ok(/bindEyeToggle\('eKeysEye', 'eKeys'\)/.test(html), '明文开关必须绑定到 API Key 框');
+  // textarea 必须吃暗色样式（用户截图反馈：此前渲染成系统白底）
+  assert.ok(/\.row input\[type=text\],\s*\.row textarea\s*\{/.test(html), '.row textarea 必须与 text 输入共用暗色样式');
+
+  // ② 序列化语义：每行一把、原顺序保留；≥2 把写 apiKeys，1 把删除该字段（真跑页面函数）
+  const grab = (name) => {
+    const start = html.indexOf('function ' + name + '(');
+    assert.ok(start >= 0, '未找到函数 ' + name);
+    let depth = 0;
+    for (let i = html.indexOf('{', start); i < html.length; i++) {
+      if (html[i] === '{') depth++;
+      else if (html[i] === '}') { depth--; if (depth === 0) return html.slice(start, i + 1); }
+    }
+    throw new Error('未闭合：' + name);
+  };
+  const vm = require('vm');
+  const ctx = {};
+  vm.createContext(ctx);
+  vm.runInContext(grab('gwMergeKeys') + '\n' + grab('gwKeysText')
+    + '\n__m = gwMergeKeys; __t = gwKeysText;', ctx);
+  const J = (v) => JSON.stringify(v);
+  assert.strictEqual(J(ctx.__m('sk-1\nsk-2\nsk-3')), J(['sk-1', 'sk-2', 'sk-3']), '每行一把，原顺序保留');
+  assert.strictEqual(J(ctx.__m('sk-1,sk-2 ; sk-3')), J(['sk-1', 'sk-2', 'sk-3']), '逗号/分号/空白分隔');
+  assert.strictEqual(J(ctx.__m('sk-1\nsk-1\nsk-2')), J(['sk-1', 'sk-2']), '重复 Key 去重');
+  assert.strictEqual(J(ctx.__m('\n\n')), J([]), '全空 → 空数组（清空 apiKey）');
+  // 回填：主 Key 永远第 1 行（即便 apiKeys 里顺序不同），其余按 apiKeys 顺序
+  assert.strictEqual(ctx.__t({ apiKey: 'sk-1', apiKeys: ['sk-1', 'sk-2', 'sk-3'] }), 'sk-1\nsk-2\nsk-3', '回填：主 Key 第 1 行');
+  assert.strictEqual(ctx.__t({ apiKey: 'sk-1', apiKeys: ['sk-2', 'sk-1'] }), 'sk-1\nsk-2', '回填：主 Key 提前且去重');
+  assert.strictEqual(ctx.__t({ apiKey: 'sk-only' }), 'sk-only', '回填：只有主 Key');
+  assert.strictEqual(ctx.__t({}), '', '回填：无 Key → 空串');
+  assert.ok(/if \(all\.length > 1\) p\.apiKeys = all; else delete p\.apiKeys;/.test(html),
+    'gwApplyEditor：≥2 把写 apiKeys，1 把清除该字段');
+  assert.ok(/const all = gwMergeKeys\(\$\('eKeys'\)\.value\)/.test(html),
+    'gwApplyEditor 必须从合一框读取全部 Key');
+  assert.ok(/\$\('eKeys'\)\.value = gwKeysText\(p\)/.test(html), 'gwOpenEditor 必须用 gwKeysText 回填');
+  assert.ok(/多 Key ' \+ p\.apiKeys\.length/.test(html), '高级摘要应显示多 Key 数量');
 });
 
 t('renderer：供应商编辑不丢高级字段（protocol/auth/accounts），并在界面显示摘要', () => {
@@ -696,8 +816,12 @@ t('renderer：供应商编辑不丢高级字段（protocol/auth/accounts），�
   // ① 就地修改已有对象 —— 否则保存后 protocol/auth/accounts/quirks/headers 会被静默抹掉
   assert.ok(/const p = gwCfg\.providers\[gwSel\] \|\| \(gwCfg\.providers\[gwSel\] = \{\}\)/.test(html),
     'gwApplyEditor 必须就地修改已有供应商对象（不能整体替换，否则丢高级字段）');
-  const applySeg = html.slice(html.indexOf('function gwApplyEditor()'), html.indexOf('function gwApplyEditor()') + 900);
-  assert.ok(!/delete p\./.test(applySeg), 'gwApplyEditor 不得删除供应商的其它字段：\n' + applySeg);
+  const applySeg = html.slice(html.indexOf('function gwApplyEditor()'), html.indexOf('function gwApplyEditor()') + 1400);
+  // 唯一允许删的是编辑器**自己拥有**的 apiKeys（多 Key 降到 1 把时必须清掉，否则旧 Key 会残留继续轮换）；
+  // protocol/auth/accounts/quirks/headers 等高级字段一律不得删（历史事故：保存后被静默抹掉）。
+  assert.ok(!/delete p\.(?!apiKeys\b)/.test(applySeg), 'gwApplyEditor 不得删除供应商的其它字段：\n' + applySeg);
+  assert.ok(/if \(all\.length > 1\) p\.apiKeys = all; else delete p\.apiKeys;/.test(applySeg),
+    '多 Key 序列化：≥2 把写 apiKeys，1 把时清空该字段');
   // ② 高级能力摘要必须在编辑器里可见（否则用户困惑"为什么不走我的 Key / 为什么有账户池"）
   assert.ok(/id="gwAdv"/.test(html), '编辑器应有 #gwAdv 高级摘要容器');
   for (const kw of ['协议=', '凭据=', '账户池 ', 'quirks=', '自定义头 ']) {
@@ -1291,11 +1415,20 @@ t('renderer：供应商 ▲▼ 只改先后顺序、不改优先级字段（2026
   // ② 2026-09-16 用户要求：移动**不得**改写 priority（旧实现重编号 1…N，静默覆盖用户配置）
   assert.ok(!/arr\.forEach\(\(p, n\) => \{ p\.priority = n \+ 1; \}\)/.test(html),
     '重排不得再重编号 priority（移动只改先后顺序）');
-  // 列表顺序 = 网关取候选的顺序，行内序号按列表位置显示（不再显示 P<priority>）
-  assert.ok(/选路顺序 #' \+ \(i \+ 1\)/.test(html) && /\+ \(i \+ 1\) \+ '<\/span>'/.test(html),
-    '行内应显示列表序号（选路顺序）');
-  assert.ok(!/'<span class="cnt">P' \+ esc\(String\(p\.priority/.test(html), '不应再显示 P<priority> 徽标');
+  // 行内徽标（2026-09-17 改）：网关先按 priority 升序取候选、同 priority 内按列表顺序，
+  // 所以必须**同时**显示 P<优先级> 与 #<列表位置>（旧版两者只显示其一，都会误导）
+  assert.ok(/const ordText = 'P' \+ pri \+ ' #' \+ \(i \+ 1\)/.test(html),
+    '行内应同时显示 P<优先级> 与 #<列表位置>');
+  assert.ok(/const pri = \(Number\(p\.priority\) > 0 \? Number\(p\.priority\) : 1\)/.test(html),
+    '优先级徽标应把缺省/非法视为 1（与网关 providerPriority 一致）');
+  assert.ok(/优先级 P' \+ pri \+ '（数值小者先尝试）· 列表位置 #'/.test(html),
+    '徽标 title 应说明两者的含义');
   assert.ok(/gwMoveSel\(-1\)/.test(html) && /gwMoveSel\(1\)/.test(html), '按钮应绑定 ±1 位移');
+  // 文案必须与"priority 优先"的新规则一致（旧文案写"保留字段/不再参与排序"，会误导）
+  assert.ok(/先按优先级（数字小者先试）· 同一优先级内按列表顺序/.test(html),
+    '工具条提示应说明"先按优先级、同级按列表顺序"');
+  assert.ok(!/保留字段（不再参与排序）/.test(html), '编辑器不应再写"保留字段/不再参与排序"');
+  assert.ok(/数值小者先尝试；同一优先级内按左侧列表顺序/.test(html), '优先级字段旁应说明真实语义');
   // ③ 两栏比例：左 44% / 右 56%（旧版 1.15:1，右侧被挤窄）
   assert.ok(/\.gw-left \{ flex: 1 1 44%/.test(html) && /\.gw-right \{ flex: 1 1 56%/.test(html),
     '两栏应改为 44% : 56%（左侧收窄、右侧加宽）');
