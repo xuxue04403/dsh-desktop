@@ -347,8 +347,10 @@ let upstreamPort = 0;
       sseErrorFirst: !!opts.sseErrorFirst,   // 200 + SSE 首事件即 error（api.chiyi.cc 实测形态）
       thinkingPassback: !!opts.thinkingPassback,   // 400/500 要求 thinking 回传（air-outer/agentrouter 实测形态）
       thinkingPassbackStatus: opts.thinkingPassbackStatus || 400,
+      rejectThinking: opts.rejectThinking || null, // 'sse' | '400'：带顶层 thinking 就拒收（amd 实测形态）
       failFirstN: opts.failFirstN || 0,            // 前 N 次请求直接销毁 socket（模拟网络抖动）
       lastBody: null,
+      bodies: [],                                  // 每次请求体（含重试），断言"重试时去掉了某字段"用
       errorBody: opts.errorBody === undefined ? { error: { message: 'upstream error' } } : opts.errorBody,
       delayMs: opts.delayMs || 0,
       // —— OpenAI Responses 协议仿真（见下方 handleResponses）——
@@ -453,7 +455,21 @@ let upstreamPort = 0;
           st.models.push(parsedBody.model);
         } catch (_) { /* 忽略 */ }
         st.lastBody = parsedBody;
+        st.bodies.push(parsedBody);
         const send = () => {
+          // 2026-09-17 实测形态（amd/GLM-5.3-Flash）：带顶层 thinking 参数 → 拒收。
+          // 'sse' = HTTP 200 + SSE 首事件 error（实测形态）；'400' = 直接 400 JSON。
+          if (st.rejectThinking && parsedBody && parsedBody.thinking) {
+            const msg = '"thinking" is not supported for this model. Remove the "thinking" parameter or use a model that supports extended thinking.';
+            if (st.rejectThinking === '400') {
+              res.writeHead(400, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: msg } }));
+              return;
+            }
+            res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+            res.end('event: error\ndata: ' + JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: msg } }) + '\n\n');
+            return;
+          }
           // 实测形态（air-outer/agentrouter）：带 tool_use 的 assistant 轮缺 thinking 块 → 400
           if (st.thinkingPassback && parsedBody) {
             const missing = (parsedBody.messages || []).some((m) => m && m.role === 'assistant'
@@ -2178,6 +2194,103 @@ let upstreamPort = 0;
       assert.ok(/request error/.test(logText), '应记录请求错误：' + logText.slice(-300));
       assert.ok(!/代理未运行/.test(logText),
         'AbortError（超时/取消）不是连接层错误，绝不能提示代理问题：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // ---- 2026-09-17：上游"不支持 thinking"（与"必须回传 thinking"相反的另一种规则）----
+
+  t('上游不支持 thinking（HTTP 200 + SSE 首事件错误）→ 去掉顶层参数重试成功，并记住该家', async () => {
+    const up = await startFakeUpstream({ rejectThinking: 'sse' });
+    const gw = await startGatewayWith([providerOf('nothink', up, { priority: 1 })], 'nothink1');
+    const body = {
+      model: 'test-model', max_tokens: 64,
+      thinking: { type: 'enabled', budget_tokens: 1024 },   // 客户端按模型推理档位自动带的顶层参数
+      messages: [{ role: 'user', content: 'hi' }],
+    };
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r1 = await call({ port: gw.port, p: '/v1/messages', body });
+      assert.strictEqual(r1.status, 200, '去掉 thinking 重试后应成功，实际 ' + r1.status + ' ' + r1.text.slice(0, 200));
+      assert.ok(/upstream-ok/.test(r1.text), '客户端应拿到上游正常流：' + r1.text.slice(0, 160));
+      assert.strictEqual(up.st.calls, 2, '应是"带 thinking 一次 + 去掉后一次"，实际 ' + up.st.calls);
+      assert.ok(!up.st.bodies[1].thinking, '重试请求体不得再带顶层 thinking：' + JSON.stringify(up.st.bodies[1].thinking));
+      const log1 = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/不支持 thinking（HTTP 200 \+ SSE 首事件错误）/.test(log1), '日志应记录该形态：' + log1.slice(-400));
+      // 第二次请求：已学习 → 首次就剥掉，只打一次上游
+      const r2 = await call({ port: gw.port, p: '/v1/messages', body });
+      assert.strictEqual(r2.status, 200, '第二次应成功，实际 ' + r2.status);
+      assert.strictEqual(up.st.calls - 2, 1, '第二次必须一次成功（已学习，不再先失败），实际 ' + (up.st.calls - 2) + ' 次');
+      assert.ok(!up.st.bodies[2].thinking, '已学习后首次即不得带 thinking');
+      const log2 = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/（不支持 thinking）→ 去掉顶层 thinking 参数后发送/.test(log2), '日志应记录预先剥离：' + log2.slice(-400));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('上游不支持 thinking（HTTP 400 形态）→ 同样去掉参数重试一次；显式 quirks:["drop-thinking"] 则首次就剥离', async () => {
+    const up400 = await startFakeUpstream({ rejectThinking: '400' });
+    const gw = await startGatewayWith([providerOf('nothink400', up400, { priority: 1 })], 'nothink2');
+    const body = { model: 'test-model', max_tokens: 64, thinking: { type: 'enabled', budget_tokens: 512 }, messages: [{ role: 'user', content: 'hi' }] };
+    try {
+      const r = await call({ port: gw.port, p: '/v1/messages', body });
+      assert.strictEqual(r.status, 200, '400 形态也应重试成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(up400.st.calls, 2, '应是 400 一次 + 去掉后一次，实际 ' + up400.st.calls);
+      assert.ok(/不支持 thinking（HTTP 400）/.test(fs.readFileSync(gw.logPath, 'utf8')), '日志应记录 400 形态');
+    } finally { killGw(gw); closeUp(up400); }
+
+    // 显式声明 quirks: ["drop-thinking"] → 不依赖学习，首次请求就剥掉（1 次上游调用）
+    const upQ = await startFakeUpstream({ rejectThinking: 'sse' });
+    const p = providerOf('quirk', upQ, { priority: 1 });
+    p.quirks = ['drop-thinking'];
+    const gw2 = await startGatewayWith([p], 'nothink3');
+    try {
+      const r2 = await call({ port: gw2.port, p: '/v1/messages', body });
+      assert.strictEqual(r2.status, 200, '声明 quirk 后应一次成功，实际 ' + r2.status);
+      assert.strictEqual(upQ.st.calls, 1, '显式 quirk 应首次就剥离（只打一次上游），实际 ' + upQ.st.calls);
+      assert.ok(/（不支持 thinking）→ 去掉顶层 thinking 参数后发送/.test(fs.readFileSync(gw2.logPath, 'utf8')));
+    } finally { killGw(gw2); closeUp(upQ); }
+  });
+
+  t('不带 thinking 的请求不受影响（drop-thinking 不产生副作用）', async () => {
+    const up = await startFakeUpstream({ rejectThinking: 'sse' });
+    const gw = await startGatewayWith([providerOf('plain', up, { priority: 1 })], 'nothink4');
+    try {
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '普通请求应一次成功，实际 ' + r.status);
+      assert.strictEqual(up.st.calls, 1, '不得触发任何重试，实际 ' + up.st.calls);
+      assert.ok(!/不支持 thinking/.test(fs.readFileSync(gw.logPath, 'utf8')), '不应记录 thinking 相关处理');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('同一逻辑名映射普通 + vision 两个上游 ID：带图片走 vision 变体，纯文本走普通变体', async () => {
+    const up = await startFakeUpstream({});
+    // 实测 amd 形态：DeepSeek-V4-Flash（普通）与 DeepSeek-V4-Flash-Vision-Exp（带图）
+    const p = providerOf('dualid', up, {
+      priority: 1,
+      models: [
+        { id: 'DeepSeek-V4-Flash', as: 'test-model' },
+        { id: 'DeepSeek-V4-Flash-Vision-Exp', as: 'test-model', vision: true },
+      ],
+    });
+    const gw = await startGatewayWith([p], 'dualid');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const text = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(text.status, 200, '纯文本应成功，实际 ' + text.status);
+      assert.strictEqual(up.st.lastModel, 'DeepSeek-V4-Flash', '纯文本应发普通上游 ID，实际 ' + up.st.lastModel);
+
+      const img = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 32,
+          messages: [{ role: 'user', content: [{ type: 'text', text: '这是什么' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGk=' } }] }],
+        },
+      });
+      assert.strictEqual(img.status, 200, '带图应成功，实际 ' + img.status);
+      assert.strictEqual(up.st.lastModel, 'DeepSeek-V4-Flash-Vision-Exp',
+        '带图片的请求必须走声明了 vision 的上游 ID，实际 ' + up.st.lastModel);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/try dualid for test-model \(anthropic\) → DeepSeek-V4-Flash-Vision-Exp/.test(logText),
+        '日志应显示映射到 vision ID：' + logText.slice(-300));
     } finally { killGw(gw); closeUp(up); }
   });
 
