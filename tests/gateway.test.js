@@ -698,8 +698,8 @@ let upstreamPort = 0;
     const upDecl = await startFakeUpstream({ catalog: [{ id: 'other-model' }] });   // 目录里没有该模型
     const upCat = await startFakeUpstream({ catalog: [{ id: 'test-model' }] });     // 仅目录里有
     const gw = await startGatewayWith([
-      providerOf('declared', upDecl, { priority: 1, models: ['test-model'] }),
-      providerOf('catalog-only', upCat, { priority: 1, models: ['other-model'] }),
+      providerOf('declared', upDecl, { priority: 5, models: ['test-model'] }),   // 优先级数字更大
+      providerOf('catalog-only', upCat, { priority: 1, models: ['other-model'] }), // 优先级更小但只能靠目录兜底
     ], 'tier', null, { routing: 'round-robin' });
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
@@ -708,7 +708,8 @@ let upstreamPort = 0;
         assert.strictEqual(r.status, 200, '第 ' + (i + 1) + ' 次应成功，实际 ' + r.status);
       }
       assert.strictEqual(upDecl.st.calls, 6, '声明归属的那家应承担全部请求，实际 ' + upDecl.st.calls);
-      assert.strictEqual(upCat.st.calls, 0, '仅目录命中的那家一次都不该被调用（配置权威），实际 ' + upCat.st.calls);
+      assert.strictEqual(upCat.st.calls, 0,
+        '仅目录命中的那家一次都不该被调用（**层级优先于 priority**：配置权威 > 目录兜底），实际 ' + upCat.st.calls);
     } finally { killGw(gw); closeUp(upDecl); closeUp(upCat); }
   });
 
@@ -826,25 +827,54 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
-  // ================= 2026-09-16 用户要求的三项优化 =================
-  // ① 候选顺序 = 配置数组顺序（priority 字段不再参与排序 —— 配置页 ▲▼ 只改顺序、不改优先级）
-  t('网关：候选顺序 = 配置数组顺序（priority 值不再参与排序）', async () => {
-    const upFirst = await startFakeUpstream({});
-    const upSecond = await startFakeUpstream({});
+  // ================= 路由顺序（2026-09-17 用户要求变更）=================
+  // ① 先按 priority 升序；② 同一 priority 内按配置数组顺序
+  t('网关：候选顺序 = priority 升序优先，同 priority 内按数组顺序（2026-09-17 规则）', async () => {
+    const upBig = await startFakeUpstream({});
+    const upSmall = await startFakeUpstream({});
+    // priority 大的排在数组前面 —— 旧规则（纯数组顺序）会先打它；新规则必须先打 priority=1 的那家
     const gw = await startGatewayWith([
-      providerOf('arr-first', upFirst, { priority: 9, models: ['test-model'] }),    // 数组在前、priority 数字大
-      providerOf('arr-second', upSecond, { priority: 1, models: ['test-model'] }),  // 数组在后、priority 数字小
-    ], 'arrayorder');
+      providerOf('pri-9', upBig, { priority: 9, models: ['test-model'] }),
+      providerOf('pri-1', upSmall, { priority: 1, models: ['test-model'] }),
+    ], 'priorder');
     try {
       assert.ok(gw.ready, '独立网关实例应就绪');
       const r = await call({ port: gw.port });
       assert.strictEqual(r.status, 200, '实际 ' + r.status);
-      assert.strictEqual(upFirst.st.calls, 1, '应先发给数组第一位（priority 不参与排序），实际 ' + upFirst.st.calls);
-      assert.strictEqual(upSecond.st.calls, 0, '数组第二位不应被先发，实际 ' + upSecond.st.calls);
+      assert.strictEqual(upSmall.st.calls, 1, 'priority=1 的家应被优先尝试，实际 ' + upSmall.st.calls);
+      assert.strictEqual(upBig.st.calls, 0, 'priority=9 的家不该被先打（旧规则才会），实际 ' + upBig.st.calls);
       const logText = fs.readFileSync(gw.logPath, 'utf8');
-      assert.ok(/arr-first=models-declared arr-second=models-declared/.test(logText),
-        '日志候选顺序应为数组顺序：' + logText.slice(-300));
-    } finally { killGw(gw); closeUp(upFirst); closeUp(upSecond); }
+      assert.ok(/pri-1=models-declared pri-9=models-declared/.test(logText),
+        '日志候选顺序应为 priority 升序：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(upBig); closeUp(upSmall); }
+  });
+
+  t('网关：同 priority 时按配置数组顺序（▲▼ 调整的就是这个顺序）', async () => {
+    const upA = await startFakeUpstream({});
+    const upB = await startFakeUpstream({});
+    const gw = await startGatewayWith([
+      providerOf('tie-a', upA, { priority: 1, models: ['test-model'] }),
+      providerOf('tie-b', upB, { priority: 1, models: ['test-model'] }),
+    ], 'tieorder');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      assert.strictEqual(upA.st.calls, 1, '同 priority 应先发数组第一位，实际 ' + upA.st.calls);
+      assert.strictEqual(upB.st.calls, 0, '同 priority 第二位不应被先发，实际 ' + upB.st.calls);
+      // priority 缺省（未写字段）视为 1，与显式 1 同级 → 仍按数组顺序
+      const upC = await startFakeUpstream({});
+      const gw2 = await startGatewayWith([
+        providerOf('def-a', upA, { models: ['test-model'] }),
+        providerOf('def-b', upC, { models: ['test-model'] }),
+      ], 'tieorder2');
+      try {
+        const r2 = await call({ port: gw2.port });
+        assert.strictEqual(r2.status, 200, '实际 ' + r2.status);
+        assert.ok(/def-a=models-declared def-b=models-declared/.test(fs.readFileSync(gw2.logPath, 'utf8')),
+          '缺省 priority 应视为 1 并与同级一起按数组顺序');
+      } finally { killGw(gw2); closeUp(upC); }
+    } finally { killGw(gw); closeUp(upA); closeUp(upB); }
   });
 
   // ② 多模态：带图片的请求只发给声明了图片能力的家（否则会被转给纯文本家，上游报错/丢图）
@@ -1969,6 +1999,185 @@ let upstreamPort = 0;
         '其余历史必须保留：' + JSON.stringify(sent.messages));
       const logText = fs.readFileSync(gw.logPath, 'utf8');
       assert.ok(/名字为空.*tool_use.*已丢弃/.test(logText), '应记录丢弃告警：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // ---- 2026-09-16 事故回归：本机代理端口死掉时，网关不该自杀、也不该把锅甩给上游 ----
+  t('代理事故回归：NO_PROXY 含回环时，代理端口死掉也不影响上游调用与 /health（不再自杀/误熔断）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    // 死代理：7899 没有任何监听（复现 19:19–19:23 的 ECONNREFUSED 场景）
+    const gw = await startGatewayWith([providerOf('p1', up, { priority: 1 })], 'deadproxy', {
+      NODE_USE_ENV_PROXY: '1',
+      HTTP_PROXY: 'http://127.0.0.1:7899',
+      HTTPS_PROXY: 'http://127.0.0.1:7899',
+      NO_PROXY: '127.0.0.1,localhost,::1',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪（回环直连 → 不被死代理拖死）');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '回环上游在 NO_PROXY 里 → 即使代理端口死掉也应 200，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      assert.ok(h.proxy && h.proxy.url === 'http://127.0.0.1:7899', '/health 应暴露代理地址：' + JSON.stringify(h.proxy));
+      assert.ok(/127\.0\.0\.1/.test(String(h.proxy.noProxy)), '/health 应暴露 NO_PROXY（含回环）：' + JSON.stringify(h.proxy));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/proxy: 走 http:\/\/127\.0\.0\.1:7899/.test(logText), '启动日志应自述代理状态：' + logText.slice(0, 400));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('代理事故回归：回环被代理且代理未运行时，日志必须点名"代理未运行"（而不是记成上游账号故障）', async () => {
+    const up = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([providerOf('p1', up, { priority: 1 })], 'deadproxy2', {
+      NODE_USE_ENV_PROXY: '1',
+      HTTP_PROXY: 'http://127.0.0.1:7899',
+      HTTPS_PROXY: 'http://127.0.0.1:7899',
+      NO_PROXY: '',            // 故意不绕过：上游请求会被塞进死代理
+    });
+    try {
+      assert.ok(gw.ready, 'watchdog 用裸 socket 自检，不经过代理 → 即使代理死掉也不该自杀');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 503, '代理不可达时唯一候选失败 → 503，实际 ' + r.status);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/upstream p1 request error/.test(logText), '应记录上游请求错误：' + logText.slice(-300));
+      assert.ok(/代理未运行/.test(logText), '必须点名"代理未运行"（否则又会把环境问题记成上游故障）：' + logText.slice(-400));
+      assert.strictEqual(up.st.calls, 0, '请求根本没到上游（死在代理连接上），实际 ' + up.st.calls);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // ---- 2026-09-17 优化项回归（依据当天日志分析：探针代价 / 402 判级 / 学习标记 / 多 Key / 误报）----
+
+  t('多 Key（apiKeys）：同一供应商内额度耗尽 → 自动换下一把 Key（用户要求 2b/2c）', async () => {
+    const upPool = await startFakeOpenAIUpstream({ script: ['credit', 'ok'], json: true });
+    const gw = await startGatewayWith([
+      // 注意 provider 同时带 apiKey（单 Key 字段）：多 Key 必须**优先**，否则等于没生效
+      openaiProvider('mk', upPool, { apiKeys: ['sk-key-1', 'sk-key-2'] }),
+    ], 'multikey');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '应换到第二把 Key 后成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(upPool.st.calls, 2, '同一供应商内应重试一次（换 Key），实际 ' + upPool.st.calls);
+      const used = upPool.st.headers.map((h) => h.authorization);
+      assert.strictEqual(used[0], 'Bearer sk-key-1', '第一次应用第一把 Key：' + JSON.stringify(used));
+      assert.strictEqual(used[1], 'Bearer sk-key-2', '第二次应换第二把 Key：' + JSON.stringify(used));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/标记为 credit/.test(logText), '日志应记账户（Key）被标记：' + logText.slice(-400));
+      // /health 可见性：多 Key 在账户池里逐把列出（排障时一眼看清哪把在冷却）
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      const keys = (h.accounts || []).map((a) => a.key);
+      assert.ok(keys.includes('mk#key1') && keys.includes('mk#key2'), '/health 应列出两把 Key：' + JSON.stringify(keys));
+    } finally { killGw(gw); closeUp(upPool); }
+  });
+
+  t('多 Key（apiKeys）：只配 1 把时不写 apiKeys（保持旧单 Key 结构），≥2 把才启用轮换', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([openaiProvider('one', up, { apiKey: 'sk-only-one' })], 'onekey');
+    try {
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      assert.strictEqual((h.accounts || []).length, 0, '单 Key（无 apiKeys）不应产生账户池：' + JSON.stringify(h.accounts));
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status);
+      assert.strictEqual(up.st.headers[0].authorization, 'Bearer sk-only-one', '单 Key 仍按旧路径使用');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('402 额度/预算耗尽 → 判为"长期状态"（长熔断），不再按 90 秒临时冷却反复重探', async () => {
+    const up = await startFakeUpstream({
+      status: 402,
+      errorBody: { error: { message: 'Budget pool quota has been exhausted. Please ask an administrator to increase the limit' } },
+    });
+    const gw = await startGatewayWith([providerOf('q402', up, { priority: 1 })], 'q402', {
+      DSH_GATEWAY_BREAKER_LONG_MS: '1500', DSH_GATEWAY_BREAKER_SHORT_MS: '1500',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 503, '唯一候选额度耗尽 → 503，实际 ' + r.status);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/供应商账号\/额度\/权限"类错误（长期状态）/.test(logText),
+        '额度耗尽必须判为长期状态（旧版判"临时"→ 每 90 秒白撞一次）：' + logText.slice(-500));
+      assert.ok(/熔断 1500ms/.test(logText), '应按长熔断时长开闸：' + logText.slice(-400));
+      assert.strictEqual(up.st.calls, 1, '应只打一次上游，实际 ' + up.st.calls);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('网络类熔断按连续开闸次数指数退避（90s→3m→…，修"坏家每 90 秒被重探"）', async () => {
+    const up = await startFakeUpstream({ status: 500, errorBody: { error: { message: 'boom' } } });
+    const gw = await startGatewayWith([providerOf('flap', up, { priority: 1 })], 'backoff', {
+      DSH_GATEWAY_BREAKER_SHORT_MS: '300', DSH_GATEWAY_BREAKER_BACKOFF_MAX_MS: '5000',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // 3 连败 → 首次开闸 300ms；之后每等到冷却结束的下一次请求 = 半开探测，失败即按 600/1200ms 递增
+      for (let i = 0; i < 3; i++) { await call({ port: gw.port }); }
+      await sleep(350); await call({ port: gw.port });
+      await sleep(650); await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/熔断 300ms/.test(logText), '首次开闸应为 300ms：' + logText.slice(-600));
+      assert.ok(/熔断 600ms/.test(logText), '第 2 次开闸应翻倍到 600ms（旧版固定 300ms）：' + logText.slice(-600));
+      assert.ok(/熔断 1200ms/.test(logText), '第 3 次开闸应到 1200ms：' + logText.slice(-600));
+      assert.ok(/退避递增/.test(logText), '日志应说明退避：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('半开探测用短超时：坏家不会让用户请求白等 60 秒（当天实测 78.5s 的那次）', async () => {
+    const upDead = await startFakeUpstream({ status: 500, errorBody: { error: { message: 'boom' } } });
+    const upOk = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('dead', upDead, { priority: 1 }),
+      providerOf('ok', upOk, { priority: 2 }),
+    ], 'probe', {
+      DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS: '600', DSH_GATEWAY_BREAKER_SHORT_MS: '300', DSH_GATEWAY_BREAKER_LONG_MS: '300',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) { await call({ port: gw.port }); }   // 让 dead 熔断（普通尝试，非探测）
+      // 冷却到点后把 dead 改成"永不响应"：这一次请求会让 dead 走半开探测
+      upDead.st.status = 200;
+      upDead.st.delayMs = 60_000;
+      await sleep(400);
+      const t0 = Date.now();
+      const r = await call({ port: gw.port });
+      const dur = Date.now() - t0;
+      assert.strictEqual(r.status, 200, '应由健康候选服务，实际 ' + r.status);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/breaker HALF-OPEN: dead/.test(logText), '应确实走了半开探测：' + logText.slice(-400));
+      assert.ok(dur < 3000, '探测必须按短超时（600ms）快速放弃，而不是等满 60 秒；实际 ' + dur + 'ms');
+    } finally { killGw(gw); closeUp(upDead); closeUp(upOk); }
+  });
+
+  t('thinking 回传"学习"：同一家第二次请求不再先失败一次（省掉重复上游失败与计费）', async () => {
+    const up = await startFakeUpstream({ thinkingPassback: true });
+    const gw = await startGatewayWith([providerOf('tp', up, { priority: 1 })], 'tplearn');
+    const body = { model: 'test-model', max_tokens: 64, messages: THINKING_HISTORY };
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r1 = await call({ port: gw.port, p: '/v1/messages', body });
+      assert.strictEqual(r1.status, 200, '首次应补位后成功，实际 ' + r1.status + ' ' + r1.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 2, '首次是"原样一次 + 补占位一次"，实际 ' + up.st.calls);
+      const r2 = await call({ port: gw.port, p: '/v1/messages', body });
+      assert.strictEqual(r2.status, 200, '第二次应成功，实际 ' + r2.status);
+      assert.strictEqual(up.st.calls - 2, 1, '第二次必须一次成功（已学习，不再先撞 400），实际 ' + (up.st.calls - 2) + ' 次');
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/已记住该家需求/.test(logText), '首次应记录学习：' + logText.slice(-400));
+      assert.ok(/（已学习）预先补齐/.test(logText), '第二次应预先补齐：' + logText.slice(-400));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('代理提示只在连接层错误出现：超时中止（AbortError）不得误报"代理未运行"', async () => {
+    const up = await startFakeUpstream({ status: 200, delayMs: 60_000 });
+    const gw = await startGatewayWith([providerOf('slow', up, { priority: 1, timeoutMs: 400 })], 'hint', {
+      // 走代理但回环直连（上游是本机）：请求能连上、然后被我方超时中止 → cause 链为空
+      NODE_USE_ENV_PROXY: '1', HTTP_PROXY: 'http://127.0.0.1:7899', HTTPS_PROXY: 'http://127.0.0.1:7899',
+      NO_PROXY: '127.0.0.1,localhost',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 503, '唯一候选超时 → 503，实际 ' + r.status);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/request error/.test(logText), '应记录请求错误：' + logText.slice(-300));
+      assert.ok(!/代理未运行/.test(logText),
+        'AbortError（超时/取消）不是连接层错误，绝不能提示代理问题：' + logText.slice(-300));
     } finally { killGw(gw); closeUp(up); }
   });
 
