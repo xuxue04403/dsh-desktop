@@ -26,17 +26,19 @@
  *         "apiKey": "sk-...",
  *         // 字符串 = 上游 ID 与逻辑名相同；对象 = 映射（as 为逻辑名）+ 可选 vision（图片输入）
  *         "models": ["deepseek-v4-flash", { "id": "v/vision-up", "as": "deepseek-v4-flash", "vision": true }],
- *         "priority": 1,          // 保留字段：**不再参与排序**（选路顺序 = 本数组顺序）
+ *         "priority": 1,          // 数值小者先尝试；同 priority 内按本数组顺序
  *         "enabled": true
  *       }
  *     ]
  *   }
  *
- * 选路顺序（2026-09-16 起）：**providers 数组顺序** = 候选尝试顺序；配置页 ▲▼ 只改顺序、不改 priority。
+ * 选路顺序（2026-09-17 用户要求）：**先 priority 升序，同级内按 providers 数组顺序**。
+ * 配置页 ▲▼ 仍然只改数组顺序、不改 priority（同级内调整先后）。
  * Config path: %APPDATA%\DSHDesktop\gateway.config.json (or DSH_GATEWAY_CONFIG).
  * A template is created on first run if the file is missing.
  */
 import http from 'node:http';
+import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -51,10 +53,16 @@ const UPSTREAM_TIMEOUT_MS = (() => {
   const n = Number(process.env.DSH_GATEWAY_UPSTREAM_TIMEOUT_MS);
   return Number.isFinite(n) && n > 0 ? n : 60_000;
 })();
-/** 供应商级超时：provider.timeoutMs > 全局默认。 */
+/** 供应商级超时：provider.timeoutMs > 全局默认；**半开探测**用短超时（见 BREAKER_PROBE_TIMEOUT_MS）。 */
 function providerTimeoutMs(provider) {
   const n = Number(provider && provider.timeoutMs);
-  return Number.isFinite(n) && n > 0 ? n : UPSTREAM_TIMEOUT_MS;
+  const base = Number.isFinite(n) && n > 0 ? n : UPSTREAM_TIMEOUT_MS;
+  // 2026-09-17 优化：半开探测不放满 60s——该请求同时在替所有人生死探测，不能让用户等满。
+  try {
+    const b = breaker.get(String((provider && provider.id) || ''));
+    if (b && b.state === 'half-open') return Math.min(base, BREAKER_PROBE_TIMEOUT_MS);
+  } catch (_) { /* 模块初始化早期（const 尚未就绪）→ 退回常规超时 */ }
+  return base;
 }
 // 瞬时网络错重试（2026-09-16）：仅当失败**够快**时才重试——慢失败（如 60s 超时）重试只会翻倍等待
 const NET_RETRY_MAX_ELAPSED_MS = (() => {
@@ -103,6 +111,50 @@ function isTransientNetError(e) {
     depth++;
   }
   return false;
+}
+
+/**
+ * 本进程的代理状态（v1.8.2）：宿主 gateway-manager 会注入 NODE_USE_ENV_PROXY=1 +
+ * HTTP(S)_PROXY + NO_PROXY；这里只做**可见性**，便于 /health 与日志一眼看清
+ * "到底走没走代理、哪些域名直连"。排障时不必再去翻宿主的 app.log。
+ */
+function proxyStatus() {
+  const env = process.env;
+  const url = env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || '';
+  const noProxy = env.NO_PROXY || env.no_proxy || '';
+  return { url: url || null, noProxy: noProxy || null, envProxy: env.NODE_USE_ENV_PROXY === '1' };
+}
+
+/** host 是否命中 NO_PROXY 清单（精确或后缀——实测 `tencent.com` 命中 copilot.tencent.com）。 */
+function hostInNoProxy(host, noProxy) {
+  const h = String(host || '').toLowerCase();
+  if (!h) return false;
+  for (const raw of String(noProxy || '').split(',')) {
+    const e = raw.trim().toLowerCase().replace(/^\./, '').replace(/^\*\./, '');
+    if (!e) continue;
+    if (h === e || h.endsWith('.' + e)) return true;
+  }
+  return false;
+}
+
+/**
+ * 网络错误归因（v1.8.2）。2026-09-16 19:19–19:23 事故：clash 的 7890 端口没在监听，
+ * 网关所有上游请求（含 workbuddy）在 12–31ms 内 ECONNREFUSED——undici 报的是**代理地址**
+ * 连不上，可日志里只有 "fetch failed"，于是熔断器写"保护上游账号"，把环境问题记成上游故障。
+ * 这里在"本进程走代理且该域名不在 NO_PROXY"时补一句人话，直接指向代理。
+ */
+function proxyHintFor(url, causeText) {
+  // 只在**确实拿到连接层错误码**时才提示代理（ENOTFOUND/证书类错误与代理无关，别误导）。
+  // 2026-09-17 修正：旧判断写成"causeText 存在才校验"→ causeText 为空时无条件放行，而
+  // AbortError（我方 60s 超时 / 客户端取消）的 cause 链恰好为空 → 把"超时"误报成"代理未运行"
+  // （当天实测 6 次，误导排查方向）。现在必须非空且命中连接层错误码。
+  if (!causeText || !/ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|EPIPE|UND_ERR_CONNECT_TIMEOUT/i.test(String(causeText))) return '';
+  const st = proxyStatus();
+  if (!st.url) return '';
+  let host = '';
+  try { host = new URL(url).hostname; } catch (_) { return ''; }
+  if (hostInNoProxy(host, st.noProxy)) return '';
+  return `（本进程走代理 ${st.url}：ECONNREFUSED/ECONNRESET 极可能是**代理未运行**（Clash 退出/切换节点/重启中），不是上游故障；请检查代理，或在网关配置里把该域名加入 noProxy 直连）`;
 }
 // R2 防封：catalog 探测失败后的冷却期（30s 内不重试探测，防请求风暴触发风控）
 const CATALOG_FAIL_COOLDOWN_MS = 30_000;
@@ -286,6 +338,14 @@ const BREAKER_SHORT_MS = envMs('DSH_GATEWAY_BREAKER_SHORT_MS', 90_000);      // 
                                                 // clash 抖动很常见，5 分钟误伤过大：全家熔断期间请求
                                                 // 全部 404/503，用户以为网关坏了）
 const BREAKER_LONG_MS = envMs('DSH_GATEWAY_BREAKER_LONG_MS', 30 * 60_000);  // 长熔断 30 分钟（401/403 业务拒绝）
+// 2026-09-17 优化（实测事故：坏家长期霸占候选首位）：
+//  ① 短熔断按"连续开闸次数"指数退避 90s→3m→6m→12m→24m→30m（封顶 30 分钟）。
+//     旧实现固定 90 秒：windhub 当天被放了 28 次探测、x666 12 次，每次都在用户请求路径上白等。
+//  ② 半开探测用**短超时**（默认 10 秒，而不是 60 秒）：冷却到点后的那一次请求是在替全家人
+//     试错，不该占满用户 60 秒（实测 14:35:05 探 x666 → 14:36:05 放弃 = 正好 60s → 再转
+//     agentrouter 18s → 该请求 78.5s；同模型正常只要 14–26s）。
+const BREAKER_BACKOFF_MAX_MS = envMs('DSH_GATEWAY_BREAKER_BACKOFF_MAX_MS', 30 * 60_000);
+const BREAKER_PROBE_TIMEOUT_MS = envMs('DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS', 10_000);
 
 /* 熔断状态机（审计修复 P2，本次）：closed / open / half-open
  * 旧版 breakerIsOpen() 带**副作用**（冷却到点即把 fails 重置、openUntil 清零），而同一个请求会
@@ -298,7 +358,20 @@ const BREAKER_LONG_MS = envMs('DSH_GATEWAY_BREAKER_LONG_MS', 30 * 60_000);  // �
  *  - 探测失败 → 回 open（半开时不看阈值，立即回 open）；探测成功/上游正常应答 → closed
  * 保底性质（与旧实现一致，必须保住）：冷却到点必然放行一次探测 → 熔断**不会永久卡死**。
  */
-const breaker = new Map();                      // providerId -> { state, fails, openUntil }
+const breaker = new Map();                      // providerId -> { state, fails, openUntil, opens }
+
+/**
+ * 空名 tool_use 告警计数器（2026-09-17）：见 anthropicToOpenAIRequest 里的去重日志。
+ */
+let emptyToolUseDropHits = 0;
+
+/**
+ * thinking 回传需求"学习"标记（2026-09-17 优化）。某些上游（实测 agentrouter/air-outer）对
+ * "带 tool_use 但缺 thinking 块"的 assistant 轮回 400/500，网关补一次空占位即可通过。旧实现
+ * **每次请求都要先失败一次**才知道（当天实测 13 次白打上游；失败调用上游通常照样计费）。
+ * 现在记住"该家需要补位"，后续请求首次就带上。命中即记、成功不撤销（结构需求是稳定属性）。
+ */
+const thinkingPassbackProviders = new Set();
 
 /** 纯读：该 provider 当前是否不可用（冷却窗口内，或半开探测名额已被别的请求占用）。 */
 function breakerIsOpen(providerId) {
@@ -323,7 +396,7 @@ function breakerAcquire(providerId) {
 }
 
 function breakerRecordFail(providerId, httpStatus) {
-  const b = breaker.get(providerId) || { state: 'closed', fails: 0, openUntil: 0 };
+  const b = breaker.get(providerId) || { state: 'closed', fails: 0, openUntil: 0, opens: 0 };
   b.fails += 1;
   // V2b：401/403 业务性拒绝（鉴权失败/需充值/禁用）不会自愈——首次出现即长熔断 30 分钟，
   // 不必等连续 3 次（避免固定失败模式被风控画像）；网络错/5xx 仍按 3 次阈值短熔断
@@ -331,11 +404,15 @@ function breakerRecordFail(providerId, httpStatus) {
   // half-open 探测失败必须回到 open（否则名额永远被占 → 熔断卡死），故不看阈值
   if (b.fails >= BREAKER_THRESHOLD || immediate || b.state === 'half-open') {
     const long = immediate;
-    const ms = long ? BREAKER_LONG_MS : BREAKER_SHORT_MS;
+    // 2026-09-17：网络/5xx 类短熔断按连续开闸次数指数退避（成功后 breakerRecordSuccess 清零 opens）
+    b.opens = (b.opens || 0) + 1;
+    const base = long ? BREAKER_LONG_MS : BREAKER_SHORT_MS;
+    const ms = long ? base : Math.min(base * 2 ** (b.opens - 1), BREAKER_BACKOFF_MAX_MS);
     b.state = 'open';
     b.openUntil = Date.now() + ms;
     log(`breaker OPEN: ${providerId} 失败（${httpStatus || 'network'}），熔断 ${
-      ms >= 60_000 ? Math.round(ms / 60_000) + ' 分钟' : ms + 'ms'}（保护上游账号）`);
+      ms >= 60_000 ? Math.round(ms / 60_000) + ' 分钟' : ms + 'ms'}`
+      + `${long ? '' : `（第 ${b.opens} 次开闸，退避递增；上限 ${Math.round(BREAKER_BACKOFF_MAX_MS / 60_000)} 分钟）`}（保护上游账号）`);
   }
   breaker.set(providerId, b);
 }
@@ -351,6 +428,17 @@ function breakerCooldownSecs(providers) {
   }));
   return Math.max(1, Math.ceil((until || BREAKER_SHORT_MS) / 1000));
 }
+
+/**
+ * 半开探测的代价控制（2026-09-17 评估结论，注意这里**没有**把探测挪到候选末尾）：
+ * 曾实现过"待探测的家排到最后"，但那样只要备选一直可用，**首选家恢复后也不会再被用到**——
+ * 等于静默改变优先级语义（用户把 x666 放第一是有意的）。因此只做两件事：
+ *   ① 探测超时单独设短（BREAKER_PROBE_TIMEOUT_MS，默认 10s，而不是 60s）；
+ *   ② 网络类熔断按连续开闸次数指数退避（90s→3m→6m→12m→24m→30m）。
+ * 合起来：用户最多为探测多等 10 秒，且第 5 次之后基本每 30 分钟才会撞上一次。
+ *（若要进一步做到"零用户代价"，需要后台恢复探测 + 只缩短冷却不直接解除熔断，属后续可选优化。）
+ */
+
 
 // V1 防封：日志脱敏——catalog/上游错误体可能回显 key，统一打码各类凭证片段
 // R25（审计）：补 Bearer/JWT(eyJ)/统一网关 key（dsh-gateway-）与 api-key 头形态
@@ -527,15 +615,35 @@ function replyBodyError(res, req, e, anthropic) {
 }
 
 /**
- * 候选顺序 = **配置里 providers 数组的顺序**（2026-09-16 用户要求）。
+ * 候选顺序（2026-09-17 用户要求，**规则变更**）：
+ *   ① 先按 `priority` **升序**（数值小者先尝试）；缺省 / 非法 / ≤0 → 视为 1
+ *   ② 同一 priority 内按 **providers 数组顺序**（= 配置页列表顺序；▲▼ 调整的就是它）
  *
- * 旧实现按 `priority` 排序；配置页的 ▲▼ 为了"界面顺序 = 实际选路"而把 priority 重编号为 1…N，
- * 于是用户手写的 priority 被静默改写（用户明确要求：移动只改先后顺序，不要动优先级配置）。
- * 现在：**列表顺序就是选路顺序**，priority 保留为配置字段但不再参与排序（向后兼容旧配置，
- * 只是不生效；界面按列表位置显示序号）。
+ * 历史（避免以后又被"改回去"时不知道为什么）：
+ *   · 2026-09-16 之前：按 priority 排序，但配置页 ▲▼ 为保持"界面顺序=实际选路"会把 priority
+ *     重编号成 1…N —— 静默改写用户手写的优先级。用户当时要求"移动只改先后顺序、不要动优先级"，
+ *     于是当天改成"完全不看 priority，纯数组顺序"。
+ *   · 2026-09-17：用户明确要求"同一模型下先看供应商优先级，相同优先级再看排序"，即本实现。
+ *     两者现在并存：▲▼ 只改数组顺序（**不触碰 priority**），而 priority 重新参与排序 ——
+ *     因此**列表位置只决定同一优先级内的先后**。
+ *
+ * 注意：层级（tier）仍优先于 priority —— selectCandidates() 会把"配置里声明承载该模型"的家
+ * 排在"一个模型都没配、只能靠上游目录兜底"的家之前。那是配置权威性规则（2026-09-15 事故），
+ * 不是排序偏好；本函数只负责同一层级内的顺序。
  */
 function providersForModel(cfg) {
-  return cfg.providers.filter((p) => p.enabled !== false);
+  const list = cfg.providers.filter((p) => p.enabled !== false);
+  // 稳定排序：同 priority 用原始下标兜底（不依赖引擎的排序稳定性）
+  return list
+    .map((p, i) => ({ p, i, pri: providerPriority(p) }))
+    .sort((a, b) => (a.pri - b.pri) || (a.i - b.i))
+    .map((x) => x.p);
+}
+
+/** priority 归一化：缺省 / 非数字 / ≤0 → 1（与历史默认一致，避免旧配置被排到末尾） */
+function providerPriority(provider) {
+  const n = Number(provider && provider.priority);
+  return Number.isFinite(n) && n > 0 ? n : 1;
 }
 
 /* ---------------- 模型映射（上游真实 ID ↔ 逻辑模型名） ----------------
@@ -623,6 +731,11 @@ function bodyForProvider(body, provider, logical) {
  *        这正是 2026-09-15 的事故形态：b.ai 目录里列着 deepseek-v4.1-flash，配置却只声明了
  *        mimo/glm-flash/qwen，转发过去上游回 400（欠费/不可用）→ 用户明明配了 chiyi-ds 承载它，
  *        却被"目录里有"的那家抢走。配置是用户意图的唯一来源，目录只用来兜底未配置的服务商。
+ *
+ * 顺序：本函数**不重排**，按传入 candidates 的既有顺序分层收集 —— 而 candidates 已由
+ * providersForModel() 按"priority 升序、同级数组顺序"排好，因此每个层级内部都保持该顺序。
+ * 最终 eligible = [配置声明的家（按 priority/数组序）] ++ [目录兜底的家（同序）]。
+ *（层级优先于 priority：配置声明的家永远排在"只能靠目录兜底"的家前面。）
  *
  * 另：本函数同时返回 needCatalogFor（哪些 provider 需要查目录）——调用方据此**只为"没配模型"
  * 的 provider 探测目录**，配置齐全时请求路径上不再有任何目录探测（省掉每次请求 ~1.5s）。
@@ -747,11 +860,31 @@ function providerExtraHeaders(provider) {
   return out;
 }
 
-/** 账户池条目（id + authFile 或 apiKey）；无 accounts 时返回空数组（沿用顶层 apiKey） */
+/** 供应商的多把 Key（`apiKeys: [...]`；也兼容逗号/空白/分号分隔的字符串），去空去重。 */
+function apiKeysOf(provider) {
+  const raw = provider && provider.apiKeys;
+  const list = Array.isArray(raw) ? raw : (typeof raw === 'string' ? raw.split(/[\s,;]+/) : []);
+  const out = [];
+  for (const v of list) {
+    const k = String(v == null ? '' : v).trim();
+    if (k && !out.includes(k)) out.push(k);
+  }
+  return out;
+}
+
+/**
+ * 账户池条目（id + authFile 或 apiKey）。
+ *  ① 显式 `accounts` 优先（含 workbuddy 的 authFile / 只写 { id } 的自动发现）；
+ *  ② 否则 `apiKeys: ["k1","k2",…]`（2026-09-17 新增：同一供应商配多把 Key）→ 映射成 key1/key2…
+ *     直接复用**已验证的账户池**：轮询分流 + 额度耗尽/密钥失效/限流时自动换下一把 + /health 可见；
+ *  ③ 都没有 → 空数组（沿用顶层单个 apiKey 的老路径）。
+ */
 function providerAccounts(provider) {
   const raw = provider && provider.accounts;
   const isWorkBuddy = String((provider && provider.auth) || '').toLowerCase() === 'workbuddy';
-  if (!Array.isArray(raw)) {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    const keys = apiKeysOf(provider);
+    if (keys.length) return keys.map((k, i) => ({ id: 'key' + (i + 1), authFile: '', apiKey: k }));
     // auth=workbuddy 但没写 accounts → 视为"自动发现本机凭据"的单个账户（开箱即用）
     return isWorkBuddy ? [{ id: 'auto', authFile: '', apiKey: '' }] : [];
   }
@@ -1832,7 +1965,7 @@ const DETERMINISTIC_4XX_STATUS = { 400: 400, 404: 404, 413: 413, 422: 422 };
  */
 const PROVIDER_SIDE_4XX_RE = /credit|balance|insufficient|quota|deposit|billing|unpaid|arrears|recharge|top\s*up|account\s+(?:suspended|disabled|locked|deactivated|banned)|no\s+available\s+(?:channel|quota|balance)|exceeded\s+your\s+(?:current\s+)?quota|not\s+available\s+(?:for|on)\s+your\s+(?:plan|account)|欠费|余额|额度|充值|未开通|无可用(?:渠道|额度)/i;
 /** 其中"余额/欠费"类属于长期状态（充值前不会自愈）→ 用长熔断，避免反复打点 */
-const PERSISTENT_ACCOUNT_RE = /credit|balance|deposit|billing|unpaid|arrears|欠费|余额|充值/i;
+const PERSISTENT_ACCOUNT_RE = /credit|balance|deposit|billing|unpaid|arrears|欠费|余额|充值|budget\s*pool|quota|额度|预算|套餐/i;
 
 /**
  * thinking 回传要求（2026-09-16 实测事故：air-outer / agentrouter）。
@@ -2023,6 +2156,15 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       outBody = q.body;
       needAggregate = q.needAggregate;
     }
+    // 2026-09-17 优化（P2）：该家已"学会"需要 thinking 回传 → **首次请求就补齐**，
+    // 不再先打一次注定失败的 400/500（实测当天 13 次白打上游，失败调用通常照样计费）。
+    if (!rawMode && isAnthropicPath && thinkingPassbackProviders.has(provider.id)) {
+      const pre = withThinkingPlaceholders(outBody);
+      if (pre) {
+        outBody = pre.body;
+        log(`upstream ${provider.id}（已学习）预先补齐 ${pre.repaired} 处空占位 thinking 块，省掉一次失败往返`);
+      }
+    }
     // raw 模式不带 body：显式传 undefined，避免 fetch 在没有 content-length 时挂起等待请求体
     init = { method, headers: upstreamHeaders, signal: controller.signal };
     if (!rawMode) init.body = JSON.stringify(outBody);
@@ -2062,8 +2204,9 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         // 笼统措辞下**只有确实存在可补位轮次时才重试**（fix 非空），避免无谓重发。
         const fix = withThinkingPlaceholders(body);
         if (fix) {
+          thinkingPassbackProviders.add(provider.id);   // 学习：后续请求首次就带上（见文件顶部说明）
           log(`upstream ${provider.id} 要求 thinking 回传（HTTP ${upstream.status}）`
-            + ` → 补齐 ${fix.repaired} 处空占位 thinking 块后重试一次`);
+            + ` → 补齐 ${fix.repaired} 处空占位 thinking 块后重试一次（已记住该家需求）`);
           const c3 = new AbortController();
           const t3 = setTimeout(() => c3.abort(), timeoutMs);
           try {
@@ -2096,12 +2239,13 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     // 单候选模型（如 deepseek-v4.1-flash → chiyi-ds）会因此整段不可用 1.5 分钟。
     // 现在：**仅对"快速失败的网络层错误"重试一次**（本地超时中止不重试，否则白白翻倍等待）。
     const elapsed = Date.now() - startedAt;
+    const upstreamUrl = `${upstreamBase(provider.baseURL)}${upstreamPath}`;
     if (isTransientNetError(e) && elapsed < NET_RETRY_MAX_ELAPSED_MS) {
       log(`upstream ${provider.id} 网络错误（${causeText}，${elapsed}ms）→ 原地重试一次`);
       const c2 = new AbortController();
       const t2 = setTimeout(() => c2.abort(), providerTimeoutMs(provider));
       try {
-        const retried = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
+        const retried = await fetch(upstreamUrl, {
           ...init,
           signal: c2.signal,
         });
@@ -2117,7 +2261,7 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       // R3 防封：失败冷却而非立即删缓存（防每个请求都重试上游形成风暴）
       catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
       breakerRecordFail(provider.id, 0);   // V2：网络错误 → 短熔断
-      log(`upstream ${provider.id} request error: ${e.message}${causeText ? ' (' + causeText + ')' : ''}`);
+      log(`upstream ${provider.id} request error: ${e.message}${causeText ? ' (' + causeText + ')' : ''}${proxyHintFor(upstreamUrl, causeText)}`);
       return rawMode ? { retryable: 0 } : false;
     }
   }
@@ -2453,8 +2597,14 @@ function anthropicToOpenAIRequest(body, provider) {
     messages,
   };
   if (droppedCount) {
-    log(`翻译告警：历史里有 ${droppedCount} 个**名字为空**的 tool_use（及其 tool_result）已丢弃——`
-      + '否则回传给上游会 400（该轮可能由此前版本的空名 bug 产生）');
+    // 去重（2026-09-17）：同一段坏历史会在**每个请求**上重复命中（实测 165 行/天，淹没有效日志）。
+    // 丢弃行为不受影响，只是告警改成"首次 + 每 100 次汇总一行"。
+    emptyToolUseDropHits += 1;
+    if (emptyToolUseDropHits === 1 || emptyToolUseDropHits % 100 === 0) {
+      log(`翻译告警：历史里有 ${droppedCount} 个**名字为空**的 tool_use（及其 tool_result）已丢弃——`
+        + `否则回传给上游会 400（该轮可能由此前版本的空名 bug 产生）；本进程累计命中 ${emptyToolUseDropHits} 次请求`
+        + `${emptyToolUseDropHits === 1 ? '' : '（同类告警已静默，每 100 次汇总一行）'}`);
+    }
   }
   if (Array.isArray(body.tools) && body.tools.length) {
     out.tools = body.tools.map((t) => ({
@@ -2772,8 +2922,9 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
     const finalBody = translateBody(openaiBody, provider);
 
     let upstream = null;
+    const upstreamUrl = `${upstreamBase(provider.baseURL)}${upstreamPath}`;
     try {
-      upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
+      upstream = await fetch(upstreamUrl, {
         method: 'POST', headers, body: JSON.stringify(finalBody), signal: controller.signal,
       });
     } catch (e) {
@@ -2785,7 +2936,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         const c2 = new AbortController();
         const t2 = setTimeout(() => c2.abort(), providerTimeoutMs(provider));
         try {
-          upstream = await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
+          upstream = await fetch(upstreamUrl, {
             method: 'POST', headers, body: JSON.stringify(finalBody), signal: c2.signal,
           });
         } catch (e2) {
@@ -2793,7 +2944,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         } finally { clearTimeout(t2); }
       }
       if (!upstream) {
-        log(`upstream ${provider.id} request error: ${e.message}${causeText ? ' (' + causeText + ')' : ''}`);
+        log(`upstream ${provider.id} request error: ${e.message}${causeText ? ' (' + causeText + ')' : ''}${proxyHintFor(upstreamUrl, causeText)}`);
         catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
         breakerRecordFail(provider.id, 0);
         return false;
@@ -3075,9 +3226,9 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
   }
 
   // 路由模式（S1）：
-  //  - 缺省 / "failover"：主备——固定从列表头开始尝试，失败切下一家（传统行为）
-  //  - "round-robin"：轮询——同一模型每次请求从不同起点开始，流量分摊到各家；
-  //    每家仍按 priority 顺序（candidates 已按 priority 排序），失败同样切下一家
+  //  - 缺省 / "failover"：主备——固定从候选头开始尝试，失败切下一家（传统行为）；
+  //    候选顺序 = priority 升序、同级按配置数组顺序（见 providersForModel）
+  //  - "round-robin"：轮询——同一模型每次请求从不同起点开始，流量分摊到各家；失败同样切下一家
   let tryOrder = ordered;
   if (cfg.routing === 'round-robin' && ordered.length > 1) {
     // 审计修复（P3）：rrCounters 的 key 是**客户端可控**的 model 字符串——无界增长。
@@ -3185,7 +3336,7 @@ async function handleResponsesResource(cfg, req, res, url, tail) {
   }
 
   const readOnly = method === 'GET';
-  // 候选供应商：与模型路由一致，按**配置数组顺序**（列表顺序即选路顺序；priority 不参与排序）
+  // 候选供应商：与模型路由一致，按 priority 升序、同级按配置数组顺序（见 providersForModel）
   const enabled = (cfg.providers || []).filter((p) => p && p.enabled !== false);
   let targets = null;
   const owner = affinityGet(id);
@@ -3491,6 +3642,12 @@ function startServer(cfg) {
   server.keepAliveTimeout = 65_000;
   server.listen(cfg.port, '127.0.0.1', () => {
     log(`gateway listening on http://127.0.0.1:${cfg.port}`);
+    // 代理状态自述（v1.8.2）：每次启动都留一行"走不走代理 / 哪些域名直连"，
+    // 于是"上游 ECONNREFUSED 到底是代理挂了还是上游挂了"一眼可判。
+    {
+      const st = proxyStatus();
+      log(`proxy: ${st.url ? '走 ' + st.url + (st.envProxy ? '（NODE_USE_ENV_PROXY=1）' : '') : '直连（未注入代理）'}；NO_PROXY=${st.noProxy || '(空)'}`);
+    }
     console.log(`[gateway] listening on http://127.0.0.1:${cfg.port}`);
   });
   server.on('error', (e) => {
@@ -3503,27 +3660,45 @@ function startServer(cfg) {
   // R17（假死自愈）：进程内自检 watchdog——每 60s 自请求 /health；事件循环卡死或
   // server 假死（表现：无调用一段时间后无法连接，重启才恢复）时自检超时，连续 3 次
   // 失败即自杀退出（宿主 gateway-manager 的 exit 处理会自动重启，清空全部状态复活）。
+  //
+  // v1.8.2 加固（2026-09-16 事故：**健康进程自杀**）：
+  //   旧实现用 http.get 探 127.0.0.1——而 NODE_USE_ENV_PROXY=1 时 Node 连回环请求也走代理，
+  //   clash 端口一没监听就 8ms ECONNREFUSED，三次自检全败 → 自杀 → 宿主当崩溃重启（19:22:40）。
+  //   两处修正：① 改成**裸 socket 发最小 HTTP 请求**，不经过任何代理层——自检只测"本进程
+  //   server 是否还能应答"，代理死活与此无关；② 每次自检**最多记一次失败**（旧实现
+  //   timeout 后 destroy 又触发 error，一次超时记两笔，两分钟就能凑够 3 次）；并把失败
+  //   原因/耗时写进日志，不再只写"连续 3 次失败"。
   {
     let fails = 0;
-    setInterval(() => {
-      const req = http.get({ host: '127.0.0.1', port: cfg.port, path: '/health', timeout: 8000 }, (res) => {
-        res.resume();
-        fails = res.statusCode === 200 ? 0 : fails + 1;
+    const probe = () => new Promise((resolve) => {
+      const t0 = Date.now();
+      let done = false;
+      const finish = (ok, why) => {
+        if (done) return;
+        done = true;
+        try { sock.destroy(); } catch (_) { /* 已关 */ }
+        if (ok) { fails = 0; return; }
+        fails += 1;
+        log(`self-watchdog: /health ${why}（${Date.now() - t0}ms，连续失败 ${fails}/3）`);
         if (fails >= 3) {
-          log(`self-watchdog: /health 返回 ${res.statusCode} 连续 ${fails} 次，进程自杀重启。`);
+          log('self-watchdog: 连续 3 次自检失败，进程自杀重启（宿主会自动拉起，属自愈行为）。');
           process.exit(1);
         }
+      };
+      const sock = net.connect({ host: '127.0.0.1', port: cfg.port });
+      sock.setTimeout(8000);
+      let buf = '';
+      sock.on('connect', () => sock.write('GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n'));
+      sock.on('data', (d) => {
+        buf += d.toString('utf8');
+        const m = /^HTTP\/1\.[01] (\d{3})/.exec(buf);
+        if (m) finish(m[1] === '200', `返回 HTTP ${m[1]}`);
       });
-      req.on('timeout', () => { req.destroy(); checkFail('timeout'); });
-      req.on('error', () => checkFail('error'));
-    }, 60_000);
-    function checkFail() {
-      fails += 1;
-      if (fails >= 3) {
-        log(`self-watchdog: /health 自检连续 ${fails} 次失败，进程自杀重启。`);
-        process.exit(1);
-      }
-    }
+      sock.on('timeout', () => finish(false, '超时 8s（事件循环疑似卡死）'));
+      sock.on('error', (e) => finish(false, `连接错误 ${e && e.code ? e.code : e.message}`));
+      sock.on('close', () => finish(false, '连接被关闭且无响应'));
+    });
+    setInterval(() => { probe().catch(() => { /* 自检本身绝不抛 */ }); }, 60_000);
   }
   return server;
 }
@@ -3543,7 +3718,9 @@ async function routeRequest(cfg, req, res) {
     if (p === '/health') {
       // 账户池可见性（2026-09-16）：WorkBuddy 这类按账户计费/限流的供应商，出问题时必须能
       // 一眼看出"哪个账户在冷却、为什么"。无账户池时该字段为空数组，不影响旧客户端解析。
-      json(res, 200, { ok: true, accounts: accountPoolSnapshot(cfg) });
+      // 代理可见性（v1.8.2）：把"是否走代理 / 哪些域名直连"也放进来——2026-09-16 事故里
+      // 上游 ECONNREFUSED 的真凶是 clash 端口没在监听，而 /health 当时只有 accounts。
+      json(res, 200, { ok: true, accounts: accountPoolSnapshot(cfg), proxy: proxyStatus() });
       return;
     }
 
