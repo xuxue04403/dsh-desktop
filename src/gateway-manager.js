@@ -17,6 +17,16 @@ const { EventEmitter } = require('events');
 
 const LOG_TAIL_MAX = 64 * 1024;
 
+// 回环地址**永远**直连：Node ≥24 在 NODE_USE_ENV_PROXY=1 下会把连 127.0.0.1 的
+// fetch/http.get 也塞进代理（实测：代理端口一死，回环请求 8ms ECONNREFUSED），
+// 于是网关进程内的 watchdog 自检 /health 会把**健康进程**判死（v1.8.1 事故：19:22:40 自杀重启）。
+const LOOPBACK_NO_PROXY = ['127.0.0.1', 'localhost', '::1'];
+
+// 国内端点默认直连（腾讯 CodeBuddy / WorkBuddy）：直连实测可达（401 于 133ms），
+// 挂在 clash 上只会白挨代理抖动——v1.8.1 事故里 workbuddy 的 ECONNREFUSED 正是代理未运行所致。
+// 需要走代理的用户可在网关配置里写 proxy.forceProxy 剔除。
+const BUILTIN_DIRECT_HOSTS = ['copilot.tencent.com', 'workbuddy.cn'];
+
 // 配置文本校验（供 UI 保存前检查与单测）：返回 { ok, error }
 // 异步跑一段 PowerShell 并取回 stdout（审计修复 P2）：
 // 旧实现用 spawnSync（单次最长 15s），而它在**启动/重启/退出**路径上都会被调用（重启时
@@ -178,6 +188,16 @@ function validateConfigText(text) {
           }
         }
       }
+      // 2026-09-17 新增：同一供应商多把 Key（设置页"多 Key"输入）。网关把它映射成账户池轮换，
+      // 校验必须放行，否则保存被误拒（历史上有过同类漏校验：workbuddy 免路径条目）。
+      if (p.apiKeys !== undefined && !Array.isArray(p.apiKeys) && typeof p.apiKeys !== 'string') {
+        return { ok: false, error: who + ' 的 apiKeys 必须是字符串数组（同一供应商的多把 Key）' };
+      }
+      if (Array.isArray(p.apiKeys)) {
+        for (const k of p.apiKeys) {
+          if (typeof k !== 'string') return { ok: false, error: who + ' 的 apiKeys 只能包含字符串' };
+        }
+      }
       if (p.auth !== undefined && !['workbuddy'].includes(String(p.auth).trim().toLowerCase())) {
         return { ok: false, error: who + ' 的 auth 非法（当前支持：workbuddy）' };
       }
@@ -330,40 +350,57 @@ class GatewayManager extends EventEmitter {
   }
 
   /**
-   * 计算 NO_PROXY 直连清单（2026-09-16）。
+   * 计算 NO_PROXY 直连清单（2026-09-16 首版，v1.8.2 加固）。
    *
-   * 背景（实测事故）：日志里 170 条 `upstream X request error: fetch failed` 全是本机
-   * clash 代理节点抖动导致——同一个域名经代理 5s 内 ECONNRESET，而**直连 0.6–1.4s 可达**
-   * （实测 ps.air-outer.com / api.chiyi.cc）。网关此前是"全有或全无"：proxy.enabled 一开，
-   * 所有上游都走代理，代理一抖全家熔断。
+   * 背景（两次实测事故，根因同一个"全有或全无"）：
+   *   1) 上游抖动：日志里 170 条 `upstream X request error: fetch failed` 全是本机 clash
+   *      代理节点抖动导致——同一个域名经代理 5s 内 ECONNRESET，而**直连 0.6–1.4s 可达**
+   *      （实测 ps.air-outer.com / api.chiyi.cc）。
+   *   2) **回环也被代理**（v1.8.1 事故）：NODE_USE_ENV_PROXY=1 下 Node 把连 127.0.0.1 的
+   *      请求也交给 EnvHttpProxyAgent；clash 端口一没监听，网关自己的 /health 自检
+   *      连续 3 次失败 → 进程自杀 → 宿主当崩溃重启，而上游 workbuddy 的 ECONNREFUSED
+   *      还被熔断器记成"上游故障，保护上游账号"。日志现场：`网络错误（ECONNREFUSED，19ms）`。
    *
-   * 现在允许**按供应商**绕过代理（Node ≥24 的 EnvHttpProxyAgent 尊重 NO_PROXY）：
+   * 现在的规则（后面的步骤可以覆盖前面的）：
+   *   · 回环 127.0.0.1 / localhost / ::1 → **永远直连**（自检、就绪探针绝不依赖代理）；
+   *   · 国内端点 copilot.tencent.com / *.workbuddy.cn → 默认直连（见 BUILTIN_DIRECT_HOSTS）；
    *   · 供应商条目 `"proxy": false` 或 `"noProxy": true` → 该家直连；
-   *   · 全局 `proxy.noProxy: ["host", ...]`（也接受逗号分隔字符串）→ 显式列域名。
-   * 返回逗号分隔的主机名列表；没有则返回 ''（保持全部走代理）。
+   *   · 全局 `proxy.noProxy: ["host", ...]`（也接受逗号分隔字符串）→ 显式列域名；
+   *   · 全局 `proxy.forceProxy: ["host", ...]` → 从清单里剔除（强制走端口代理）。
+   * 返回逗号分隔的主机名列表。NO_PROXY 支持裸后缀匹配（实测 `tencent.com` 命中
+   * `copilot.tencent.com`，`.tencent.com` / `*.tencent.com` 同样有效）。
    */
   computeNoProxy() {
+    const hosts = new Set();
+    const norm = (v) => {
+      const s = String(v || '').trim();
+      if (!s) return '';
+      // 允许写成 URL（取 hostname）或裸主机名
+      let host = s;
+      if (/^https?:\/\//i.test(s)) { try { host = new URL(s).hostname; } catch (_) { /* 原样 */ } }
+      host = host.replace(/^\./, '').replace(/\/.*$/, '');
+      return host;
+    };
+    const listOf = (v) => (Array.isArray(v) ? v : (typeof v === 'string' ? v.split(',') : []));
+    // 1) 回环永远直连（先加，后面 forceProxy 也不能把它剔掉——见第 4 步的排除）
+    LOOPBACK_NO_PROXY.forEach((h) => hosts.add(h));
     try {
       const cfg = JSON.parse(this.configText() || '{}');
-      const hosts = new Set();
-      const add = (v) => {
-        const s = String(v || '').trim();
-        if (!s) return;
-        // 允许写成 URL（取 hostname）或裸主机名
-        let host = s;
-        if (/^https?:\/\//i.test(s)) { try { host = new URL(s).hostname; } catch (_) { /* 原样 */ } }
-        host = host.replace(/^\./, '').replace(/\/.*$/, '');
-        if (host) hosts.add(host);
-      };
-      const list = cfg.proxy && cfg.proxy.noProxy;
-      if (Array.isArray(list)) list.forEach(add);
-      else if (typeof list === 'string') list.split(',').forEach(add);
+      // 2) 国内端点默认直连
+      BUILTIN_DIRECT_HOSTS.forEach((h) => hosts.add(h));
+      // 3) 用户显式配置
+      listOf(cfg.proxy && cfg.proxy.noProxy).forEach((v) => { const h = norm(v); if (h) hosts.add(h); });
       for (const p of Array.isArray(cfg.providers) ? cfg.providers : []) {
         if (!p || p.enabled === false) continue;
-        if (p.proxy === false || p.noProxy === true) add(p.baseURL);
+        if (p.proxy === false || p.noProxy === true) { const h = norm(p.baseURL); if (h) hosts.add(h); }
       }
-      return [...hosts].join(',');
-    } catch (_) { return ''; }
+      // 4) 强制走代理的域名：剔除（回环除外——本机自检不允许被代理）
+      for (const v of listOf(cfg.proxy && cfg.proxy.forceProxy)) {
+        const h = norm(v);
+        if (h && !LOOPBACK_NO_PROXY.includes(h)) hosts.delete(h);
+      }
+    } catch (_) { /* 配置解析失败也必须保住回环直连，不能返回空 */ }
+    return [...hosts].join(',');
   }
 
   // 检测本机代理（clash/v2ray 等）：返回 "http://host:port" 或 null。
@@ -491,6 +528,13 @@ async waitPortFree(port, timeoutMs) {
         this.log('模型网关：NO_PROXY 直连 ' + noProxy);
       }
       this.log('模型网关：网关进程走代理 ' + proxy);
+    } else {
+      // 显式直连（proxy.enabled=false 或探测不到代理）：把**继承来的**代理变量一并清掉。
+      // 否则宿主若从带 HTTPS_PROXY 的 shell/环境启动，网关会"配置写了直连却仍走代理"，
+      // 代理一死就是全网关 ECONNREFUSED（含回环自检）。
+      for (const k of ['NODE_USE_ENV_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']) {
+        delete gwEnv[k];
+      }
     }
     this.proc = spawn(this.nodePath, [
       mjs,
