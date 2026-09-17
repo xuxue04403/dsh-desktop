@@ -51,13 +51,17 @@ dsh-app/
 │   ├── status.html     # 引导/失败/安全模式页
 │   └── settings.html   # 设置页（含模型网关面板）
 ├── scripts/
-│   ├── build-portable.mjs   # 绿色免安装版（手工 asar + dist 复制）
+│   ├── build-portable.mjs   # 绿色目录版（手工 asar + dist 复制）
+│   ├── build-uat.mjs        # 构建到 out/DSH-App-UAT（验证环境，保留其 data\）
 │   ├── portable.mirror.mjs  # 单文件便携 exe（electron-builder + 镜像）
 │   ├── extract-exe-icon.mjs # 从 electron.exe 提取官方内嵌图标（zero-dep PE 解析）
 │   ├── dist.mirror.mjs      # NSIS 安装版 + 单文件便携（npmmirror 镜像）
-│   ├── release.ps1          # 通用发布脚本（版本号从 package.json 读取）
+│   ├── publish.mjs          # 发布到 GitHub：安全闸门 + 绿色 zip + 传源码 + 传资产 + 校验
+│   ├── verify-workbuddy.mjs # WorkBuddy 接入离线全链路验证（配套 mock-workbuddy.mjs）
+│   ├── probe-workbuddy-net.mjs / probe-opencode-zen.mjs # 上游连通性/端点排障探针
+│   ├── release.ps1          # 旧版 PowerShell 发布脚本（语义已对齐 publish.mjs）
 │   └── reupload-zip.ps1     # 单资产补传（大文件上传断线重试）
-└── tests/              # 6 个测试套件（unit 单测 / node tests/unit.js 可单独运行）
+└── tests/              # 6 个测试套件、216 个用例（node tests/unit.js 可单独运行）
 ```
 
 ## 设置项（设置窗口）
@@ -77,9 +81,18 @@ dsh-app/
 设置 → 模型网关：把多个 OpenAI 兼容上游（供应商）聚合为一个统一代理（继承自 DSH 桌面助手 v1.3.5 的成熟实现 `src/gateway/model-gateway.mjs`，原样分发，可与桌面助手保持同步）：
 
 - **统一接口**：`http://127.0.0.1:<port>/v1`（OpenAI 兼容）+ `/v1/messages`（Anthropic），统一 Key；
-- 同模型多供应商按**优先级路由 + 故障自动切换**，SSE 流式透传，`/v1/models` 目录合并；
-- **分级熔断**：401/403 业务拒绝立即熔断 30 分钟；网络错误/5xx 连续 3 次熔断 5 分钟；日志自动脱敏；
-- 可选 `clientUA` 仿真、`/health` 健康检查；
+- **选路顺序（2026-09-17 起）= 先 `priority` 升序（数值小者先试），同一优先级内按配置数组顺序**；配置页 ▲▼ 只调整同级内的先后，**不改写** priority（行内徽标显示 `P<优先级> #<列表位置>`）。层级优先于优先级：**在配置里声明承载该模型的家**永远排在"一个模型都没配、只能靠上游目录兜底"的家之前（2026-09-15 误路由事故的修复规则）；
+- 同模型多供应商**故障自动切换**，SSE 流式透传，`/v1/models` 目录合并；每次请求写一行 `[route] <模型>: N 个候选｜各家判定`，并记 `[call] … via=provider#账户`，排查"为什么走了这家/哪个 Key"直接看日志；
+- **分级熔断（2026-09-17 加固）**：
+  - 401/403 业务拒绝、**402 额度/预算耗尽**（`Budget pool quota has been exhausted` 等）→ 首次即**长熔断 30 分钟**（不会自愈的确定性状态，不再按"临时"每 90 秒重撞）；
+  - 网络错误/5xx → 连续 3 次后熔断，并按连续开闸次数**指数退避** 90s → 3m → 6m → 12m → 24m → 30m（成功后清零）——修"坏家每 90 秒被重探一次"；
+  - **半开探测用短超时**（默认 10 秒，可用 `DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS` 调整）：冷却到点的那次探测不再让用户请求白等 60 秒（实测某次 78.5s，现在最多 ~10s 就切到健康家）；
+  - 冷却到点必然放行一次探测、成功即恢复 → **熔断不会永久卡死**；日志自动脱敏；
+- 可选 `clientUA` 仿真、`/health` 健康检查（含账户池与代理状态）；
+- **WorkBuddy 内置模型接入（v1.8.1）**：WorkBuddy 只提供 OpenAI 线协议，网关自动把 dsh 的 Anthropic 请求翻译成 OpenAI、再把响应（**含 SSE 流**）翻回 Anthropic 事件序列；按本机安装版本合成**桌面客户端身份 UA**（`WorkBuddy/<app> … CLI/<cli>`，从 `resources\install-manifest.json` 与内置 CLI 的 `package.json` 读取）——用 CLI 形态 UA 调 chat 会被上游判"参数不符合模型要求"；凭据**只读**复用 WorkBuddy 桌面 App 的登录信息并在到期前自动刷新（刷新结果写在 `data\gateway\workbuddy-auth\`，绝不改写 App 自己的文件），路径免配置自动发现（`WORKBUDDY_AUTH_FILE` / `WORKBUDDY_APP_DIR` 可指定）。离线回归：`node scripts/verify-workbuddy.mjs`（配套模拟器 `scripts/mock-workbuddy.mjs`，**不需要安装 WorkBuddy**）；
+- **账户池 / 同一供应商多把 Key（v1.8.2）**：供应商可配 `apiKeys: ["sk-a", "sk-b"]`（设置页「API Key」框**每行一把，第 1 行为主 Key**），网关把它映射成**账户池轮换**——某把额度耗尽（402/积分不足）、密钥失效、限流时各自按类型冷却（30 分钟 / 60 分钟 / 90 秒）并**自动换下一把**，全部不可用才交给下一家供应商；**账户级失败不计供应商熔断**（否则第一次额度耗尽就把整家熔断，换 Key 的重试会被熔断挡在门外）。`GET /health` 的 `accounts` 逐把列出状态与剩余冷却时间，日志用 `via=provider#key2` 标注实际使用的 Key。等价写法：`accounts: [{ id, apiKey | authFile }]`（`authFile` 供 WorkBuddy 凭据用）；
+- **thinking 回传需求"学习"（v1.8.2）**：部分上游（air-outer / agentrouter）对"带 tool_use 但缺 thinking 块"的 assistant 轮回 400 或笼统 500；网关补空占位块重试一次，并**记住该家的需求**——后续请求首次就补齐，不再白打一次（省掉重复的上游失败与计费）；
+- **配置页（v1.8.2）**：左侧**分区导航**（服务 / 窗口 / 模型网关 / 插件市场 / 更新与诊断），点击平滑定位、滚动自动高亮，窄窗口或高缩放时自动变成顶部药丸标签条；供应商「API Key」支持多把（每行一把），它与「统一 Key」都带 **👁 明文显示**开关；
 - **「写入 dsh 配置」**：自动把网关注册为 dsh 的 `gateway` 提供商并写入统一 Key，重启 dsh web 后在模型选择器直接选用（打包版下网关运行时自动从 asar 解包到 `data\gateway\` 供外部 node 执行；**服务启动/写配置均传 `--config`/`--log` 并设 `DSH_GATEWAY_CONFIG` 环境变量，确保读取 dsh-app 自己的 `data\gateway.config.json`，不误读 `%APPDATA%\DSHDesktop` 的旧/模拟配置**）；
 - 统一 Key 输入框右侧有「**复制**」按钮，一键复制到剪贴板；
 - **「应用修改」与「保存并重启网关」分工**：前者只把右侧编辑面板内容写入表格/JSON 缓存（不落盘）；后者写盘并确保网关以新配置运行——**运行中自动重启、已停止则直接启动**（无需再手动点「启动网关」）；
@@ -87,7 +100,13 @@ dsh-app/
 - **日志实时可见**：网关内部日志（catalog 探测 / 调用 / 熔断 / 上游错误）同时输出到**设置页网关日志框与 `data\logs\gateway.log`**（`DSH_GATEWAY_VERBOSE=1`），401/余额/敏感词等上游问题可直接在界面看到原因；
 - **推理档位统一翻译**：dsh 发统一推理档位（off/low/medium/high/max），网关按各上游词汇翻译后转发（各供应商可在配置里设 `reasoningEffortMap`，如 sensenova `{"max":"xhigh","off":"none"}`；未配置时原样透传，与桌面助手一致）——解决"第三方供应商 deepseek 模型无法设置/生效推理级别"问题；dsh 侧需在 settings.yaml 的模型条目声明 `reasoningEfforts` 后选择器才提供档位；
 - **协议兼容（role 翻译）**：dsh 新版可能发送 `developer` 角色消息（OpenAI 协议演进），部分上游（sensenova 等）只接受 `system/assistant/user/tool`——网关转发时自动把 `developer` 合并为 `system`；
-- **代理自动注入**：agentrouter/air-outer 等上游需经 clash 类代理访问——网关进程启动时自动探测系统代理/常见端口（7890 等）并注入 `HTTPS_PROXY` + `NODE_USE_ENV_PROXY=1`（node≥24 fetch 原生走代理），不依赖桌面环境变量；设置页「网络代理」可显式配置（启用开关 + 地址，配置优先于自动探测）；
+- **代理自动注入**：agentrouter/air-outer 等上游需经 clash 类代理访问——网关进程启动时自动探测系统代理/常见端口（7890 等）并注入 `HTTPS_PROXY` + `NODE_USE_ENV_PROXY=1`（node≥24 fetch 原生走代理），不依赖桌面环境变量；设置页「网络代理」可显式配置（启用开关 + 地址，配置优先于自动探测）；显式关闭（`proxy.enabled: false`）时会**清掉继承来的代理变量**，确保"配了直连就是直连"；
+- **直连清单 / 代理事故修复（v1.8.2）**：`NODE_USE_ENV_PROXY=1` 时 Node 会把**连 127.0.0.1 的请求也交给代理**——clash 一停，网关连自己的 `/health` 自检都连不上，连续 3 次失败就**让健康进程自杀**（宿主当崩溃重启），同时所有上游请求秒回 ECONNREFUSED，而熔断器还把锅记在上游账号上。现在：
+  - **回环恒直连**：`127.0.0.1` / `localhost` / `::1` 永远在 `NO_PROXY` 里（本机自检绝不依赖代理）；
+  - **国内端点默认直连**：`copilot.tencent.com`、`*.workbuddy.cn`（实测直连 133ms 可达）；设置页新增「**直连域名**」输入框（支持裸后缀，如 `tencent.com`），落盘为 `proxy.noProxy: [...]`；
+  - 供应商条目可写 `"proxy": false`（该家直连）；`proxy.forceProxy: [...]` 反向把域名强制走代理（覆盖内置直连清单）；
+  - 进程内自检改为**裸 socket 发最小 HTTP 请求**（不经过任何代理层），且每次自检**最多记一次失败**（旧实现一次超时被记两笔，两分钟就能凑够 3 次）并写明失败原因与耗时；
+  - 上游网络错若发生在"本进程走代理、且该域名不在直连清单"时，日志会直接点名**"代理未运行（Clash 退出/重启中）"**，不再冤给上游；`/health` 也暴露 `proxy`（url / noProxy / envProxy）；
 - **零系统依赖（v1.5.17 内嵌运行时）**：基于 **Electron 44.3.0（内嵌 Node 24.20.0**，满足 dsh 全部 API 需求：zstd/stripTypeScriptTypes/HMR**）**——`DSH-App.exe` 以 `ELECTRON_RUN_AS_NODE=1` 即纯 Node 运行时 + 内嵌 npm（`resources\node_modules\npm`）——**用户机器无需安装 Node.js/npm，双击即用**：dsh 首次自动**异步**安装到便携目录 `data\node-global`（不阻塞界面）；安装/启动全程带 `--expose-internals`（dsh HMR 必需）与应用根目录 `node.exe`（硬链接，供原生依赖 postinstall 使用）；开发模式回退系统 node；
 - **dsh 自动升级（v1.5.17）**：设置开启「启动时检查更新」→ 检测到新版**自动升级**（先停服防文件占用 → `npm i -g @deepseek-ai/dsh@latest`（内嵌模式装便携前缀）→ 自动重启服务）；设置页「立即升级」按钮可手动触发，进度实时写日志；**安装/升级默认走 npmmirror 镜像**（npm 默认源国内会装出残缺包——实测 zod 缺 index.js 导致启动崩；`DSH_NPM_REGISTRY` 可覆盖）；断网不阻塞；dsh 自身配置/会话在 `~/.dsh` 不受升级影响；
 - **协议与仿真联动（关键）**：客户端仿真选 **Claude Code** → 网关走 **Anthropic 协议**（`/v1/messages`，x-api-key + anthropic-version + UA=claude-cli，与 Claude Code 完全同形态——**实测可避开 new-api 对 OpenAI 超长请求的内容拦截**）；选 **Codex/关闭** → **OpenAI 协议**（`/v1/chat/completions`，Bearer）。「写入 dsh 配置」按仿真写入 dsh 的 `api` 字段（claude→`anthropic-messages`、其余→`openai-completions`）与 `baseURL`（anthropic 不带 `/v1`——SDK 自拼路径，避免 `/v1/v1/messages` 双前缀 404）；模型条目自动带 `reasoningEfforts` 声明（off/low/medium/high/max，**新增模型写入时自动声明**），修改仿真后需重新「写入 dsh 配置」并重启 dsh web；
@@ -96,7 +115,7 @@ dsh-app/
 - **构建不销毁数据（R13）**：`build-portable.mjs` 重建输出目录前自动备份并还原 `data\`（配置/日志/设置）——修复"每次构建把用户数据清空、启动时从旧源迁移导致配置回退"的严重问题；
 - **审计加固（R10-R12）**：forward 响应体单次消费（错误详情/dump 不丢）、网关启动互斥（防并发双 spawn）、「写入 dsh 配置」端口实时读配置（未运行时也正确）、诊断完整 dump 落盘前脱敏；
 - **插件市场（v1.5.18，参考官方 DSH Community Market 架构）**：设置页新增「插件市场」卡片——**发现**（内置 DSH 1024Store 源，搜索/分页/详情）、**安装**（先经 npm registry 校验：同名 + 稳定版本 + 有效 `dsh.bundle.patch`，确认后执行标准 `dsh plugin add`）、**卸载**（`dsh plugin remove`）、**已安装**（读 dsh 真实 profile 状态——市场/命令行/手工安装互通，**不影响自行安装的插件**）。安全边界照搬官方：**源提供的版本不作为安装目标**（npm latest 为准）、源命令字符串一律丢弃、仅浏览型条目只展示；安装/卸载改动需重启 dsh 服务生效；`DSH_NPM_REGISTRY` 可换元数据源；
-- 配置（供应商列表/优先级/Key）保存在**程序目录旁 `data\gateway.config.json`**（绿色便携，随程序目录走；不可写时才回退 `%APPDATA%\DSH-App\`；与桌面助手配置同构，可直接沿用）；
+- 配置（供应商列表/优先级/Key/直连域名）保存在**程序目录旁 `data\gateway.config.json`**（绿色便携，随程序目录走；不可写时才回退 `%APPDATA%\DSH-App\`；与桌面助手配置同构，可直接沿用）。设置页覆盖的字段：顺序（▲▼）、`priority`、`apiKey`/`apiKeys`、`models`（含 `vision`/`contextWindow`/`maxTokens`）、启用开关、`protocol`/`auth`/`accounts`/`quirks`/`headers`（在 JSON 里编辑，编辑器顶部显示摘要）；`proxy.noProxy` 对应设置页的「直连域名」；
 - **一次性自动迁移**：本地网关配置缺失、或仍是**模拟/示例数据**（mockA/mockB、provider-a/b）时，按优先级从桌面助手真实位置自动复制/升级（旧文件备份为 `.bak-mock`）——环境变量 `DSH_LEGACY_CONFIG` → 沿程序目录祖先链找 `<base>\dsh-desktop\data\`（真实便携配置） → `%USERPROFILE%\dsh-desktop\data\` → 旧 `%APPDATA%` 位置。来源本身是模拟数据的会被跳过；用户已修改的真实配置不会被覆盖；无导入按钮。
 
 ## 打包分发（免安装版）
@@ -161,10 +180,14 @@ npm run dist:mirror              # NSIS 安装版 + 单文件便携（dist/，�
 node scripts/build-portable.mjs  # 绿色版（out/DSH-App/；若旧目录被运行中实例占用自动回退，
                                  #   也可 $env:OUT_NAME='DSH-App-v1.5.9' 指定）
 
-# 2) 发布到 GitHub（无需 git 客户端；API Token 仅在内存中）
-powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Token <TOKEN> [-CleanOld]
-#   -CleanOld：清理仓库里 v1.x C# 桌面助手的旧文件（setup/、gateway/、DSHDesktop.cs 等，仅首次需要）
-#   Release 附带：安装版 exe / 单文件便携 exe / 绿色版 zip（同名资产自动替换）
+# 2) 发布到 GitHub（node 实现 `scripts/publish.mjs`；API Token 仅在内存中）
+node scripts/publish.mjs --token <TOKEN>            # 或设环境变量 DSH_GH_TOKEN
+#   自动完成：安全闸门（真实邮箱/密钥检测，命中即中止）→ 打绿色版 zip（剔除 data\、logs\、
+#   node.exe、*.log/*.tmp，打包后再校验 zip 结构）→ 上传源码（剔除 node_modules/out/dist/.git）
+#   → 创建/复用 v<version> release（正文取 package.json 的 dshApp.releaseNotes）→ 上传 3 个资产
+#   （同名旧资产先改名保留，新资产成功后才删）→ 断言资产名与大小和本地一致。
+#   可选：--skip-source / --skip-assets / --zip-from <绿色目录> / --notes-file <本版说明.md>
+#   （旧版 PowerShell 流程 scripts\release.ps1 / reupload-zip.ps1 仍保留，语义一致）
 
 # 3) 大文件上传断线补传（可选）
 powershell -ExecutionPolicy Bypass -File scripts\reupload-zip.ps1 -Token <TOKEN>
@@ -175,7 +198,7 @@ powershell -ExecutionPolicy Bypass -File scripts\reupload-zip.ps1 -Token <TOKEN>
 ## 测试
 
 ```powershell
-npm test          # 6 个套件（见下），全部在临时目录内操作，不触碰真实用户数据
+npm test          # 6 个套件、共 216 个用例，全部在临时目录内操作，不触碰真实用户数据
 npm run check     # 语法检查
 ```
 
@@ -186,7 +209,7 @@ npm run check     # 语法检查
 | `tests/market.test.js` | 插件市场条目标准化与源配置 |
 | `tests/email-scrub.test.mjs` | **发布安全闸门**（真实邮箱/密钥拦截、占位符不误报、fail-closed） |
 | `tests/runtime.test.js` | 运行时回归：launcher 状态机 / 看门狗终态 / 市场包名校验 / 网关管理器 / 主进程接线 / 渲染层结构 |
-| `tests/gateway.test.js` | **模型网关端到端**：进程内假上游 + 真启动网关进程（鉴权 / SSE / 客户端断开取消上游 / 413 / 畸形 Host / write-dsh 的 YAML 定位） |
+| `tests/gateway.test.js` | **模型网关端到端**（进程内假上游 + 真启动网关进程）：鉴权 / SSE 透传与聚合 / **协议翻译**（Anthropic↔OpenAI、工具名迟到、thinking 回传与"学习"）/ **WorkBuddy** 桌面身份与凭据刷新 / **账户池与多 Key 轮换** / **熔断分级**（401/403/402 长熔断、网络类指数退避、半开短超时）/ **选路顺序**（priority 优先、同级按数组、层级优先于优先级）/ 内容拦截与降敏重试 / SSE 首事件即错误 / 客户端断开 / 413 / 畸形 Host / write-dsh 的 YAML 定位 / **代理事故回归** |
 
 > 本机若未安装独立 Node.js，`node` 会解析到随应用分发的 `DSH-App.exe`（Electron 的
 > `ELECTRON_RUN_AS_NODE` 模式）——测试已适配（`process.noAsar`、`process.resourcesPath`
