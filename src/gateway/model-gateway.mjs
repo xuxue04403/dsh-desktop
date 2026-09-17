@@ -373,6 +373,47 @@ let emptyToolUseDropHits = 0;
  */
 const thinkingPassbackProviders = new Set();
 
+/**
+ * 上游"**不支持** extended thinking"的学习标记（2026-09-17）。实测 amd/GLM-5.3-Flash 会拒收顶层
+ * `thinking` 参数（客户端按模型推理档位自动带上）→ SSE 首事件报 `"thinking" is not supported`。
+ * 命中一次即记住该家：后续请求**首次就剥掉** thinking，不再白失败一轮（与 thinkingPassbackProviders 对称）。
+ * 不想等学习、或想强制某家永不发 thinking，可在配置里写 `quirks: ["drop-thinking"]`。
+ */
+const thinkingUnsupportedProviders = new Set();
+
+/** 该家是否应去掉顶层 thinking 参数：已学习，或显式声明了 drop-thinking quirk。 */
+function shouldDropThinking(provider) {
+  return thinkingUnsupportedProviders.has(provider.id) || providerQuirks(provider).has('drop-thinking');
+}
+
+/**
+ * 去掉顶层 `thinking` 参数（上游明确说不支持时）。返回 { body }，本来就没有则返回 null。
+ * 只动**顶层参数**：历史消息里的 thinking 内容块属于"回传结构"，与此无关，不在此处处理。
+ */
+function stripThinkingParam(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body) || !('thinking' in body)) return null;
+  const out = { ...body };
+  delete out.thinking;
+  return { body: out };
+}
+
+/** 去掉 thinking 后的"复活重试"（4xx 与 SSE 首事件两种错误形态共用）；返回新 Response 或 null。 */
+async function retryWithoutThinking(provider, upstreamPath, upstreamHeaders, body, timeoutMs) {
+  const stripped = stripThinkingParam(body);
+  if (!stripped) return null;
+  thinkingUnsupportedProviders.add(provider.id);   // 先学习：即使本次重试也失败，下次首次就剥掉
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), timeoutMs);
+  try {
+    return await fetch(`${upstreamBase(provider.baseURL)}${upstreamPath}`, {
+      method: 'POST', headers: upstreamHeaders, body: JSON.stringify(stripped.body), signal: c.signal,
+    });
+  } catch (e) {
+    log(`upstream ${provider.id} 去 thinking 重试失败: ${e.message}`);
+    return null;
+  } finally { clearTimeout(t); }
+}
+
 /** 纯读：该 provider 当前是否不可用（冷却窗口内，或半开探测名额已被别的请求占用）。 */
 function breakerIsOpen(providerId) {
   const b = breaker.get(providerId);
@@ -693,10 +734,17 @@ function modelEntries(provider) {
   return out;
 }
 
-/** 逻辑模型名 → 该 provider 的上游真实 ID（未声明该逻辑名 → null，表示原样透传请求里的 model） */
-function upstreamIdFor(provider, logical) {
-  const hit = modelEntries(provider).find((e) => e.as === logical);
-  return hit ? hit.up : null;
+/**
+ * 逻辑模型名 → 该 provider 的上游真实 ID（未声明该逻辑名 → null，表示原样透传请求里的 model）。
+ * `hasImage`：请求里带图片时**优先选声明了 `vision: true` 的那条映射** —— 同一逻辑名可能同时映射到
+ * 普通变体与 vision 变体（如实测 amd：`DeepSeek-V4-Flash` 与 `DeepSeek-V4-Flash-Vision-Exp`），
+ * 若按声明顺序取第一条，图片会被发到不支持图片的普通变体上（上游报错或忽略图片）。
+ */
+function upstreamIdFor(provider, logical, hasImage) {
+  const list = modelEntries(provider).filter((e) => e.as === logical);
+  if (!list.length) return null;
+  const hit = (hasImage && list.find((e) => e.vision === true)) || list[0];
+  return hit.up;
 }
 
 /** 该 provider 声明的逻辑模型名（去重，保序） */
@@ -709,9 +757,9 @@ function logicalModelNames(provider) {
   return out;
 }
 
-/** 把一个逻辑模型名换成该 provider 的上游 ID（无需替换时原样返回传入对象） */
-function bodyForProvider(body, provider, logical) {
-  const up = upstreamIdFor(provider, logical);
+/** 把一个逻辑模型名换成该 provider 的上游 ID（无需替换时原样返回传入对象；hasImage 见 upstreamIdFor） */
+function bodyForProvider(body, provider, logical, hasImage) {
+  const up = upstreamIdFor(provider, logical, hasImage);
   if (!up || up === logical) return body;
   return Object.assign({}, body, { model: up });
 }
@@ -1995,6 +2043,15 @@ const THINKING_PASSBACK_RE = /content\[\]\.thinking|thinking[^.\n]{0,40}must be 
 const THINKING_REJECTED_GENERIC_RE = /rejected the request as invalid/i;
 
 /**
+ * 上游**不支持** extended thinking（与上面"必须回传 thinking"正好相反，2026-09-17 实测）。
+ * 形态：客户端按模型声明的推理档位带了顶层 `thinking` 参数，而该家的这个模型不支持：
+ *   amd/GLM-5.3-Flash → HTTP 200 + SSE 首事件 error：`"thinking" is not supported for this model.
+ *   Remove the "thinking" parameter or use a model that supports extended thinking.`
+ * 处理：去掉顶层参数重试一次，并**记住该家**（下次首次就剥掉）；也可显式声明 quirks: ["drop-thinking"]。
+ */
+const THINKING_UNSUPPORTED_RE = /"thinking"\s+is not supported|thinking\b[^.\n]{0,30}\bnot supported|does not support[^.\n]{0,24}thinking|不支持[^。\n]{0,10}(?:思考|thinking)/i;
+
+/**
  * 给"带 tool_use 但缺 thinking 块"的 assistant 轮补一个空占位 thinking 块。
  * 只做**结构性补齐**：thinking 正文与签名都为空（不伪造推理内容）。
  * @returns {{body:object, repaired:number}|null} 无需修复时返回 null。
@@ -2121,6 +2178,11 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
   // 只把上游响应原样流回。有 body 的转发一律走 POST + 翻译路径。
   const rawMode = !!(opts && opts.raw);
   const method = (opts && opts.method) || 'POST';
+  // 2026-09-17 修复：SSE「首事件即错误」的偷看块在 **try 块之外**，块内的 `isAnthropicPath`
+  // 在那里不可见——引用它会抛 ReferenceError 并被偷看逻辑的 catch 吞掉，等于让该防线静默失效
+  //（测试实测：`upstream p1 首事件偷看失败：isAnthropicPath is not defined`）。
+  // 因此这里在外层也留一个同义常量，专供 try 块之外的判定使用。
+  const isAnthropicWire = upstreamPath === '/messages';
   // 审计修复（P2，本次）：发请求前先占用熔断半开探测名额（唯一的状态转换点）。抢不到
   //（冷却未到点 / 已有探测在途）→ 本次不发任何上游请求，直接交给下一家。
   if (!breakerAcquire(provider.id)) {
@@ -2165,6 +2227,15 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         log(`upstream ${provider.id}（已学习）预先补齐 ${pre.repaired} 处空占位 thinking 块，省掉一次失败往返`);
       }
     }
+    // 2026-09-17：该家不支持 extended thinking（已学习，或显式 quirks: ["drop-thinking"]）
+    // → 首次请求就去掉顶层 thinking 参数，不再白失败一轮
+    if (!rawMode && isAnthropicPath && shouldDropThinking(provider)) {
+      const stripped = stripThinkingParam(outBody);
+      if (stripped) {
+        outBody = stripped.body;
+        log(`upstream ${provider.id}（不支持 thinking）→ 去掉顶层 thinking 参数后发送`);
+      }
+    }
     // raw 模式不带 body：显式传 undefined，避免 fetch 在没有 content-length 时挂起等待请求体
     init = { method, headers: upstreamHeaders, signal: controller.signal };
     if (!rawMode) init.body = JSON.stringify(outBody);
@@ -2193,6 +2264,17 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
             clearTimeout(t2);
           }
           firstDetail = null;   // 换了新响应，detail 需重读
+        }
+      } else if (isAnthropicPath && THINKING_UNSUPPORTED_RE.test(firstDetail) && stripThinkingParam(body)) {
+        // 上游明确说"不支持 thinking"（与实际形态相反的另一种 thinking 规则）→ 去掉顶层参数重试一次。
+        // 与"必须回传 thinking"的补位重试对称：命中即记住该家，后续请求首次就剥掉。
+        const originalStatus = upstream.status;
+        const revived = await retryWithoutThinking(provider, upstreamPath, upstreamHeaders, body, timeoutMs);
+        if (revived) {
+          log(`upstream ${provider.id} 不支持 thinking（HTTP ${originalStatus}）`
+            + ` → 去掉顶层 thinking 参数后重试（HTTP ${revived.status}，已记住该家）`);
+          upstream = revived;
+          firstDetail = null;
         }
       } else if (isAnthropicPath
         && (THINKING_PASSBACK_RE.test(firstDetail) || THINKING_REJECTED_GENERIC_RE.test(firstDetail))) {
@@ -2346,8 +2428,8 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     return false;
   }
   breakerRecordSuccess(provider.id);   // V1：成功清零熔断计数
-  const bodyStream = upstream.body;
-  const ctype = String(upstream.headers.get('content-type') || 'application/json');
+  let bodyStream = upstream.body;
+  let ctype = String(upstream.headers.get('content-type') || 'application/json');
   // —— SSE「首事件就是错误」识别（2026-09-15 实测事故）——
   // 部分上游（实测 api.chiyi.cc）对失败的请求回 **HTTP 200 + text/event-stream**，流里第一件事
   // 就是 `event: error` + `data: {"error":{"message":"Service temporarily unavailable",...}}`。
@@ -2378,12 +2460,32 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         || /"type"\s*:\s*"(message_start|content_block_start|response\.created)"/.test(head);
       const looksError = !hasRealEvent && (/event:\s*error/i.test(head) || /"type"\s*:\s*"error"/.test(head.slice(0, 2048)));
       if (looksError) {
-        const detail = head.replace(/\s+/g, ' ').slice(0, 200);
-        log(`upstream ${provider.id} HTTP 200 但 SSE 首事件是错误 → 判定该家失败并换下一家：${maskSecrets(detail)}`);
-        catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
-        breakerRecordFail(provider.id, 0);   // 短熔断（连续 3 次 / 或半开探测失败）
-        try { await peekReader.cancel(); } catch { /* 忽略 */ }
-        return rawMode ? { retryable: 0 } : false;
+        // ① 上游说"不支持 thinking"（实测 amd/GLM-5.3-Flash：HTTP 200 + SSE 首事件 error）
+        //    → 去掉顶层 thinking 参数重试一次。此刻尚未向客户端写任何字节，重试是安全的。
+        let revived = null;
+        if (isAnthropicWire && THINKING_UNSUPPORTED_RE.test(head) && stripThinkingParam(body)) {
+          try { await peekReader.cancel(); } catch { /* 忽略 */ }
+          revived = await retryWithoutThinking(provider, upstreamPath, upstreamHeaders, body, timeoutMs);
+          if (revived && revived.ok) {
+            log(`upstream ${provider.id} 不支持 thinking（HTTP 200 + SSE 首事件错误）`
+              + ' → 去掉顶层 thinking 参数后重试成功（已记住该家）');
+            upstream = revived;
+            bodyStream = revived.body;
+            ctype = String(revived.headers.get('content-type') || 'application/json');
+            pendingHead = null;
+          } else if (revived) {
+            log(`upstream ${provider.id} 去 thinking 重试仍非 2xx：HTTP ${revived.status}`);
+          }
+        }
+        // ② 重试无效 → 按既有规则判该家失败并换下一家
+        if (!(revived && revived.ok)) {
+          const detail = head.replace(/\s+/g, ' ').slice(0, 200);
+          log(`upstream ${provider.id} HTTP 200 但 SSE 首事件是错误 → 判定该家失败并换下一家：${maskSecrets(detail)}`);
+          catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
+          breakerRecordFail(provider.id, 0);   // 短熔断（连续 3 次 / 或半开探测失败）
+          try { await peekReader.cancel(); } catch { /* 忽略 */ }
+          return rawMode ? { retryable: 0 } : false;
+        }
       }
       peekReader.releaseLock();   // 未判失败：把流交回下面的正常消费路径
     } catch (peekErr) {
@@ -3254,8 +3356,9 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
     }
   }
   for (const p of tryOrder) {
-    // 模型映射：把逻辑名换成该供应商的上游真实 ID（未声明映射 → 原样透传）
-    const attemptBody = bodyForProvider(body, p, model);
+    // 模型映射：把逻辑名换成该供应商的上游真实 ID（未声明映射 → 原样透传）；
+    // 带图片时优先选声明了 vision 的那条上游 ID（见 upstreamIdFor）
+    const attemptBody = bodyForProvider(body, p, model, bodyHasImage(body));
     const upModel = attemptBody.model;
     log(`try ${p.id} for ${model}${upModel !== model ? ' → ' + upModel : ''}`);
     // 透传 dsh 原始请求标识（K1 防屏蔽）/ 仿真模式（V2: clientProfile）：clientHeaders = req.headers
@@ -3535,8 +3638,9 @@ async function handleMessages(cfg, req, res, body) {
   }
 
   for (const p of tryOrder) {
-    // 模型映射：逻辑名 → 该供应商的上游真实 ID（Anthropic 路径同样处理）
-    const attemptBody = bodyForProvider(outBody, p, model);
+    // 模型映射：逻辑名 → 该供应商的上游真实 ID（Anthropic 路径同样处理）；
+    // 带图片时优先选声明了 vision 的那条上游 ID（见 upstreamIdFor）
+    const attemptBody = bodyForProvider(outBody, p, model, bodyHasImage(body));
     const upModel = attemptBody.model;
     // 上游线协议：声明 openai-chat 的家走协议翻译（客户端说 Anthropic，上游只会 OpenAI）
     const toOpenAI = providerProtocol(p) === 'openai-chat';
