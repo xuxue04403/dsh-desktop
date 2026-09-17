@@ -278,6 +278,8 @@ writeFileSync(path.join(appDir, '使用说明.txt'),
   + '  · 多账号轮询：在 accounts 数组里再加一条 { "id": "acct2", "authFile": "另一个账号的凭据文件" }，\r\n'
   + '    额度耗尽 / 登录失效 / 限流时自动切到下一个账户；账户状态见 http://127.0.0.1:3091/health\r\n'
   + '    的 accounts 字段（含各自冷却剩余时间），日志里的 via=workbuddy#acct2 表示实际用的账户。\r\n'
+  + '  · 同一家多把 Key：设置页供应商编辑器的「多 Key」框每行填一把（写入配置的 apiKeys 数组），\r\n'
+  + '    网关按账户池轮换；API Key 与「多 Key」框都有 👁 按钮可切换明文显示/隐藏。\r\n'
   + '  · 网关会自动刷新过期 token（结果写在 data\\gateway\\workbuddy-auth\\，不碰 App 自己的文件）。\r\n'
   + '  · WorkBuddy 只提供 OpenAI 线协议，网关会自动把 dsh 的 Anthropic 请求翻译成 OpenAI、\r\n'
   + '    再把流式响应翻回 Anthropic —— 无需改 dsh 侧任何配置。\r\n'
