@@ -92,6 +92,8 @@ dsh-app/
 - **WorkBuddy 内置模型接入（v1.8.1）**：WorkBuddy 只提供 OpenAI 线协议，网关自动把 dsh 的 Anthropic 请求翻译成 OpenAI、再把响应（**含 SSE 流**）翻回 Anthropic 事件序列；按本机安装版本合成**桌面客户端身份 UA**（`WorkBuddy/<app> … CLI/<cli>`，从 `resources\install-manifest.json` 与内置 CLI 的 `package.json` 读取）——用 CLI 形态 UA 调 chat 会被上游判"参数不符合模型要求"；凭据**只读**复用 WorkBuddy 桌面 App 的登录信息并在到期前自动刷新（刷新结果写在 `data\gateway\workbuddy-auth\`，绝不改写 App 自己的文件），路径免配置自动发现（`WORKBUDDY_AUTH_FILE` / `WORKBUDDY_APP_DIR` 可指定）。离线回归：`node scripts/verify-workbuddy.mjs`（配套模拟器 `scripts/mock-workbuddy.mjs`，**不需要安装 WorkBuddy**）；
 - **账户池 / 同一供应商多把 Key（v1.8.2）**：供应商可配 `apiKeys: ["sk-a", "sk-b"]`（设置页「API Key」框**每行一把，第 1 行为主 Key**），网关把它映射成**账户池轮换**——某把额度耗尽（402/积分不足）、密钥失效、限流时各自按类型冷却（30 分钟 / 60 分钟 / 90 秒）并**自动换下一把**，全部不可用才交给下一家供应商；**账户级失败不计供应商熔断**（否则第一次额度耗尽就把整家熔断，换 Key 的重试会被熔断挡在门外）。`GET /health` 的 `accounts` 逐把列出状态与剩余冷却时间，日志用 `via=provider#key2` 标注实际使用的 Key。等价写法：`accounts: [{ id, apiKey | authFile }]`（`authFile` 供 WorkBuddy 凭据用）；
 - **thinking 回传需求"学习"（v1.8.2）**：部分上游（air-outer / agentrouter）对"带 tool_use 但缺 thinking 块"的 assistant 轮回 400 或笼统 500；网关补空占位块重试一次，并**记住该家的需求**——后续请求首次就补齐，不再白打一次（省掉重复的上游失败与计费）；
+- **上游"不支持 thinking"的相反形态（v1.8.2）**：客户端会按模型声明的推理档位带顶层 `thinking` 参数，而有的上游模型不支持（实测 amd/GLM-5.3-Flash → `HTTP 200 + SSE 首事件 error：`"thinking" is not supported…``；也有直接回 400 的）。网关命中该错误时**去掉顶层 `thinking` 参数重试一次**，并记住该家——后续请求首次就剥掉，不再白失败一轮；不想等学习或要强制某家永不发 thinking，可写 `quirks: ["drop-thinking"]`。注意粒度是**按供应商**（该家任一模型被拒后，该家全部请求都会剥掉 thinking）；
+- **同一逻辑名映射多个上游 ID 时按图片能力选择（v1.8.2）**：一个逻辑名可以同时映射"普通变体"与"vision 变体"（如 amd 的 `DeepSeek-V4-Flash` / `DeepSeek-V4-Flash-Vision-Exp`）——**带图片的请求自动走声明了 `vision: true` 的那条**，纯文本仍走第一条，避免把图片发给不支持图片的变体（配置里两条顺序无所谓）；
 - **配置页（v1.8.2）**：左侧**分区导航**（服务 / 窗口 / 模型网关 / 插件市场 / 更新与诊断），点击平滑定位、滚动自动高亮，窄窗口或高缩放时自动变成顶部药丸标签条；供应商「API Key」支持多把（每行一把），它与「统一 Key」都带 **👁 明文显示**开关；
 - **「写入 dsh 配置」**：自动把网关注册为 dsh 的 `gateway` 提供商并写入统一 Key，重启 dsh web 后在模型选择器直接选用（打包版下网关运行时自动从 asar 解包到 `data\gateway\` 供外部 node 执行；**服务启动/写配置均传 `--config`/`--log` 并设 `DSH_GATEWAY_CONFIG` 环境变量，确保读取 dsh-app 自己的 `data\gateway.config.json`，不误读 `%APPDATA%\DSHDesktop` 的旧/模拟配置**）；
 - 统一 Key 输入框右侧有「**复制**」按钮，一键复制到剪贴板；
@@ -209,7 +211,7 @@ npm run check     # 语法检查
 | `tests/market.test.js` | 插件市场条目标准化与源配置 |
 | `tests/email-scrub.test.mjs` | **发布安全闸门**（真实邮箱/密钥拦截、占位符不误报、fail-closed） |
 | `tests/runtime.test.js` | 运行时回归：launcher 状态机 / 看门狗终态 / 市场包名校验 / 网关管理器 / 主进程接线 / 渲染层结构 |
-| `tests/gateway.test.js` | **模型网关端到端**（进程内假上游 + 真启动网关进程）：鉴权 / SSE 透传与聚合 / **协议翻译**（Anthropic↔OpenAI、工具名迟到、thinking 回传与"学习"）/ **WorkBuddy** 桌面身份与凭据刷新 / **账户池与多 Key 轮换** / **熔断分级**（401/403/402 长熔断、网络类指数退避、半开短超时）/ **选路顺序**（priority 优先、同级按数组、层级优先于优先级）/ 内容拦截与降敏重试 / SSE 首事件即错误 / 客户端断开 / 413 / 畸形 Host / write-dsh 的 YAML 定位 / **代理事故回归** |
+| `tests/gateway.test.js` | **模型网关端到端**（进程内假上游 + 真启动网关进程）：鉴权 / SSE 透传与聚合 / **协议翻译**（Anthropic↔OpenAI、工具名迟到、thinking 回传与"学习"、**不支持 thinking 的剥离重试**）/ **WorkBuddy** 桌面身份与凭据刷新 / **账户池与多 Key 轮换** / **熔断分级**（401/403/402 长熔断、网络类指数退避、半开短超时）/ **选路顺序**（priority 优先、同级按数组、层级优先于优先级）/ **图片请求选择 vision 变体** / 内容拦截与降敏重试 / SSE 首事件即错误 / 客户端断开 / 413 / 畸形 Host / write-dsh 的 YAML 定位 / **代理事故回归** |
 
 > 本机若未安装独立 Node.js，`node` 会解析到随应用分发的 `DSH-App.exe`（Electron 的
 > `ELECTRON_RUN_AS_NODE` 模式）——测试已适配（`process.noAsar`、`process.resourcesPath`
