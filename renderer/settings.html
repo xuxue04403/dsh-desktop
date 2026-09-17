@@ -15,11 +15,13 @@
   /* 标签宽度 165px（2026-09-15）：130px 装不下「启动应用时自动启动服务」这类长标签 →
      折行把该行撑成两行高，与相邻行的复选框不对齐。 */
   .row label { width: 165px; color: #9aa7bc; flex: none; }
-  .row input[type=text] {
+  .row input[type=text], .row textarea {
     flex: 1; background: #1b212c; border: 1px solid #2c3546; color: #e8ecf2;
     border-radius: 6px; padding: 7px 10px; font-size: 13px; outline: none;
     font-family: inherit;
   }
+  /* 2026-09-17 修复：多 Key 的 textarea 此前没吃到暗色样式（渲染成系统白底，用户截图反馈） */
+  .row textarea { resize: vertical; line-height: 1.6; }
   .row input[type=checkbox] { width: 16px; height: 16px; accent-color: #2b5bd7; }
   button {
     border: 1px solid rgba(110, 130, 160, .35); background: rgba(40, 48, 62, .9);
@@ -29,6 +31,11 @@
   button:hover { background: rgba(56, 67, 86, .95); }
   button.primary { background: #2b5bd7; border-color: #2b5bd7; color: #fff; }
   button.primary:hover { background: #3a6cf5; }
+  /* Key 明文开关（2026-09-17）：👁 按钮 + textarea 的掩码（Chromium 支持 -webkit-text-security，
+     运行时再用 CSS.supports 兜底检测；不支持时至少还有 input[type=password] 那一行是掩码的）。 */
+  button.eye { padding: 6px 9px; line-height: 1; font-size: 13px; }
+  .masked { -webkit-text-security: disc; }
+  textarea.keys { min-height: 54px; resize: vertical; font-family: inherit; }
   .card {
     background: rgba(28, 34, 46, .6); border: 1px solid rgba(72, 84, 108, .35);
     border-radius: 10px; padding: 16px 18px; margin-bottom: 16px;
@@ -184,9 +191,65 @@
     .gw-wrap { flex-direction: column; }
     .gw-left, .gw-right { width: 100%; flex: none; }
   }
+
+  /* —— 左侧分区导航（2026-09-17）：长配置页按块快速定位 + 滚动高亮 ——
+     布局：.layout 两列（sticky 导航 + 内容）；窄窗口 / 大缩放（<820 CSS px）退化为横向药丸标签条。
+     二稿（2026-09-17，用户反馈"导航项大小与右侧不搭、放大到最大很差"）：宽度改自适应内容、
+     字号/内边距加大到与表单控件同体量；大缩放下整个导航自动变成顶部药丸条，不再是一根细长条。 */
+  html { scroll-behavior: smooth; }
+  .layout { display: flex; gap: 24px; align-items: flex-start; }
+  .content { flex: 1; min-width: 0; }
+  .sidenav {
+    position: sticky; top: 14px; flex: none;
+    width: auto; min-width: 176px; max-width: 320px;
+    display: flex; flex-direction: column; gap: 4px;
+    padding: 12px; border-radius: 12px;
+    background: rgba(28, 34, 46, .6); border: 1px solid rgba(72, 84, 108, .35);
+  }
+  .sidenav .nav-title {
+    font-size: 12px; color: #8a93a3; padding: 2px 14px 9px; letter-spacing: 1px;
+  }
+  .nav-item {
+    display: block; padding: 10px 16px; border-radius: 9px; font-size: 14.5px; line-height: 1.4;
+    color: #9aa7bc; text-decoration: none; cursor: pointer;
+    border-left: 3px solid transparent; white-space: nowrap;
+  }
+  .nav-item:hover { background: rgba(56, 67, 86, .55); color: #e8ecf2; }
+  .nav-item.active {
+    background: rgba(43, 91, 215, .18); color: #fff;
+    border-left-color: #2b5bd7; font-weight: 600;
+  }
+  /* 锚点定位留出呼吸空间（否则被吸顶导航压住标题） */
+  .card[id] { scroll-margin-top: 14px; }
+  /* 窄窗口 / 系统缩放放大（窗口 CSS 宽度 <820px，含 200% 缩放的普通窗口）：
+     导航不再占一列，改为横向药丸标签条（与按钮同体量，可换行）。 */
+  @media (max-width: 820px) {
+    .layout { flex-direction: column; gap: 12px; }
+    .sidenav {
+      position: static; width: 100%; max-width: none;
+      flex-direction: row; flex-wrap: wrap; gap: 8px; padding: 10px;
+    }
+    .sidenav .nav-title { display: none; }
+    .nav-item {
+      border-left: none; border: 1px solid rgba(110, 130, 160, .35); border-radius: 999px;
+      padding: 9px 18px; background: rgba(40, 48, 62, .9); font-size: 14px;
+    }
+    .nav-item.active { background: rgba(43, 91, 215, .45); border-color: #2b5bd7; color: #fff; }
+  }
 </style>
 </head>
 <body>
+  <div class="layout">
+  <!-- 左侧分区导航（2026-09-17）：点一下跳到对应配置块；滚动时自动高亮当前所在块 -->
+  <nav class="sidenav" id="sideNav" aria-label="设置分区">
+    <div class="nav-title">设置分区</div>
+    <a class="nav-item" href="#card-service">服务</a>
+    <a class="nav-item" href="#card-window">窗口</a>
+    <a class="nav-item" href="#card-gateway">模型网关</a>
+    <a class="nav-item" href="#card-market">插件市场</a>
+    <a class="nav-item" href="#card-diag">更新与诊断</a>
+  </nav>
+  <main class="content">
   <h1>DSH App · 设置</h1>
 
   <div class="warn hidden" id="safeWarn">
@@ -194,7 +257,7 @@
     排查并修复插件问题后，点击下方「退出安全模式并重启」恢复正常状态。
   </div>
 
-  <div class="card">
+  <div class="card" id="card-service">
     <h2>服务</h2>
     <div class="row"><label>端口</label><input type="text" id="port" /></div>
     <div class="row"><label>工作目录</label><input type="text" id="workdir" /><button id="btnBrowse">浏览…</button></div>
@@ -203,7 +266,7 @@
     <div class="hint">端口对应 `dsh web --port`（默认 3080）；工作目录为 dsh 的启动目录（默认为用户主目录）。</div>
   </div>
 
-  <div class="card">
+  <div class="card" id="card-window">
     <h2>窗口</h2>
     <div class="row"><label>关闭窗口最小化到托盘</label><input type="checkbox" id="minimizeToTray" /></div>
     <div class="row"><label>就绪后自动打开系统浏览器</label><input type="checkbox" id="autoOpenBrowser" /></div>
@@ -228,6 +291,7 @@
     <div class="row">
       <label>统一 Key</label>
       <input type="password" id="gwApiKey" placeholder="网关对外统一 Key（任意客户端使用）" style="flex:1;" />
+      <button type="button" id="gwApiKeyEye" class="eye" title="显示/隐藏明文">👁</button>
       <button id="btnGwKeyCopy" title="复制统一 Key 到剪贴板" style="white-space:nowrap;">复制</button>
     </div>
     <div class="row">
@@ -255,6 +319,12 @@
       <input type="text" id="gwProxyUrl" placeholder="http://127.0.0.1:7890" style="flex:1;" />
       <span style="color:#8a93a3;font-size:11px;">访问需代理的上游时启用；留空自动探测本机代理</span>
     </div>
+    <div class="row">
+      <label>直连域名</label>
+      <input type="text" id="gwProxyNoProxy" placeholder="copilot.tencent.com, workbuddy.cn（逗号分隔；支持后缀，如 tencent.com）"
+        style="flex:1;" />
+      <span style="color:#8a93a3;font-size:11px;">这些域名绕过代理直连；<b>127.0.0.1/localhost 恒直连</b>（本机自检不走代理）</span>
+    </div>
     <details class="gw-hint-more">
       <summary>说明：防屏蔽与熔断 · 支持的协议 · 模型路由规则（点击展开）</summary>
       <div class="hint">防屏蔽：仿真模式不透传任何 dsh 特征头；熔断（401/403 与"余额/额度"类拒绝即断 30 分钟、网络/5xx 连续 3 次断 5 分钟）、上游错误日志自动脱敏。<b>协议联动</b>：「写入 dsh 配置」按此处的仿真选择写入 dsh 协议——Claude Code=Anthropic（/v1/messages），Codex/关闭=OpenAI（/v1/chat/completions）；修改仿真后需重新「写入 dsh 配置」并重启 dsh web。
@@ -266,9 +336,9 @@
     <div class="gw-wrap">
       <div class="gw-left">
         <div class="gw-tools">
-          <button type="button" id="btnGwUp" title="把选中的供应商上移一位（列表顺序 = 网关取候选的顺序；不改动优先级字段）">▲ 上移</button>
-          <button type="button" id="btnGwDown" title="把选中的供应商下移一位（列表顺序 = 网关取候选的顺序；不改动优先级字段）">▼ 下移</button>
-          <span class="gw-tools-hint">选中一行后用 ▲▼ 调整顺序 · 顺序即选路顺序（#1 最先尝试）</span>
+          <button type="button" id="btnGwUp" title="把选中的供应商上移一位（只改同级内的先后顺序；不改动 priority 字段）">▲ 上移</button>
+          <button type="button" id="btnGwDown" title="把选中的供应商下移一位（只改同级内的先后顺序；不改动 priority 字段）">▼ 下移</button>
+          <span class="gw-tools-hint">先按优先级（数字小者先试）· 同一优先级内按列表顺序（#1 最先）</span>
         </div>
         <div class="gw-tbl">
           <div id="gwRows"></div>
@@ -283,7 +353,16 @@
             <div class="gw-adv" id="gwAdv" style="display:none"></div>
             <div class="row"><label>ID</label><input type="text" id="eId" /></div>
             <div class="row"><label>Base URL</label><input type="text" id="eUrl" placeholder="https://api.example.com/v1" /></div>
-            <div class="row"><label>API Key</label><input type="password" id="eKey" placeholder="sk-…" /></div>
+            <!-- API Key 合一（2026-09-17 用户反馈：已支持多 Key 后，单 Key 独立输入框没意义了）。
+                 每行一把：第 1 行 = 主 Key（写 apiKey，网关与旧配置兼容的主字段）；
+                 填 ≥2 把时整组写进 apiKeys → 网关按账户池轮换（某把额度耗尽/失效/限流自动换下一把，
+                 状态在 /health 的 accounts 里逐把可见）。 -->
+            <div class="row">
+              <label>API Key</label>
+              <textarea id="eKeys" class="keys masked" rows="2"
+                placeholder="每行一把（也可只填一把）：第 1 行为主 Key；填 ≥2 把时自动轮换——额度耗尽/失效/限流换下一把"></textarea>
+              <button type="button" id="eKeysEye" class="eye" title="显示/隐藏明文">👁</button>
+            </div>
             <!-- 模型映射（本次改动）：原「模型列表」逗号文本框 #eModels 已替换为映射表（上游真实 ID ↔ 逻辑模型名） -->
             <div class="gw-map" id="gwModelMap">
               <div class="map-head">
@@ -314,7 +393,7 @@
               </details>
             </div>
             <div class="row"><label>优先级</label><input type="number" id="ePriority" min="1" value="1" style="width:90px;" />
-              <span style="color:#8a93a3;font-size:11px;">保留字段（不再参与排序）：网关按左侧列表顺序取候选，▲▼ 移动不会改动这里的值</span></div>
+              <span style="color:#8a93a3;font-size:11px;">数值小者先尝试；同一优先级内按左侧列表顺序（▲▼ 调的是同级内顺序）</span></div>
             <div class="row"><label>启用</label><input type="checkbox" id="eEnabled" /></div>
             <div class="row">
               <label style="width:auto;"></label>
@@ -370,7 +449,7 @@
     <div class="hint">安全边界（参考官方 DSH Community Market）：目录源数据仅用于发现——<b>源提供的版本不作为安装目标</b>；一键安装前经 npm registry 校验（同名 + 稳定版本 + 有效 <code>dsh.bundle.patch</code>）；安装/卸载执行标准 <code>dsh plugin add/remove</code> 命令（与手工完全一致，<b>不影响自行安装的插件</b>）；仅浏览型条目（无 npm 包身份）只展示详情。插件改动后需重启 dsh 服务生效。</div>
   </div>
 
-  <div class="card">
+  <div class="card" id="card-diag">
     <h2>更新与诊断</h2>
     <div class="row"><label>dsh 版本</label><span id="versions">检测中…</span></div>
     <div class="row" id="upgradeRow" style="display:none;">
@@ -391,6 +470,8 @@
   </div>
   <!-- 审计修复（P3 无障碍）：role=status + aria-live=polite，提示可被读屏播报 -->
   <div id="toast" role="status" aria-live="polite"></div>
+  </main>
+  </div>
 
   <script>
     const $ = (id) => document.getElementById(id);
@@ -530,11 +611,11 @@
       try { $('gwConfig').value = JSON.stringify(gwCfg, null, 2); } finally { gwUpdating = false; }
     }
 
-    // 供应商重排（2026-09-15 加，2026-09-16 改）：选中一行 → ▲/▼ 与相邻行交换。
-    // 2026-09-16 用户要求：**移动只改先后顺序，不改动优先级配置**。
-    // 旧实现交换后把 priority 重编号为 1…N，等于静默改写用户手写的优先级字段；现在
-    // 列表顺序本身就是选路顺序（网关按 providers 数组顺序取候选，不再按 priority 排序），
-    // 因此 priority 字段原样保留、不再被重排触碰。
+    // 供应商重排（2026-09-15 加，2026-09-16/17 改）：选中一行 → ▲/▼ 与相邻行交换。
+    // 2026-09-16 用户要求：**移动只改先后顺序，不改动优先级配置**（旧实现交换后把 priority
+    // 重编号为 1…N，等于静默改写用户手写的优先级字段）——这一点保持不变。
+    // 2026-09-17 路由规则变更：priority 重新参与排序（先 priority 升序，同级按数组顺序），
+    // 所以 ▲▼ 的实际影响范围是"同一优先级内的先后"。
     function gwMoveSel(delta) {
       if (!gwCfg || !Array.isArray(gwCfg.providers)) return;
       const i = gwSel;
@@ -568,14 +649,17 @@
         // 改为紧凑写法「3 模型 · 1 映射」；完整映射清单仍在 title 里（悬停可见）。
         const cntText = modelList.length + ' 模型' + (mapped ? '·' + mapped + '映射' : '');
         const cntTitle = gwNormalizeModels(modelList).map((r) => r.as + ' ← ' + r.up).join('\n');
-        // 序号 = **选路顺序**（2026-09-16 改）：网关按配置数组顺序取候选，priority 字段不再参与
-        // 排序，所以这里显示列表位置（旧版显示 P<priority>，与移动结果不符、且会误导）。
+        // 徽标 = 优先级 + 列表位置（2026-09-17 改）：网关**先按 priority 升序**取候选，同 priority
+        // 内才按列表顺序 —— 两个数字缺一不可（旧版只显示 #位置；再之前只显示 P<priority>）。
+        const pri = (Number(p.priority) > 0 ? Number(p.priority) : 1);
+        const ordText = 'P' + pri + ' #' + (i + 1);
+        const ordTitle = '优先级 P' + pri + '（数值小者先尝试）· 列表位置 #' + (i + 1) + '（同一优先级内按此顺序）';
         row.innerHTML =
           '<span><input type="checkbox" ' + (p.enabled === false ? '' : 'checked') + ' title="启用"></span>' +
           '<span class="mono id" title="' + esc(p.id || '') + '">' + esc(p.id || '（未命名）') + '</span>' +
           '<span class="mono" title="' + esc(p.baseURL || '') + '">' + esc(p.baseURL || '—') + '</span>' +
           '<span class="cnt" title="' + esc(cntTitle) + '">' + esc(cntText) + '</span>' +
-          '<span class="cnt" title="' + esc('选路顺序 #' + (i + 1) + '（列表顺序即网关取候选的顺序）') + '">#' + (i + 1) + '</span>' +
+          '<span class="cnt" title="' + esc(ordTitle) + '">' + esc(ordText) + '</span>' +
           '<span><button data-i="' + i + '" data-act="edit">编辑</button> <button data-i="' + i + '" data-act="del">删除</button></span>';
         row.querySelector('input[type=checkbox]').onchange = (e) => {
           p.enabled = e.target.checked;
@@ -840,13 +924,33 @@
       toast('已追加 ' + rows.length + ' 行，点「应用修改」后写入配置');
     }
 
+    // —— API Key 框（合一后：每行一把，第 1 行 = 主 Key）的序列化/回填（2026-09-17；纯函数便于单测）——
+    // 文本框内容（每行/逗号/分号分隔）→ 去重后的 Key 列表，原顺序保留
+    function gwMergeKeys(text) {
+      const out = [];
+      const add = (v) => { const s = String(v == null ? '' : v).trim(); if (s && !out.includes(s)) out.push(s); };
+      String(text || '').split(/[\s,;]+/).forEach(add);
+      return out;
+    }
+    // 配置（apiKey + apiKeys）→ 文本框内容：主 Key 永远排第 1 行，其余按 apiKeys 顺序
+    function gwKeysText(provider) {
+      const p = provider || {};
+      const raw = Array.isArray(p.apiKeys) ? p.apiKeys : (typeof p.apiKeys === 'string' ? p.apiKeys.split(/[\s,;]+/) : []);
+      const out = [];
+      const add = (v) => { const s = String(v == null ? '' : v).trim(); if (s && !out.includes(s)) out.push(s); };
+      add(p.apiKey);
+      raw.forEach(add);
+      return out.join('\n');
+    }
+
     function gwOpenEditor(i) {
       const p = gwCfg.providers[i];
       if (!p) return;
       $('gwEditId').textContent = p.id || '';
       $('eId').value = p.id || '';
       $('eUrl').value = p.baseURL || '';
-      $('eKey').value = p.apiKey || '';
+      // API Key 回填（合一框）：主 Key 在第 1 行，apiKeys 其余的依次排后面
+      $('eKeys').value = gwKeysText(p);
       // 模型映射（本次改动）：原 $('eModels').value = models.join(', ') 改为填充映射表
       gwFillModelRows(p.models);
       $('ePriority').value = p.priority || 1;
@@ -858,6 +962,7 @@
         if (p.protocol) adv.push('协议=' + p.protocol);
         if (p.auth) adv.push('凭据=' + p.auth);
         if (Array.isArray(p.accounts) && p.accounts.length) adv.push('账户池 ' + p.accounts.length + ' 个');
+        if (Array.isArray(p.apiKeys) && p.apiKeys.length) adv.push('多 Key ' + p.apiKeys.length + ' 把（轮换）');
         if (p.quirks) adv.push('quirks=' + (Array.isArray(p.quirks) ? p.quirks.join(',') : p.quirks));
         if (p.headers && typeof p.headers === 'object') adv.push('自定义头 ' + Object.keys(p.headers).length + ' 个');
         if (p.timeoutMs) adv.push('timeoutMs=' + p.timeoutMs);
@@ -883,7 +988,13 @@
       const p = gwCfg.providers[gwSel] || (gwCfg.providers[gwSel] = {});
       p.id = id;
       p.baseURL = url;
-      p.apiKey = $('eKey').value.trim();
+      // API Key（合一框，2026-09-17 用户反馈）：每行一把，第 1 行 = 主 Key（apiKey）；
+      // ≥2 把时整组写进 apiKeys → 网关按账户池轮换；只有 1 把时不写 apiKeys（保持旧结构）。
+      {
+        const all = gwMergeKeys($('eKeys').value);
+        p.apiKey = all[0] || '';
+        if (all.length > 1) p.apiKeys = all; else delete p.apiKeys;
+      }
       // 模型映射（本次改动）：原 read $('eModels').value.split(',') 改为读映射表并序列化
       // （留空的「映射为」= 同名 → 写回字符串；不同名 → 写回 { id, as }）
       p.models = gwSerializeModels(gwReadModelRows());
@@ -918,15 +1029,45 @@
       const px = gwCfg.proxy || {};
       $('gwProxyEnabled').checked = !!px.enabled;
       $('gwProxyUrl').value = px.url || '';
+      // 直连域名（noProxy）：数组或逗号分隔字符串都接受
+      const npList = Array.isArray(px.noProxy) ? px.noProxy
+        : (typeof px.noProxy === 'string' ? px.noProxy.split(',') : []);
+      $('gwProxyNoProxy').value = npList.map((s) => String(s).trim()).filter(Boolean).join(', ');
       gwProxySync();
     }
 
     // 代理启用开关与 URL 输入框联动（关闭时禁用输入）
     function gwProxySync() {
-      $('gwProxyUrl').disabled = !$('gwProxyEnabled').checked;
-      $('gwProxyUrl').style.opacity = $('gwProxyEnabled').checked ? '1' : '.45';
+      const on = $('gwProxyEnabled').checked;
+      $('gwProxyUrl').disabled = !on;
+      $('gwProxyUrl').style.opacity = on ? '1' : '.45';
+      $('gwProxyNoProxy').disabled = !on;
+      $('gwProxyNoProxy').style.opacity = on ? '1' : '.45';
     }
     $('gwProxyEnabled').addEventListener('change', gwProxySync);
+
+    // Key 明文开关（2026-09-17，用户要求）：供应商 API Key（password 输入框）与「多 Key」
+    // （textarea：不能改 type，用 -webkit-text-security 掩码）都能一键显示/隐藏明文。
+    function bindEyeToggle(btnId, inputId) {
+      const btn = $(btnId), inp = $(inputId);
+      if (!btn || !inp) return;
+      const isInput = inp.tagName === 'INPUT';
+      const isHidden = () => (isInput ? inp.type === 'password' : inp.classList.contains('masked'));
+      const apply = (hide) => {
+        if (isInput) inp.type = hide ? 'password' : 'text';
+        else inp.classList.toggle('masked', hide);
+        btn.textContent = hide ? '👁' : '🙈';
+        btn.title = hide ? '显示明文' : '隐藏';
+      };
+      btn.onclick = () => apply(!isHidden());
+    }
+    // textarea 掩码依赖 -webkit-text-security（Chromium 支持）。不支持时不掩码，
+    // 但按钮仍可用（避免"看起来点了但其实一直是明文"的错觉——此处退化为始终明文，符合同源行为）。
+    if (!(window.CSS && CSS.supports && CSS.supports('-webkit-text-security', 'disc'))) {
+      document.querySelectorAll('textarea.masked').forEach((el) => el.classList.remove('masked'));
+    }
+    bindEyeToggle('eKeysEye', 'eKeys');
+    bindEyeToggle('gwApiKeyEye', 'gwApiKey');
 
     // 「自定义 UA」选项与输入框联动
     $('gwProfile').addEventListener('change', () => {
@@ -1053,9 +1194,15 @@
           delete cfg.clientUA;
         }
         // 网络代理：启用时写 {enabled,url}；未启用或 URL 空 → 删除 proxy 字段（走自动探测兜底）
+        // v1.8.2：**保留 proxy 里用户手写的其它键**（noProxy / forceProxy 等）。旧实现直接
+        // 赋一个字面量对象，把 noProxy 直连清单静默抹掉——"配置里加了直连域名，一保存就没了"。
         if ($('gwProxyEnabled').checked) {
           const u = $('gwProxyUrl').value.trim();
-          cfg.proxy = u ? { enabled: true, url: u } : { enabled: true, url: '' };
+          const prev = (gwCfg && gwCfg.proxy) || {};
+          const next = Object.assign({}, prev, { enabled: true, url: u });
+          const np = $('gwProxyNoProxy').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+          if (np.length) next.noProxy = np; else delete next.noProxy;
+          cfg.proxy = next;
         } else {
           delete cfg.proxy;
         }
@@ -1322,6 +1469,47 @@
       btn.disabled = false;
       refreshSafeMode();   // 重新读取设置，刷新横幅与按钮显隐
     };
+
+    // —— 左侧分区导航（2026-09-17）——
+    // 点击：平滑滚动到对应配置块并立即高亮；滚动：按"最后一个已越过阈值的块"高亮
+    //（比 IntersectionObserver 更稳——短区块不会被跳过；隐藏的块用 offsetParent === null 排除，
+    //  否则它们的 rect.top 恒为 0，会永远被判成"已越过"。）
+    (function initSideNav() {
+      const items = Array.from(document.querySelectorAll('.sidenav .nav-item'));
+      if (!items.length) return;
+      const target = (a) => document.getElementById(String(a.getAttribute('href') || '').slice(1));
+      const setActive = (a) => items.forEach((x) => x.classList.toggle('active', x === a));
+
+      items.forEach((a) => {
+        a.addEventListener('click', (e) => {
+          const t = target(a);
+          if (!t) return;
+          e.preventDefault();                        // 不用默认跳转：避免 hash 变化与瞬间跳动
+          t.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          setActive(a);
+        });
+      });
+
+      const spy = () => {
+        const visible = items
+          .map((a) => ({ a, el: target(a) }))
+          .filter((x) => x.el && x.el.offsetParent !== null);
+        if (!visible.length) return;
+        const line = 96;                             // 视口顶部下方的一条判定线
+        let cur = visible[0].a;
+        for (const { a, el } of visible) {
+          if (el.getBoundingClientRect().top <= line) cur = a;
+        }
+        // 已在底部：高亮最后一块（否则最后一块永远轮不到）
+        if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 4) {
+          cur = visible[visible.length - 1].a;
+        }
+        setActive(cur);
+      };
+      window.addEventListener('scroll', spy, { passive: true });
+      window.addEventListener('resize', spy);
+      spy();
+    })();
 
     load();
   </script>
