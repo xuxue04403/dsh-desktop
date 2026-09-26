@@ -395,6 +395,43 @@
             <div class="row"><label>优先级</label><input type="number" id="ePriority" min="1" value="1" style="width:90px;" />
               <span style="color:#8a93a3;font-size:11px;">数值小者先尝试；同一优先级内按左侧列表顺序（▲▼ 调的是同级内顺序）</span></div>
             <div class="row"><label>启用</label><input type="checkbox" id="eEnabled" /></div>
+            <!-- 高级字段（2026-09-23）：此前 protocol/quirks/headers/accounts 等**只能在 JSON 里编辑**，
+                 一旦用户在界面上改这家并「应用修改」，就容易被误以为"配置被吞了"。
+                 现在把它们提升为可编辑的一等字段（留空 = 不写该字段，保持既有行为）。 -->
+            <details class="gw-adv" id="eAdvBox">
+              <summary>高级字段（协议 / 兼容开关 / 自定义请求头）</summary>
+              <div class="row">
+                <label>上游线协议</label>
+                <select id="eProtocol" style="width:190px;">
+                  <option value="">（跟随客户端请求路径）</option>
+                  <option value="openai-chat">openai-chat（只会 OpenAI chat/completions）</option>
+                  <option value="anthropic-messages">anthropic-messages（只会 Anthropic）</option>
+                </select>
+              </div>
+              <div class="row" style="align-items:flex-start;">
+                <label title="逗号分隔。force-stream=上游只收流式；stringify-tool-choice=tool_choice 只能是字符串；prepend-system=首条必须是 system；drop-thinking=该家不支持 extended thinking">兼容开关</label>
+                <input type="text" id="eQuirks" placeholder="force-stream, stringify-tool-choice" style="flex:1;min-width:220px;" />
+              </div>
+              <div class="row" style="align-items:flex-start;">
+                <label title="该供应商的客户端仿真档。cline 会发出 Cline 官方 SDK 的 9 个身份头（api.cline.bot 的硬要求）；留空则按 baseURL 主机名自动推断、再回落到全局设置">客户端仿真</label>
+                <select id="eClientProfile" style="width:190px;">
+                  <option value="">（自动：按主机名 / 回落全局）</option>
+                  <option value="cline">cline</option>
+                  <option value="claude">claude</option>
+                  <option value="codex">codex</option>
+                </select>
+              </div>
+              <div class="row" style="align-items:flex-start;">
+                <label title="JSON 对象，每行一个头：Header-Name: value。用于上游的客户端白名单/产品面校验">自定义请求头</label>
+                <textarea id="eHeaders" rows="4" spellcheck="false" style="flex:1;min-width:240px;font-family:Consolas;font-size:11px;"
+                  placeholder="User-Agent: Cline/3.0.47&#10;X-CLIENT-TYPE: cline-sdk"></textarea>
+              </div>
+              <div class="row" style="align-items:flex-start;">
+                <label title="毫秒。到响应头的超时；留空 = 60 秒。慢速中转需显式声明">超时 ms</label>
+                <input type="number" id="eTimeoutMs" min="1" placeholder="60000" style="width:110px;" />
+                <span style="color:#8a93a3;font-size:11px;">留空 = 60 秒；声明后熔断半开探测也按它执行</span>
+              </div>
+            </details>
             <div class="row">
               <label style="width:auto;"></label>
               <button id="btnEApply" class="primary" style="background:#2b5bd7;color:#fff;">应用修改</button>
@@ -943,6 +980,33 @@
       return out.join('\n');
     }
 
+    // —— 自定义请求头（headers）的 文本 ↔ 对象 互转（2026-09-23；纯函数便于单测）——
+    // 界面用「每行一个 Header: value」表达（比让用户写 JSON 友好，也不会因引号出错）；
+    // 值里允许出现冒号（如 URL、时间），因此只在**第一个**冒号处切分。
+    // 解析失败/单行无冒号 → 跳过该行（不抛错，避免整份配置写不出去）。
+    function gwParseHeaders(text) {
+      const out = {};
+      String(text == null ? '' : text).split(/\r?\n/).forEach((raw) => {
+        const line = String(raw).trim();
+        if (!line || line.charAt(0) === '#') return;
+        const i = line.indexOf(':');
+        if (i <= 0) return;
+        const k = line.slice(0, i).trim();
+        const v = line.slice(i + 1).trim();
+        if (!k) return;
+        out[k] = v;
+      });
+      return out;
+    }
+    // 对象 → 文本。值里的换行会破坏"一行一个头"，替换为空格（HTTP 头本就不允许裸换行）。
+    function gwHeadersText(headers) {
+      if (!headers || typeof headers !== 'object' || Array.isArray(headers)) return '';
+      return Object.keys(headers)
+        .filter((k) => headers[k] !== null && headers[k] !== undefined)
+        .map((k) => k + ': ' + String(headers[k]).replace(/[\r\n]+/g, ' '))
+        .join('\n');
+    }
+
     function gwOpenEditor(i) {
       const p = gwCfg.providers[i];
       if (!p) return;
@@ -955,6 +1019,16 @@
       gwFillModelRows(p.models);
       $('ePriority').value = p.priority || 1;
       $('eEnabled').checked = p.enabled !== false;
+      // —— 高级字段回填（2026-09-23）——
+      if ($('eProtocol')) $('eProtocol').value = p.protocol ? String(p.protocol) : '';
+      if ($('eQuirks')) {
+        const q = Array.isArray(p.quirks) ? p.quirks.join(', ')
+          : (typeof p.quirks === 'string' ? p.quirks : '');
+        $('eQuirks').value = q;
+      }
+      if ($('eClientProfile')) $('eClientProfile').value = p.clientProfile ? String(p.clientProfile) : '';
+      if ($('eHeaders')) $('eHeaders').value = gwHeadersText(p.headers);
+      if ($('eTimeoutMs')) $('eTimeoutMs').value = Number(p.timeoutMs) > 0 ? String(Number(p.timeoutMs)) : '';
       // 高级能力摘要（2026-09-16）：protocol/auth/accounts/quirks/headers 目前只能在 JSON 里编辑，
       // 但**必须在界面上可见** —— 否则用户会困惑"这家为什么不走我的 Key / 为什么有账户池"。
       if ($('gwAdv')) {
@@ -1000,6 +1074,31 @@
       p.models = gwSerializeModels(gwReadModelRows());
       p.priority = parseInt($('ePriority').value, 10) || 1;
       p.enabled = $('eEnabled').checked;
+      // —— 高级字段写回（2026-09-23）——
+      // 语义：**留空 = 不改动该字段**（刻意不做 delete）。理由：runtime.test.js 有一条历史防线
+      // ——「gwApplyEditor 不得删除非 apiKeys 字段」，那正是当年"字段被静默抹掉"的事故根因。
+      // 若把留空解读成删除，一旦输入框因故渲染为空就会**再次静默丢字段**。
+      // 需要真正清掉某字段时，用下方「高级：直接编辑配置 JSON」删（那里删是显式意图）。
+      if ($('eProtocol')) {
+        const v = $('eProtocol').value.trim();
+        if (v) p.protocol = v;
+      }
+      if ($('eQuirks')) {
+        const list = $('eQuirks').value.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+        if (list.length) p.quirks = list;
+      }
+      if ($('eClientProfile')) {
+        const v = $('eClientProfile').value.trim();
+        if (v) p.clientProfile = v;
+      }
+      if ($('eHeaders')) {
+        const h = gwParseHeaders($('eHeaders').value);
+        if (Object.keys(h).length) p.headers = h;
+      }
+      if ($('eTimeoutMs')) {
+        const n = Number($('eTimeoutMs').value);
+        if (Number.isFinite(n) && n > 0) p.timeoutMs = n;
+      }
       gwSyncText();
       gwRenderRows();
       toast('已应用到配置（点击「保存并重启网关」生效）');
