@@ -169,6 +169,31 @@ t('watchdog：非安全模式且日志无插件特征 → 失败但不进安全�
   assert.strictEqual(settings.data.safeMode, false, '不得进入安全模式');
 });
 
+t('watchdog（2026-09-22 新电脑事故回归）：纯"等依赖"级联日志 → 绝不生成 safe.yml 禁用核心服务', async () => {
+  // 现场：web.log 报 "13 entries did not activate"，逐行都是 pending (waiting for service: X)。
+  // 旧版把这些受害者名喂给 resolveEntryIds，命中了 typert / settings / credentials /
+  // llm-pi-ai / connection / sandbox-policy 等**服务提供者**并写进 safe.yml →
+  // 安全模式永久缺服务、每次启动必失败，用户被锁死（只能手删 safe.yml）。
+  const { wd, updates, logs, settings } = mkWatchdog();
+  fs.mkdirSync(path.join(settings.dir, 'logs'), { recursive: true });
+  fs.writeFileSync(path.join(settings.dir, 'logs', 'web.log'), [
+    'dsh: 13 entries did not activate',
+    '@deepseek-ai/dsh-typert-loader: pending (waiting for service: typert)',
+    '@deepseek-ai/dsh-api-gateway: pending (waiting for service: typert)',
+    '@deepseek-ai/dsh-pwsh-sandbox: pending (waiting for service: sandboxPolicy)',
+    '@deepseek-ai/dsh-session-log-export: pending (waiting for service: connection)',
+    '',
+  ].join('\n'), 'utf8');
+  await wd.tryRecover();
+  assert.strictEqual(settings.data.safeMode, false, '不得进入安全模式（否则禁用核心服务→永远起不来）');
+  assert.ok(!fs.existsSync(settings.safePatchPath), '不得写出 safe.yml：' + settings.safePatchPath);
+  const last = updates[updates.length - 1];
+  assert.strictEqual(last.service, 'failed');
+  assert.ok(/不宜自动隔离/.test(last.phase), 'phase 应说明不宜自动隔离：' + last.phase);
+  assert.ok(/等依赖|受害者|核心/.test(last.failReason), 'failReason 应说明原因：' + last.failReason);
+  assert.ok(logs.some((l) => /跳过自动隔离/.test(l)), '日志应记录跳过隔离：' + JSON.stringify(logs.slice(-3)));
+});
+
 t('watchdog：Level2 备份不被第二次覆盖（防原始配置被"已剥离版本"顶掉）', () => {
   const { wd, dir } = mkWatchdog();
   const profile = path.join(dir, 'profiles', 'web');
@@ -451,6 +476,65 @@ t('logger：轮转用 rename（保留历史，不复制不丢段）', () => {
   assert.ok(fs.existsSync(prev), '超过 1MB 应轮转到 .prev');
   assert.ok(fs.statSync(cur).size < 1024 * 1024, '当前文件应在阈值内');
   assert.ok(fs.statSync(prev).size > 0, '历史不应为空（旧实现清空后崩溃即丢段）');
+});
+
+t('logger：web.log 逐行加时间戳；半行暂存后按行落盘（2026-09-22 用户要求）', async () => {
+  const logger = require(path.join(SRC, 'logger.js'));
+  const dir = fs.mkdtempSync(path.join(tmpRoot, 'weblog-'));
+  logger.init(dir);
+  logger.resetWebLineState();
+  logger.appendWeb('first line\nsecond line\nthird line\n');   // 整行立即落盘
+  logger.appendWeb('partial-');                                 // 半行 → 暂存
+  logger.appendWeb('tail\n');                                   // 补齐 → 落盘
+  logger.appendWeb('no newline at all');                        // 半行 → 定时器补
+  await new Promise((r) => setTimeout(r, 400));                 // 等 FLUSH_IDLE_MS
+  const text = fs.readFileSync(path.join(dir, 'logs', 'web.log'), 'utf8');
+  const lines = text.split('\r\n').filter(Boolean);
+  assert.strictEqual(lines.length, 5, '应有 5 行：' + JSON.stringify(lines));
+  for (const l of lines) {
+    assert.ok(/^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] /.test(l), '每行都应有时间戳：' + JSON.stringify(l));
+  }
+  assert.ok(/\] first line$/.test(lines[0]), '首行：' + lines[0]);
+  assert.ok(/\] third line$/.test(lines[2]), '第三行：' + lines[2]);
+  assert.ok(/\] partial-tail$/.test(lines[3]), '半行应拼成一整行：' + lines[3]);
+  assert.ok(/\] no newline at all$/.test(lines[4]), '无换行的整行应由定时器补齐：' + lines[4]);
+});
+
+t('logger：resetWebLineState 把残留半行落盘，新进程第一行独立带时间戳', () => {
+  const logger = require(path.join(SRC, 'logger.js'));
+  const dir = fs.mkdtempSync(path.join(tmpRoot, 'weblog2-'));
+  logger.init(dir);
+  logger.resetWebLineState();
+  logger.appendWeb('killed mid-line');   // 半行，未落盘
+  logger.resetWebLineState();            // 下次启动：先落盘再开始
+  logger.appendWeb('fresh start\n');
+  const lines = fs.readFileSync(path.join(dir, 'logs', 'web.log'), 'utf8').split('\r\n').filter(Boolean);
+  assert.strictEqual(lines.length, 2, '残留半行应与新行分开：' + JSON.stringify(lines));
+  assert.ok(/\] killed mid-line$/.test(lines[0]), '残留半行应在复位时落盘：' + lines[0]);
+  assert.ok(/^\[[\d\- :]+\] fresh start$/.test(lines[1]), '新行必须独立带时间戳：' + lines[1]);
+});
+
+t('watchdog：带时间戳的 web.log 仍能正确解析故障插件（时间戳不得污染条目名）', () => {
+  const { parseFailedPlugins, classifyDidNotActivate, stripLogStamp } = require(path.join(SRC, 'watchdog.js'));
+  const stamped = [
+    '[2026-09-22 09:25:01] dsh: 2 entries did not activate',
+    '[2026-09-22 09:25:01] @linxin666/dsh-web-ui-all: Error: Cannot find module \'x\'',
+    '[2026-09-22 09:25:01] @deepseek-ai/dsh-typert-loader: pending (waiting for service: typert)',
+    '[2026-09-22 09:25:01]     at ModuleJob.run (node:internal/modules:96:1)',
+    '',
+  ].join('\r\n');
+  assert.deepStrictEqual(parseFailedPlugins(stamped), ['@linxin666/dsh-web-ui-all', '@deepseek-ai/dsh-typert-loader'],
+    '时间戳必须被剥掉：' + JSON.stringify(parseFailedPlugins(stamped)));
+  const c = classifyDidNotActivate(stamped);
+  assert.deepStrictEqual(c.faults.map((f) => f.name), ['@linxin666/dsh-web-ui-all'], '真故障应只剩第三方插件');
+  assert.deepStrictEqual(c.dependents.map((d) => d.name), ['@deepseek-ai/dsh-typert-loader'], '等依赖项应被识别');
+  assert.strictEqual(stripLogStamp('[2026-09-22 09:25:01.123] x'), 'x');
+  assert.strictEqual(stripLogStamp('no stamp here'), 'no stamp here');
+  // 形态1 也要兼容（时间戳 + 多个插件名）
+  assert.deepStrictEqual(
+    parseFailedPlugins('[2026-09-22 09:25:01] dsh: plugin(s) failed to load: dshmarket, @a/b; boom'),
+    ['dshmarket', '@a/b'],
+  );
 });
 
 t('datadir：空 providers 但已有真实网关 Key 的配置不判为"模拟"（不被外部来源覆盖）', () => {
@@ -1457,8 +1541,221 @@ t('renderer：供应商 ▲▼ 只改先后顺序、不改优先级字段（2026
   assert.ok(/\.row label \{ width: 165px;/.test(html), '行标签宽度应加到 165px（130px 时"启动应用时自动启动服务"折行）');
 });
 
+// ================= 12. 2026-09-22：换机首启适配（网关配置里"只在本机成立"的部分）=================
+// 背景：绿色目录带着 data\gateway.config.json 复制到新电脑后，里面三处会直接坏掉——
+// 写死原机器用户名的 authFile、沿用原区域的 workbuddy 供应商（凭据互不通用）、
+// 指向原机器本地代理的 proxy.url。这里逐项回归。
+
+/** 造一份"带着**别台机器**痕迹的网关配置（模拟从旧机器复制过来的 data\）。
+ *  注意 authFile 用的是不存在的用户名路径——本机真实存在的那份不能用来测"失效路径"。 */
+function writeMachineAdaptFixture(dataDir) {
+  const cfg = {
+    port: 3091, apiKey: 'unified-key',
+    clientUA: 'claude-cli/2.0.0 (external, cli)', clientProfile: 'claude',
+    proxy: { enabled: true, url: 'http://127.0.0.1:7890', noProxy: ['127.0.0.1', 'localhost'] },
+    providers: [
+      { id: 'sensenova', baseURL: 'https://token.sensenova.cn/v1', apiKey: 'sk-sensenova', priority: 1,
+        enabled: true, models: ['deepseek-v4.1-flash'], apiKeys: ['sk-a', 'sk-b'] },
+      { id: 'workbuddy', baseURL: 'https://copilot.tencent.com/v2', priority: 2, enabled: true,
+        auth: 'workbuddy', models: ['hy3'],
+        // 写死**别的电脑**的用户名路径（本机必然不存在 → 换机后失效）
+        accounts: [{ id: 'acct1', authFile: 'C:/Users/__no_such_user__/AppData/Local/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info' }] },
+      { id: 'workbuddy-global', baseURL: 'https://www.workbuddy.ai/v2', priority: 2, enabled: false,
+        auth: 'workbuddy', models: ['hy3'], accounts: [{ id: 'acct1', authFile: '' }] },
+    ],
+  };
+  fs.writeFileSync(path.join(dataDir, 'gateway.config.json'), JSON.stringify(cfg, null, 2));
+  return cfg;
+}
+
+/** 造一个"新机上装了某个区域 WorkBuddy"的探测根（hermetic：不碰真实 AppData） */
+function makeWorkbuddyRoot(region) {
+  const root = fs.mkdtempSync(path.join(tmpRoot, 'wbroot-'));
+  const dir = path.join(root, 'CodeBuddyExtension', 'Data', 'Public', 'auth');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = region === 'global' ? 'workbuddy-desktop-ai.info' : 'workbuddy-desktop.info';
+  const domain = region === 'global' ? 'workbuddy.ai' : 'codebuddy.cn';
+  fs.writeFileSync(path.join(dir, file), JSON.stringify({
+    auth: { accessToken: 'tok-' + region, refreshToken: 'r', expiresAt: Date.now() + 3600_000, domain },
+    account: { uid: 'u1', nickname: 'tester' },
+  }));
+  return root;
+}
+
+t('换机适配：authFile 指向本机不存在的路径 → 清空为自动发现（且不动任何 Key）', async () => {
+  const ma = require(path.join(SRC, 'machine-adapt.js'));
+  const dataDir = fs.mkdtempSync(path.join(tmpRoot, 'ma1-'));
+  writeMachineAdaptFixture(dataDir);
+  const r = await ma.applyIfNeeded({ dataDir, force: true, proxyTimeoutMs: 300, workbuddyRoots: [makeWorkbuddyRoot('cn')] });
+  assert.strictEqual(r.ok, true, '适配应成功：' + JSON.stringify(r));
+  const cfg = JSON.parse(fs.readFileSync(path.join(dataDir, 'gateway.config.json'), 'utf8'));
+  const wb = cfg.providers.find((p) => p.id === 'workbuddy');
+  assert.ok(!wb.accounts[0].authFile, '写死的 authFile 应被清空（交给运行时自动发现）：' + JSON.stringify(wb.accounts));
+  // 绝不碰 Key / 模型 / 优先级
+  const sn = cfg.providers.find((p) => p.id === 'sensenova');
+  assert.strictEqual(sn.apiKey, 'sk-sensenova', 'apiKey 不得被改动');
+  assert.deepStrictEqual(sn.apiKeys, ['sk-a', 'sk-b'], 'apiKeys 不得被改动');
+  assert.deepStrictEqual(sn.models, ['deepseek-v4.1-flash'], '模型映射不得被改动');
+  assert.strictEqual(sn.priority, 1, '优先级不得被改动');
+  assert.strictEqual(cfg.apiKey, 'unified-key', '统一 Key 不得被改动');
+  assert.ok(r.changes.some((c) => /authFile/.test(c)), '结果里应说明改了什么：' + JSON.stringify(r.changes));
+});
+
+t('换机适配：本机装国际版 → 启用 workbuddy-global、停用国内版（凭据互不通用）', async () => {
+  const ma = require(path.join(SRC, 'machine-adapt.js'));
+  const dataDir = fs.mkdtempSync(path.join(tmpRoot, 'ma-global-'));
+  writeMachineAdaptFixture(dataDir);
+  const r = await ma.applyIfNeeded({ dataDir, force: true, proxyTimeoutMs: 300, workbuddyRoots: [makeWorkbuddyRoot('global')] });
+  const cfg = JSON.parse(fs.readFileSync(path.join(dataDir, 'gateway.config.json'), 'utf8'));
+  const cn = cfg.providers.find((p) => p.id === 'workbuddy');
+  const gl = cfg.providers.find((p) => p.id === 'workbuddy-global');
+  assert.strictEqual(gl.enabled, true, '国际版应被启用：' + JSON.stringify(r.changes));
+  assert.strictEqual(cn.enabled, false, '国内版应被停用（否则区域守卫直接报错）：' + JSON.stringify(r.changes));
+});
+
+t('换机适配：本机不可达的本地代理 → 自动关闭（否则境外供应商全连不上）', async () => {
+  const ma = require(path.join(SRC, 'machine-adapt.js'));
+  const dataDir = fs.mkdtempSync(path.join(tmpRoot, 'ma2-'));
+  writeMachineAdaptFixture(dataDir);
+  // 用一个几乎不可能有人监听的端口，确保"不可达"分支稳定命中
+  const cfgPath = path.join(dataDir, 'gateway.config.json');
+  const cfg0 = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  cfg0.proxy.url = 'http://127.0.0.1:59997';
+  fs.writeFileSync(cfgPath, JSON.stringify(cfg0, null, 2));
+  const r = await ma.applyIfNeeded({ dataDir, force: true, proxyTimeoutMs: 400 });
+  const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  assert.strictEqual(cfg.proxy.enabled, false, '不可达的代理应被关闭：' + JSON.stringify(cfg.proxy));
+  assert.ok(r.changes.some((c) => /代理/.test(c)), '结果里应说明代理被关闭：' + JSON.stringify(r.changes));
+});
+
+t('换机适配：区域判定只认凭据里的 domain（workbuddy.ai = 国际版），不看文件名', () => {
+  const ma = require(path.join(SRC, 'machine-adapt.js'));
+  assert.strictEqual(ma.regionOfDomain('workbuddy.ai'), 'global');
+  assert.strictEqual(ma.regionOfDomain('www.workbuddy.ai'), 'global');
+  assert.strictEqual(ma.regionOfDomain('codebuddy.cn'), 'cn');
+  assert.strictEqual(ma.regionOfDomain(''), 'cn', '空域按国内版（与网关 workbuddyRegionOf 一致）');
+  assert.strictEqual(ma.regionOfDomain(undefined), 'cn');
+});
+
+t('换机适配：本机无 WorkBuddy 凭据 → 停用该家（避免启动即报凭据错误）', async () => {
+  const ma = require(path.join(SRC, 'machine-adapt.js'));
+  const dataDir = fs.mkdtempSync(path.join(tmpRoot, 'ma3-'));
+  writeMachineAdaptFixture(dataDir);
+  // 探测根指向空目录 → 模拟"新机没装 WorkBuddy"（hermetic，不碰真实 AppData）
+  const empty = fs.mkdtempSync(path.join(tmpRoot, 'ma3-empty-'));
+  const r = await ma.applyIfNeeded({ dataDir, force: true, proxyTimeoutMs: 300, workbuddyRoots: [empty] });
+  const cfg = JSON.parse(fs.readFileSync(path.join(dataDir, 'gateway.config.json'), 'utf8'));
+  const wb = cfg.providers.filter((p) => p.auth === 'workbuddy');
+  assert.ok(wb.every((p) => p.enabled === false),
+    '无凭据时两家 workbuddy 都应停用：' + JSON.stringify(wb.map((p) => [p.id, p.enabled])));
+  assert.ok(r.changes.some((c) => /未检测到 WorkBuddy/.test(c)), '应说明原因：' + JSON.stringify(r.changes));
+});
+
+t('换机适配：幂等——同机器第二次运行不再改动，且留下 .bak 备份', async () => {
+  const ma = require(path.join(SRC, 'machine-adapt.js'));
+  const dataDir = fs.mkdtempSync(path.join(tmpRoot, 'ma4-'));
+  writeMachineAdaptFixture(dataDir);
+  const roots = [makeWorkbuddyRoot('cn')];
+  const first = await ma.applyIfNeeded({ dataDir, proxyTimeoutMs: 300, workbuddyRoots: roots });
+  const afterFirst = fs.readFileSync(path.join(dataDir, 'gateway.config.json'), 'utf8');
+  const second = await ma.applyIfNeeded({ dataDir, proxyTimeoutMs: 300, workbuddyRoots: roots });
+  assert.strictEqual(second.action, 'noop', '第二次应为 noop（同机器指纹）：' + JSON.stringify(second));
+  assert.strictEqual(fs.readFileSync(path.join(dataDir, 'gateway.config.json'), 'utf8'), afterFirst,
+    '第二次不得再改写配置');
+  if (first.action === 'adapted') {
+    const baks = fs.readdirSync(dataDir).filter((f) => f.includes('.bak-machineadapt-'));
+    assert.ok(baks.length >= 1, '改写前应留下备份：' + JSON.stringify(fs.readdirSync(dataDir)));
+  }
+});
+
+t('换机适配：配置缺失/不可解析 → 不阻断启动（返回 skip 而非抛出）', async () => {
+  const ma = require(path.join(SRC, 'machine-adapt.js'));
+  const emptyDir = fs.mkdtempSync(path.join(tmpRoot, 'ma5-'));
+  const r1 = await ma.applyIfNeeded({ dataDir: emptyDir, force: true });
+  assert.strictEqual(r1.ok, true, '无配置文件不应算失败（首次启动会从示例生成）');
+  const badDir = fs.mkdtempSync(path.join(tmpRoot, 'ma6-'));
+  fs.writeFileSync(path.join(badDir, 'gateway.config.json'), '{ 这不是合法 JSON');
+  const r2 = await ma.applyIfNeeded({ dataDir: badDir, force: true });
+  assert.strictEqual(r2.action, 'skip', '坏配置应跳过：' + JSON.stringify(r2));
+});
+
+t('换机适配：main.js 接线——必须在网关启动前 await 适配（网关只在启动时读一次配置）', () => {
+  const src = fs.readFileSync(path.join(SRC, 'main.js'), 'utf8');
+  assert.ok(/require\('\.\/machine-adapt'\)/.test(src), '必须导入 machine-adapt');
+  const iInit = src.indexOf('gateway.init();');
+  const iAdapt = src.indexOf('await adaptGatewayForMachineBeforeStart();');
+  assert.ok(iInit >= 0 && iAdapt > iInit, '适配必须在 gateway.init() 之后调用');
+  assert.ok(/async function adaptGatewayForMachineBeforeStart/.test(src), '应有适配函数');
+});
+
 // ================= 执行 =================
 (async () => {
+t('renderer：供应商编辑器的高级字段可编辑（cliпe 这类特殊配置在界面上就能改，2026-09-23）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
+  // ① 控件存在
+  for (const id of ['eProtocol', 'eQuirks', 'eClientProfile', 'eHeaders', 'eTimeoutMs']) {
+    assert.ok(html.includes('id="' + id + '"'), '编辑器应有 #' + id + ' 控件');
+  }
+  // ② 回填：打开编辑器时把配置里的值填进控件（否则一保存就把界面上的空值写回去）
+  const openSeg = html.slice(html.indexOf('function gwOpenEditor('), html.indexOf('function gwOpenEditor(') + 3000);
+  for (const f of ['protocol', 'quirks', 'clientProfile', 'headers', 'timeoutMs']) {
+    assert.ok(new RegExp("\\$\\('e" + f.charAt(0).toUpperCase() + f.slice(1) + "'\\)").test(openSeg)
+      || new RegExp("e" + f.charAt(0).toUpperCase() + f.slice(1)).test(openSeg),
+      'gwOpenEditor 应回填 ' + f + '：\n' + openSeg.slice(0, 600));
+  }
+  // ③ 写回：非空才写，**不得 delete**（历史防线：字段被静默抹掉）
+  const applyStart = html.indexOf('function gwApplyEditor()');
+  const applySeg = html.slice(applyStart, applyStart + 2600);
+  for (const f of ['protocol', 'quirks', 'clientProfile', 'headers', 'timeoutMs']) {
+    assert.ok(new RegExp('p\\.' + f + '\\s*=').test(applySeg), 'gwApplyEditor 应写回 ' + f);
+    assert.ok(!new RegExp('delete\\s+p\\.' + f + '\\b').test(applySeg),
+      'gwApplyEditor 不得 delete p.' + f + '（留空应解读为"不改动"，否则输入框为空时会静默丢字段）');
+  }
+  // ④ 只允许 delete apiKeys（唯一例外，多 Key 降到 1 把时必须清）
+  assert.ok(!/delete p\.(?!apiKeys\b)/.test(applySeg), '除 apiKeys 外不得删除任何供应商字段');
+});
+
+t('renderer：自定义请求头（headers）文本 ↔ 对象互转无损（真跑页面函数）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
+  function extractFn(name) {
+    const i = html.indexOf('function ' + name + '(');
+    assert.ok(i >= 0, '应存在函数 ' + name);
+    const rest = html.slice(i);
+    const end = rest.indexOf('\n    function ', 10);
+    return (end > 0 ? rest.slice(0, end) : rest.slice(0, 2000)).trim();
+  }
+  const factory = new Function(
+    extractFn('gwParseHeaders') + '\n\n' + extractFn('gwHeadersText')
+    + '\nreturn { gwParseHeaders, gwHeadersText };');
+  const { gwParseHeaders, gwHeadersText } = factory();
+
+  // 基本解析
+  const h1 = gwParseHeaders('User-Agent: Cline/3.0.47\nX-CLIENT-TYPE: cline-sdk');
+  assert.deepStrictEqual(h1, { 'User-Agent': 'Cline/3.0.47', 'X-CLIENT-TYPE': 'cline-sdk' });
+  // 值里带冒号（URL）——只能在第一个冒号处切分
+  const h2 = gwParseHeaders('HTTP-Referer: https://cline.bot');
+  assert.strictEqual(h2['HTTP-Referer'], 'https://cline.bot', '值里的冒号不能被切断');
+  // 注释、空行、无冒号行都跳过
+  const h3 = gwParseHeaders('# 注释\n\nA: 1\n这行没有冒号\nB: 2');
+  assert.deepStrictEqual(h3, { A: '1', B: '2' });
+  // 往返一致（含真实 Cline 9 头）
+  const cline = {
+    'User-Agent': 'Cline/3.0.47', 'HTTP-Referer': 'https://cline.bot', 'X-Title': 'Cline',
+    'X-IS-MULTIROOT': 'false', 'X-CLIENT-TYPE': 'cline-sdk', 'X-CLIENT-VERSION': '3.0.47',
+    'X-PLATFORM': 'terminal', 'X-PLATFORM-VERSION': '3.0.47', 'X-CORE-VERSION': '0.0.66',
+  };
+  assert.deepStrictEqual(gwParseHeaders(gwHeadersText(cline)), cline, 'Cline 9 头往返必须无损');
+  // 值里的换行会被压成空格（否则会破坏"一行一个头"）
+  const h4 = gwParseHeaders(gwHeadersText({ A: 'x\ny' }));
+  assert.strictEqual(h4.A, 'x y');
+  // 空输入不抛错
+  assert.deepStrictEqual(gwParseHeaders(''), {});
+  assert.deepStrictEqual(gwParseHeaders(null), {});
+  assert.strictEqual(gwHeadersText(null), '');
+  // 解析出的对象必须是**纯对象**（写入 JSON 后仍是对象，不能被原型污染）
+  assert.strictEqual(Object.getPrototypeOf(gwParseHeaders('A: 1')), Object.prototype);
+});
+
   for (const { name, fn } of __tests) {
     await fn();
     passed++;
