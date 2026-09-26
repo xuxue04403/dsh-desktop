@@ -5,7 +5,7 @@
 //   好处：壳与 dsh 完全解耦（升级 dsh 不影响壳）；坏插件导致的服务故障由壳层安全模式兜底。
 'use strict';
 
-const { app, BrowserWindow, ipcMain, shell, clipboard, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, clipboard, dialog, session } = require('electron');
 const path = require('path');
 const os = require('os');
 
@@ -21,6 +21,10 @@ const { resolveDataDir } = require('./datadir');
 const market = require('./market');   // v1.5.18 插件市场（1024Store + npm 校验 + dsh CLI）
 const { installDefaultPlugins, verifyDefaultPlugins } = require('./default-plugins');   // v1.7.0 随 app 分发的默认插件（B1 修复：漏导入 verifyDefaultPlugins 曾使启动前自检静默失效）
 const pluginSnapshot = require('./plugin-snapshot');   // v1.7.7：插件迁移快照（复制目录到新电脑后自动装回插件）
+const machineAdapt = require('./machine-adapt');       // v1.8.3：换机首启适配（网关配置里写死的凭据路径/区域/代理）
+const crashReport = require('./crash-report');         // v1.9.0：致命错误现场落盘（独立于滚动日志，可整体拷走）
+const quitGuard = require('./quit-guard');             // v1.9.0：退出前任务确认（旁路信号，见模块头注释）
+const webAuth = require('./web-auth');                 // v1.9.0：用启动令牌换 cookie，页面 URL 不再带 token
 let marketOps = null;                 // 市场安装/卸载执行器（懒初始化，detect 后可用）
 let defaultPluginsDone = false;       // 默认插件安装幂等闸（每进程最多装一次）
 
@@ -52,6 +56,60 @@ let readyHandled = false;   // 每次启动的就绪处理幂等闸
 
 // 窗口、托盘图标资源与持久化数据目录（app.getPath('userData') 由 bootstrap 传入）
 let APP_USERDATA = '';   // 数据目录（resolveDataDir 解析结果），供输入历史持久化
+
+// v1.9.0：崩溃报告的附加现场。任何一项都可能尚未初始化（启动早期就崩），所以逐项
+// 防御——取不到就不写这一项，绝不因为"收集现场"本身再抛一次异常。
+function crashContext() {
+  const info = {};
+  try { info.version = app.getVersion(); } catch (_) { /* 忽略 */ }
+  try { info.electron = process.versions.electron; } catch (_) { /* 忽略 */ }
+  try { info.node = process.versions.node; } catch (_) { /* 忽略 */ }
+  try { info.platform = process.platform + ' ' + process.arch + ' / ' + os.release(); } catch (_) { /* 忽略 */ }
+  try { info.uptimeMs = process.uptime() * 1000; } catch (_) { /* 忽略 */ }
+  try { if (APP_USERDATA) info.dataDir = APP_USERDATA; } catch (_) { /* 忽略 */ }
+  try { if (state) { info.port = state.port; info.service = state.service; info.phase = state.phase; } } catch (_) { /* 忽略 */ }
+  try {
+    if (launcher) {
+      info.context = {
+        dshReady: !!launcher.ready,
+        dshRunning: !!launcher.running,
+        safeMode: !!(settings && settings.data && settings.data.safeMode),
+        gatewayRunning: !!(gateway && gateway.running),
+      };
+    }
+  } catch (_) { /* 忽略 */ }
+  return info;
+}
+
+// v1.9.0：统一的主界面加载入口。
+// 先把启动令牌换成会话 cookie，成功则加载**不含令牌**的干净 URL——令牌不再进入渲染层的
+// location / 导航历史（页面里还有第三方插件的客户端脚本）。任何一步失败都回退到既有的
+// "带令牌 URL"，保证界面一定打得开。换发每次 dsh 就绪只做一次：cookie 绑定该次启动的
+// authority，重启 dsh 后必须重换（在 startService 里随 readyHandled 一起复位）。
+let webAuthPrimed = false;
+let webAuthTried = false;
+
+async function loadWebUI(win) {
+  if (!win || win.isDestroyed() || !launcher || !launcher.authUrl) return;
+  if (!webAuthTried) {
+    webAuthTried = true;   // 先占位：即使下面的 await 期间再次被调用，也不会重复换发
+    try {
+      const r = await webAuth.primeSessionCookie(session.defaultSession, launcher.authUrl,
+        (m) => logger.appendLog(m));
+      webAuthPrimed = r.ok;
+      logger.appendLog(r.ok
+        ? '[界面加载] ' + r.detail + '；主窗口以不带令牌的 URL 加载'
+        : '[界面加载] cookie 引导未生效（' + r.detail + '），回退为带令牌的 URL');
+    } catch (err) {
+      webAuthPrimed = false;
+      logger.appendLog('[界面加载] cookie 引导异常，回退为带令牌的 URL：' + (err && err.message ? err.message : err));
+    }
+  }
+  if (win.isDestroyed()) return;   // 换发期间窗口可能已被关掉
+  return win.loadURL(webAuth.targetUrl(webAuthPrimed, launcher.authUrl)).catch((err) => {
+    logger.appendLog('加载界面失败: ' + (err && err.message ? err.message : err));
+  });
+}
 
 function createMainWindow() {
   mainWindow = new BrowserWindow({
@@ -102,6 +160,20 @@ function createMainWindow() {
   mainWindow.webContents.on('render-process-gone', (_e, details) => {
     const reason = (details && details.reason) || 'unknown';
     logger.appendLog('界面渲染进程异常退出：' + reason + '（exitCode ' + ((details && details.exitCode) || 0) + '）');
+    // v1.9.0：`clean-exit` 是正常收尾，不算崩溃；其余（crashed / oom / killed /
+    // integrity-failure…）固化成报告——渲染进程没了而壳还活着，正是最需要现场的一种。
+    if (reason !== 'clean-exit') {
+      try {
+        const ctx = crashContext();
+        ctx.context = Object.assign({}, ctx.context, {
+          reason: reason,
+          exitCode: (details && details.exitCode) || 0,
+          statePhase: ctx.phase,   // 原 state.phase 挪进现场，"阶段"让位给事件标签
+        });
+        ctx.phase = '界面渲染进程异常退出';
+        crashReport.record('renderer', null, ctx);
+      } catch (_) { /* 忽略 */ }
+    }
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'status.html'))
         .then(() => state.update({ phase: '界面进程异常退出（' + reason + '），已回到状态页——可点「重新启动」恢复' }))
@@ -145,10 +217,9 @@ function ensureMainWindow() {
   if (!mainWindow || mainWindow.isDestroyed()) {
     createMainWindow();
     // 服务已就绪 → 直接载入 dsh 界面（否则停留本地状态页）
+    // v1.9.0：走统一入口（先换 cookie 再加载，失败自动回退带令牌 URL）
     if (launcher && launcher.ready && launcher.authUrl && mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.loadURL(launcher.authUrl).catch((err) => {
-        logger.appendLog('加载界面失败: ' + (err && err.message ? err.message : err));
-      });
+      loadWebUI(mainWindow);
     }
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -668,6 +739,63 @@ async function applyPluginSnapshotBeforeStart() {
   }
 }
 
+// ---------------- 换机首启适配（v1.8.3：网关配置里"只在本机成立"的部分） ----------------
+// 与迁移快照的分工：快照负责把插件与 dsh 配置装回来；这里负责网关配置的换机适配——
+// 清掉写死别处用户名的 authFile、按新机实际登录的 WorkBuddy 区域启停对应供应商、
+// 关掉本机不可达的本地代理。幂等（按机器指纹），只动机器相关字段，绝不碰任何 Key。
+let machineAdapted = false;
+async function adaptGatewayForMachineBeforeStart() {
+  if (machineAdapted) return null;
+  if (!APP_USERDATA) return null;
+  machineAdapted = true;   // 每次进程只尝试一次
+  try {
+    const r = await machineAdapt.applyIfNeeded({
+      dataDir: APP_USERDATA,
+      log: (s) => logger.appendLog('[换机适配] ' + s),
+    });
+    if (r.action === 'adapted') logger.appendLog('[换机适配] ' + r.message);
+    else logger.appendLog('[换机适配] ' + r.action + '：' + r.message);
+    return r;
+  } catch (err) {
+    logger.appendLog('[换机适配] 异常（不阻断启动）：' + (err && err.message ? err.message : err));
+    return null;
+  }
+}
+
+/**
+ * v1.9.0：快照可迁移性自检。
+ *
+ * 本项目的核心用法是"绿色目录直接拷到新电脑就能跑"，而能否直接跑取决于快照承诺随包
+ * 携带的插件包体与 dsh 配置文件是否真的躺在 data\ 里。等到新机器上才发现缺东西，
+ * 代价是离线环境下插件装不回来——所以每次刷新快照后当场校验一次并如实报告。
+ *
+ * 只读、不阻断：异常只记日志（启动路径上不引入新的失败面）。
+ */
+function selfCheckSnapshot(reason) {
+  if (!APP_USERDATA) return null;
+  try {
+    const v = pluginSnapshot.verify(APP_USERDATA);
+    if (!v.snapshotExists) {
+      logger.appendLog('[迁移自检] 尚无迁移快照（' + reason + '）');
+      return v;
+    }
+    if (v.ok) {
+      logger.appendLog('[迁移自检] 通过：' + v.message + '（' + reason + '）');
+    } else {
+      logger.appendLog('[迁移自检] 发现不完整——现在拷到新电脑可能缺内容：' + v.message + '（' + reason + '）');
+    }
+    if (v.plugins && v.plugins.registry && v.plugins.registry.length) {
+      logger.appendLog('[迁移自检] ' + v.plugins.registry.length + ' 个插件无随包内容，新机器需联网安装：'
+        + v.plugins.registry.join(', '));
+    }
+    state.update({ migrationCheck: { ok: v.ok, message: v.message, at: Date.now() } });
+    return v;
+  } catch (err) {
+    logger.appendLog('[迁移自检] 异常：' + (err && err.message ? err.message : err));
+    return null;
+  }
+}
+
 /** 服务就绪后刷新快照（保持"随时可复制迁移"的状态） */
 function capturePluginSnapshotNow(reason) {
   if (pluginSnapshotCaptured || !APP_USERDATA) return null;
@@ -680,6 +808,7 @@ function capturePluginSnapshotNow(reason) {
     });
     if (r.ok) logger.appendLog('[迁移快照] ' + r.action + '：' + r.message + '（' + reason + '）');
     else logger.appendLog('[迁移快照] ' + r.action + '：' + r.message + '（' + reason + '）');
+    selfCheckSnapshot(reason);   // v1.9.0：采集完立刻校验可迁移性
     return r;
   } catch (err) {
     logger.appendLog('[迁移快照] 采集异常：' + (err && err.message ? err.message : err));
@@ -706,6 +835,9 @@ function runServiceOp(label, fn) {
 async function startService() {
   return runServiceOp('启动', async () => {
     readyHandled = false;
+    // v1.9.0：新一次启动 = 新 authority 令牌，会话 cookie 必须重换（见 loadWebUI）
+    webAuthTried = false;
+    webAuthPrimed = false;
     state.update({ service: 'starting', phase: '正在启动 dsh 服务…', failReason: '' });
     // 启动分段计时（2026-09-11 加）：迁移到新机器后"启动慢"必须能一眼看出卡在哪一段。
     //   [启动计时] 停旧进程 0ms / 检测 dsh 120ms / 默认插件自检 5000ms / 迁移快照 20ms → 已拉起 dsh
@@ -889,11 +1021,8 @@ function onReady() {
     shell.openExternal(launcher.authUrl).catch(() => { /* 忽略 */ });
   }
   // 安全模式：页面顶部横幅由渲染层按 safeMode 展示
-  if (mainWindow) {
-    mainWindow.loadURL(launcher.authUrl).catch((err) => {
-      logger.appendLog('加载界面失败: ' + (err && err.message ? err.message : err));
-    });
-  }
+  // v1.9.0：走统一入口（先换 cookie 再加载，失败自动回退带令牌 URL）
+  if (mainWindow) loadWebUI(mainWindow);
 }
 
 function onBootTimeout() {
@@ -938,6 +1067,13 @@ function wireLauncher() {
       state.update({ service: 'stopped', phase: 'dsh 服务已停止' });
       return;
     }
+    // v1.9.0：dsh 服务**非用户主动**退出即固化现场（含"启动失败"与"就绪后崩溃"两种）。
+    // 看门狗随后可能自动恢复，但恢复成功与否正是事后要判断的事——现场必须留下。
+    try {
+      const ctx = crashContext();
+      ctx.phase = wasReady ? 'dsh 服务就绪后意外退出' : 'dsh 服务启动失败（未就绪即退出）';
+      crashReport.record('web', null, ctx);
+    } catch (_) { /* 忽略 */ }
     if (!wasReady) {
       // 未就绪即退出 → 看门狗（插件故障自动隔离）
       watchdog.tryRecover();
@@ -1138,8 +1274,42 @@ function registerIpc() {
 // ---------------- 生命周期 ----------------
 
 let forceQuit = false;
+let quitConfirming = false;   // 确认框已弹出：重复的退出请求应"加入"而不是叠第二个框
 
-function quitAll() {
+// v1.9.0：退出前任务确认。
+// 官方 desktop 直接问 Host"这次退出会打断什么"（私有 IPC，2 秒不应答按有任务算）；
+// DSH-App 与 dsh 之间只有 stdout 就绪行 + HTTP 两个稳定契约，没有这条通道，
+// 因此改用旁路可观测信号（会话状态写入 + 网关流量）。判定与措辞的取舍见 quit-guard.js。
+function quitAll(confirmed) {
+  if (!confirmed) {
+    // 用户可在设置里关掉这项确认；函数式取用，避免设置尚未加载时读到 undefined
+    if (settings && settings.data && settings.data.confirmQuitWhenBusy === false) { quitAll(true); return; }
+    if (quitConfirming) return;   // 已有确认框在等：本次请求并入那一次
+    let verdict;
+    try {
+      verdict = quitGuard.assess({ gatewayLastActivityAt: gateway ? gateway.lastActivityAt : 0 });
+    } catch (err) {
+      // 判定本身失败不该把用户锁在应用里：放行并留痕
+      logger.appendLog('[退出确认] 活动判定失败，按直接退出处理：' + (err && err.message ? err.message : err));
+      quitAll(true);
+      return;
+    }
+    if (!verdict.busy) { quitAll(true); return; }
+    quitConfirming = true;
+    logger.appendLog('[退出确认] 检测到近期活动（' + verdict.signals.map((s) => s.detail).join('；') + '），等待用户确认');
+    quitGuard.confirm(dialog, mainWindow, verdict, (m) => logger.appendLog(m))
+      .then((ok) => {
+        quitConfirming = false;
+        if (ok) quitAll(true);
+        else logger.appendLog('[退出确认] 用户取消退出，任务继续。');
+      })
+      .catch((err) => {
+        quitConfirming = false;
+        logger.appendLog('[退出确认] 确认流程异常，按确认退出：' + (err && err.message ? err.message : err));
+        quitAll(true);
+      });
+    return;
+  }
   forceQuit = true;
   const stopAll = async () => {
     // R18（退出全清）：正常停网关 + dsh 主进程后，再全局清理所有 dsh 相关进程树
@@ -1188,13 +1358,24 @@ async function bootstrap() {
       + '系统清理临时文件后配置/会话历史/供应商密钥会丢失。建议改用绿色目录版，或设置环境变量 '
       + 'DSH_DATA_DIR=<固定目录>。');
   }
+  // v1.9.0：崩溃报告目录与滚动日志同处（一切随绿色目录走，换机可整体拷走）。
+  // 清理放在启动路径而不是错误路径上——崩溃时不该再去做删文件这种事。
+  crashReport.init(logger.logDirPath());
+  const prunedCrashes = crashReport.prune();
+  if (prunedCrashes > 0) {
+    logger.appendLog('已清理 ' + prunedCrashes + ' 份旧崩溃报告（保留最近 ' + crashReport.MAX_KEEP + ' 份）');
+  }
   // R22：兜底未捕获异常/Promise 拒绝——主进程缺 handler 时 Node 默认直接 throw，
   // 用户操作路径上偶发的 openExternal/加载失败即可带崩整个壳
+  // v1.9.0：除 app.log 的一行流水外，另固化一份完整现场（logs\crash-*.log）。app.log
+  // 是 1MB 轮转的流水，事故现场会被后续输出冲掉；而绿色目录换机后用户往往只剩日志可查。
   process.on('unhandledRejection', (reason) => {
     try { logger.appendLog('[未处理 Promise 拒绝] ' + ((reason && (reason.stack || reason.message)) || reason)); } catch (_) { /* 忽略 */ }
+    try { crashReport.record('main', reason, crashContext()); } catch (_) { /* 忽略 */ }
   });
   process.on('uncaughtException', (err) => {
     try { logger.appendLog('[未捕获异常] ' + ((err && err.stack) || err)); } catch (_) { /* 忽略 */ }
+    try { crashReport.record('main', err, crashContext()); } catch (_) { /* 忽略 */ }
   });
   settings = new Settings(userData);
   settings.load();
@@ -1210,6 +1391,24 @@ async function bootstrap() {
   // 启动探明 dsh 版本与 node 路径（仅读包信息，不启动服务）；
   // 放在网关创建之前，让网关复用真实的 node 路径
   launcher.detect();
+  // v1.9.0：每次启动幂等确保「应用根目录\node.exe」存在。
+  // 它是内嵌运行时的 PATH 入口——launcher.prepareEmbeddedInstallEnv 在 exe 旁建硬链接，
+  // 因为 dsh 的原生依赖（koffi/node-pty）postinstall 直接调 `node`，而本机没有系统 Node.js。
+  // 该文件此前**只在安装/升级 dsh 时**才会被创建，于是 build-portable / build-uat 的
+  // `rmSync(appDir)`（只备份 data\）之后它不会自动恢复：表现为 PATH 上的 `node` 突然消失，
+  // 后续任何依赖它的命令都失败（2026-09-25 实际发生，根因排查花了较久）。
+  // 已存在时零开销（一次 existsSync）；缺失时硬链接（同盘零拷贝），失败才回退复制。
+  try {
+    const ensured = require('./launcher').prepareEmbeddedInstallEnv(null, process.env);
+    if (ensured && ensured.nodeExe) {
+      logger.appendLog('内嵌运行时入口就绪：' + ensured.nodeExe);
+    } else {
+      logger.appendLog('[警告] 未能准备内嵌 node.exe —— dsh 原生依赖的安装/postinstall 可能失败'
+        + '（可从 DSH-App.exe 手工硬链接一份为 node.exe）');
+    }
+  } catch (err) {
+    logger.appendLog('[警告] 准备内嵌 node.exe 异常：' + (err && err.message ? err.message : err));
+  }
   watchdog = new Watchdog({ settings, launcher, state, logger, workDir });
   gateway = new GatewayManager({
     userDataDir: userData,
@@ -1219,6 +1418,10 @@ async function bootstrap() {
     logger,
   });
   gateway.init();
+  // v1.8.3：换机首启适配——必须在网关启动之前完成（网关只在启动时读一次配置）。
+  // 放在 gateway.init() 之后，确保"首次无配置时从示例生成"的那份也已存在。
+  // 幂等：同一台机器只做一次，正常启动只是一次小文件读取，无额外等待。
+  await adaptGatewayForMachineBeforeStart();
   // 网关状态变化 → 推送给设置窗（若打开）
   gateway.on('state', () => broadcastGw());
   // 逐请求日志（pushLog 内 800ms 节流 emit）→ 也推送给设置窗，日志框才能实时跟随
