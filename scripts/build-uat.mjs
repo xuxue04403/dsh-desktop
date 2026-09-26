@@ -87,15 +87,50 @@ const exeOld = path.join(appDir, 'electron.exe');
 const exeNew = path.join(appDir, 'DSH-App.exe');
 if (existsSync(exeOld)) renameSync(exeOld, exeNew);
 const defaultAsar = path.join(appDir, 'resources', 'default_app.asar');
-if (existsSync(defaultAsar)) rmSync(defaultAsar, { force: true });
+// 删不掉也不能中止构建。三个 Windows 事实，2026-09-25 逐个踩到：
+//   · 它可能是**目录**（上次构建中断 / cpSync 的"目标已有同名目录就复制进去"语义）
+//     → 非递归 rmSync 抛 EISDIR；
+//   · 它是**刚由 cpSync 写入**的，而紧接着复制的是 246MB 的 Electron 运行时，Windows 上
+//     句柄常被杀软扫描或写回缓存持有数秒 → 抛 EPERM，重试 2 秒仍不够；
+//   · 它只是 Electron 的**兜底默认应用**，仅在缺少 app.asar 时才会被加载——而本次构建
+//     在上一步必定产出 app.asar。所以留着它无害，为一个装饰性文件让整次构建失败不划算。
+if (existsSync(defaultAsar)) {
+  try {
+    rmSync(defaultAsar, { force: true, recursive: true, maxRetries: 5, retryDelay: 500 });
+  } catch (err) {
+    console.log('[警告] 未能删除 default_app.asar（' + ((err && err.code) || err) + '）——'
+      + '不影响运行（有 app.asar 时它不会被加载），可稍后手工删除。');
+  }
+}
 
 // 5) 内嵌 npm（同 build-portable）
+// 2026-09-25 修复：原先只有两个候选、且**找不到时静默跳过**。本机没有独立 Node.js
+// （`node` 就是 Electron，其发行包不含 npm）→ 产物从来没有内嵌 npm，而 dsh 的首次安装
+// 与自动升级都依赖它（launcher.findEmbeddedNpmCli → resources\node_modules\npm\bin\npm-cli.js），
+// 缺失时回退到 PATH 的 `npm` 并报 `'npm' 不是内部或外部命令`。
+// 现在与 build-portable / prepare-extra 对齐候选，并在缺失时**明确告警**。
 {
-  let npmSrc = path.join(root, 'node_modules', 'npm');
-  if (!existsSync(npmSrc)) npmSrc = path.join(path.dirname(process.execPath), 'node_modules', 'npm');
-  if (existsSync(npmSrc)) {
-    cpSync(npmSrc, path.join(appDir, 'resources', 'node_modules', 'npm'), { recursive: true });
-    console.log('[内嵌] npm → resources\\node_modules\\npm');
+  const npmDst = path.join(appDir, 'resources', 'node_modules', 'npm');
+  const npmCandidates = [
+    path.join(root, 'out', '_npm', 'package'),                       // scripts/fetch-npm.mjs 产出
+    path.join(root, 'node_modules', 'npm'),
+    path.join(root, 'out', 'DSH-App', 'resources', 'node_modules', 'npm'),
+    path.join(path.dirname(process.execPath), 'node_modules', 'npm'),
+  ];
+  const npmFrom = npmCandidates.find((p) => existsSync(path.join(p, 'bin', 'npm-cli.js')));
+  if (npmFrom) {
+    rmSync(npmDst, { recursive: true, force: true });
+    cpSync(npmFrom, npmDst, { recursive: true });
+    // 减体积：与 build-portable 同一套（文档/测试/多语言不在运行链路上）
+    for (const junk of ['docs', 'test', 'tap-snapshots']) {
+      const j = path.join(npmDst, junk);
+      try { if (existsSync(j)) rmSync(j, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
+    }
+    console.log('[内嵌] npm ← ' + path.relative(root, npmFrom));
+  } else {
+    console.log('[警告] 未找到内嵌 npm（试过：' + npmCandidates.map((p) => path.relative(root, p)).join(' / ') + '）');
+    console.log('        → dsh 首次安装与自动升级会回退系统 npm，零依赖机器上必然失败。');
+    console.log('        → 先运行：node scripts/fetch-npm.mjs');
   }
 }
 
