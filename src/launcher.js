@@ -276,18 +276,45 @@ class Launcher extends EventEmitter {
       if (!fs.existsSync(file)) return false;
       let src = fs.readFileSync(file, 'utf8');
       if (src.includes('// R28 dsh-app')) return true;   // 已打过
-      const anchor = [
-        '\tif (request.provider !== void 0) {',
-        '\t\tconst installed = catalogModels(request.provider);',
-        '\t\tif (installed.size > 0) return [...installed.values()].map((model) => ({',
-        '\t\t\tid: model.id,',
-        '\t\t\tname: model.name,',
-        '\t\t\tcontextWindow: model.contextWindow,',
-        '\t\t\tmaxTokens: model.maxTokens',
-        '\t\t}));',
-        '\t}',
-      ].join('\n');
-      if (!src.includes(anchor)) {
+      // 上游两个版本的写法差异：**0.1.7-rc.2 起目录模型多了一个 inputModalities 字段**
+      // （多模态输入能力，取自 model.input）。锚点与替换体必须**成对**匹配——只改锚点不改
+      // 替换体，会把新字段从 catalogReply 里吃掉，表现为「获取模型」列出的模型悄悄丢掉
+      // 图片能力。那比打不上补丁更糟（静默降级），所以按版本分别准备。
+      const VARIANTS = [
+        {
+          label: '0.1.5-rc.x',
+          anchor: [
+            '\tif (request.provider !== void 0) {',
+            '\t\tconst installed = catalogModels(request.provider);',
+            '\t\tif (installed.size > 0) return [...installed.values()].map((model) => ({',
+            '\t\t\tid: model.id,',
+            '\t\t\tname: model.name,',
+            '\t\t\tcontextWindow: model.contextWindow,',
+            '\t\t\tmaxTokens: model.maxTokens',
+            '\t\t}));',
+            '\t}',
+          ].join('\n'),
+          fields: ['\t\t\t\tmaxTokens: model.maxTokens'],
+        },
+        {
+          label: '0.1.7-rc.x',
+          anchor: [
+            '\tif (request.provider !== void 0) {',
+            '\t\tconst installed = catalogModels(request.provider);',
+            '\t\tif (installed.size > 0) return [...installed.values()].map((model) => ({',
+            '\t\t\tid: model.id,',
+            '\t\t\tname: model.name,',
+            '\t\t\tcontextWindow: model.contextWindow,',
+            '\t\t\tmaxTokens: model.maxTokens,',
+            '\t\t\tinputModalities: [...model.input]',
+            '\t\t}));',
+            '\t}',
+          ].join('\n'),
+          fields: ['\t\t\t\tmaxTokens: model.maxTokens,', '\t\t\t\tinputModalities: [...model.input]'],
+        },
+      ];
+      const variant = VARIANTS.find((v) => src.includes(v.anchor));
+      if (!variant) {
         this.log('R28 补丁：未找到模型发现目录短路锚点（dsh 版本变化？）——「获取模型」仍只会返回内置快照');
         return false;
       }
@@ -299,7 +326,7 @@ class Launcher extends EventEmitter {
         '\t\t\t\tid: model.id,',
         '\t\t\t\tname: model.name,',
         '\t\t\t\tcontextWindow: model.contextWindow,',
-        '\t\t\t\tmaxTokens: model.maxTokens',
+        ...variant.fields,
         '\t\t\t}));',
         '\t\t\t// R28 dsh-app: 内置目录是安装时的快照——目录命中的 provider 在此直接返回，永不联网，',
         '\t\t\t// 新上线的模型因此在「获取模型」里永远看不到。白名单内的 provider 先要一次实时列表，',
@@ -335,9 +362,9 @@ class Launcher extends EventEmitter {
         '\t\t}',
         '\t}',
       ].join('\n');
-      src = src.replace(anchor, replacement);
+      src = src.replace(variant.anchor, replacement);
       fs.writeFileSync(file, src, 'utf8');
-      this.log('R28 补丁：dsh-llm-pi-ai 模型发现改为「实时优先 + 目录回退」 ✓');
+      this.log('R28 补丁：dsh-llm-pi-ai 模型发现改为「实时优先 + 目录回退」 ✓（适配 ' + variant.label + '）');
       return true;
     } catch (e) {
       this.log('R28 补丁 失败: ' + (e && e.message ? e.message : e));
@@ -387,6 +414,11 @@ class Launcher extends EventEmitter {
             src = src.replace(anchor, '\tconst child = spawn(program, args, {\n\t\twindowsHide: true,   // dsh-app R19: GUI 宿主下隐藏孙进程控制台窗口\n\t\tcwd: spec.cwd,');
             fs.writeFileSync(t1, src, 'utf8');
             this.log('R19 补丁1：dsh-subprocess-local windowsHide ✓');
+          } else if (src.includes('windowsHide: true')) {
+            // 0.1.7-rc.2 起上游重写了 subprocess 启动路径（runner 机制）并自带 windowsHide: true
+            this.log('R19 补丁1：上游已自带 windowsHide（无需补丁）✓');
+          } else {
+            this.log('R19 补丁1：未找到 spawn 锚点，且未见上游自带的 windowsHide —— 孙进程可能弹控制台窗口');
           }
         }
       }
@@ -403,8 +435,13 @@ class Launcher extends EventEmitter {
             src = src.split(anchor).join(replacement);
             fs.writeFileSync(t2, src, 'utf8');
             this.log('R19 补丁2：dsh-win32-process STARTF+SW_HIDE ✓');
+          } else if (src.includes('dwFlags: 257') && src.includes('wShowWindow: 0')) {
+            // 0.1.7-rc.2 起上游自己带了 STARTF_USESHOWWINDOW(1)+SW_HIDE(0)（两处调用点都是
+            // dwFlags: 257, wShowWindow: 0）→ 补丁不再需要。此前这里会打"版本变化？"的告警，
+            // 把"上游已修"误报成"补丁失效"，反而误导排查。
+            this.log('R19 补丁2：上游已自带 STARTF_USESHOWWINDOW+SW_HIDE（无需补丁）✓');
           } else {
-            this.log('R19 补丁2：未找到 dwFlags 锚点（dsh 版本变化？）');
+            this.log('R19 补丁2：未找到 dwFlags 锚点，且未见上游自带的 SW_HIDE —— 孙进程窗口可能可见（dsh 版本变化？）');
           }
         }
       }
@@ -484,7 +521,12 @@ class Launcher extends EventEmitter {
     // R22：记录本次启动前的 web.log 字节基线——看门狗只分析「本次启动之后」追加的
     // 输出（web.log 跨启动不清空，历史插件故障行若被误读会触发假安全模式）
     this.webLogBaseline = 0;
-    try { this.webLogBaseline = require('./logger').webLogSize() || 0; } catch (_) { /* 忽略 */ }
+    try {
+      const logger = require('./logger');
+      // 先把上一次残留的半行落盘（否则它会与本次第一行粘在一起）
+      if (typeof logger.flushWebNow === 'function') logger.flushWebNow();
+      this.webLogBaseline = logger.webLogSize() || 0;
+    } catch (_) { /* 忽略 */ }
     const port = this.settings.data.port;
     const patch = this.settings.data.safeMode ? this.settings.safePatchPath : null;
 
