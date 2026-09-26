@@ -14,6 +14,7 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { EventEmitter } = require('events');
+const crashReport = require('./crash-report');   // v1.9.0：网关反复崩溃时固化现场
 
 const LOG_TAIL_MAX = 64 * 1024;
 
@@ -595,6 +596,14 @@ async waitPortFree(port, timeoutMs) {
         if (this._healTimes.length >= 5) {
           this.log('模型网关：10 分钟内已自愈重启 ' + this._healTimes.length + ' 次仍未稳定，停止自动重启'
             + '（请检查配置/端口/上游后手动启动）。');
+          // v1.9.0：自愈放弃 = 这条链路已无法自己恢复，正是最该留现场的时刻。
+          // 单次自愈重启不记（那是常态恢复），只记"放弃"这一种。
+          try {
+            crashReport.record('gateway', null, {
+              phase: '模型网关反复异常退出，已停止自愈',
+              context: { exitCode: code, healCount: this._healTimes.length, windowMinutes: 10 },
+            });
+          } catch (_) { /* 忽略 */ }
           return;
         }
         this._healTimes.push(now);
@@ -719,6 +728,11 @@ async waitPortFree(port, timeoutMs) {
 
   pushLog(text) {
     this.logTail = (this.logTail + text).slice(-LOG_TAIL_MAX);
+    // v1.9.0：记账"最近一次网关输出"，供退出前的任务确认判定（见 quit-guard.js）。
+    // 记在 pushLog 而不是别处：它是**全部** stdout/stderr 的唯一汇聚点，因此
+    // "网关有输出" 等价于 "有模型请求在流动"——这正是"模型正在思考、会话还没落盘"
+    // 那段空档里唯一可观测的信号。
+    this.lastActivityAt = Date.now();
     // 审计补充：逐请求日志也要能实时到界面。旧实现靠设置页每 2 秒轮询**整体重写**日志框
     // （用户无法阅读/复制），现改为事件驱动 + 800ms 节流 emit('log')；渲染侧已实现
     // "内容不变不碰 DOM、仅在底部才自动滚动"，因此不会打断阅读。
