@@ -115,6 +115,14 @@ removed.push(['跨平台预编译二进制', crossBytes], ['*.map 源码映射',
   ['测试/示例/文档目录', testBytes], ['@types 类型包', typesBytes], ['*.ts/.tsx 源码与类型', tsBytes]);
 // 启动即再生的运行期文件
 for (const rel of ['data/logs', 'data/gateway', 'data/broker', 'data/market']) rm(path.join(work, rel), rel + '（启动再生）');
+// 应用根目录的 node.exe：**不是随包文件**，而是 shell 启动时幂等再生的「内嵌运行期入口」。
+// src/main.js「v1.9.0：每次启动幂等确保应用根目录 node.exe 存在」→
+// launcher.prepareEmbeddedInstallEnv 把应用 exe **硬链接**为 node.exe（失败才退回复制）。
+// 它与应用 exe 同为约 237 MB 的 Electron 二进制，留着等于白背一份
+// （实测：372.5 MB → 269.4 MB，省 103 MB ≈ node.exe 压缩后大小）。
+// publish.mjs 的绿色包早已如此排除
+// （ZIP_SKIP_FILES = ['node.exe']，注释「运行期 node.exe」），此处对齐。
+rm(path.join(work, 'node.exe'), 'node.exe（启动时由 DSH-App.exe 硬链接再生）');
 if (dropNpm) rm(path.join(work, 'resources', 'node_modules', 'npm'), '内嵌 npm');
 if (dropDsh) rm(path.join(work, 'data', 'node-global'), '内置 dsh（首次启动需联网安装）');
 
