@@ -290,9 +290,12 @@ async function syncSources() {
     for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
       if (e.name === 'node_modules' || e.name === 'out' || e.name === 'dist' || e.name === '.git') continue;
       if (e.name === 'anywhere-lab-sdsh-desktop') continue;   // 官方参考源码副本，不属于本项目仓库
-      // 审计修复（P2）：*.bak-scrub / *.bak 是脱敏或改图标前的**原始值**备份（含真实
-      // 邮箱/密钥），绝不允许随源码上传。
-      if (/\.bak-scrub$/i.test(e.name) || /\.bak$/i.test(e.name)) { skippedBackups++; continue; }
+      // G1（v1.9.0 安全修复）：一律不上传任何 `*.bak` 变体。`.bak-scrub` 是脱敏前的
+      // **原始值**备份（含真实邮箱/密钥）；`.bak-nobom-*` / `.bak-version` /
+      // `.bak-machineadapt-*` 同理是"改动前的现场"，没有理由公开。旧规则只认
+      // `\.bak$` 与 `\.bak-scrub$`，会漏掉带后缀的变体；release.ps1 此前完全没有
+      // 这条规则（原始凭据可经该链路外泄）。两处规则现已对齐。
+      if (/\.bak($|-)/i.test(e.name)) { skippedBackups++; continue; }
       const abs = path.join(dir, e.name);
       if (e.isDirectory()) { await walk(abs); continue; }
       const rel = path.relative(root, abs).split(path.sep).join('/');
