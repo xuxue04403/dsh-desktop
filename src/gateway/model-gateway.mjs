@@ -53,14 +53,25 @@ const UPSTREAM_TIMEOUT_MS = (() => {
   const n = Number(process.env.DSH_GATEWAY_UPSTREAM_TIMEOUT_MS);
   return Number.isFinite(n) && n > 0 ? n : 60_000;
 })();
-/** 供应商级超时：provider.timeoutMs > 全局默认；**半开探测**用短超时（见 BREAKER_PROBE_TIMEOUT_MS）。 */
+/** 供应商级超时：provider.timeoutMs > 全局默认；**半开探测**用短超时（见 BREAKER_PROBE_TIMEOUT_MS）。
+ *
+ * 例外（2026-09-22 实测事故：amd 的 DeepSeek-V4.1-Flash 永远选不上）：
+ * 供应商**显式声明** `timeoutMs` 时，半开探测也照它来，不再压到 10 秒。
+ * 旧实现用 `Math.min(base, PROBE)` 一刀切，于是"首字节稳定 >10s"的家**探测必然超时**
+ * → 熔断重新 open → 退避 2m→3m→6m→12m→30m → 再探测又超时，**永远无法恢复**；
+ * 实测 amd 该模型首字节 13.7–15.5s（同家 DeepSeek-V4-Flash 只要 0.7–1.1s），
+ * 结果每个请求都 `skip amd (breaker open)` 落到 workbuddy——配了 timeoutMs 也没用。
+ * 未声明 timeoutMs 的家仍走 10 秒探测上限（探测是在替全家人试错，不该占满用户 60 秒）。 */
 function providerTimeoutMs(provider) {
   const n = Number(provider && provider.timeoutMs);
-  const base = Number.isFinite(n) && n > 0 ? n : UPSTREAM_TIMEOUT_MS;
+  const declared = Number.isFinite(n) && n > 0;
+  const base = declared ? n : UPSTREAM_TIMEOUT_MS;
   // 2026-09-17 优化：半开探测不放满 60s——该请求同时在替所有人生死探测，不能让用户等满。
   try {
     const b = breaker.get(String((provider && provider.id) || ''));
-    if (b && b.state === 'half-open') return Math.min(base, BREAKER_PROBE_TIMEOUT_MS);
+    if (b && b.state === 'half-open') {
+      return declared ? base : Math.min(base, BREAKER_PROBE_TIMEOUT_MS);
+    }
   } catch (_) { /* 模块初始化早期（const 尚未就绪）→ 退回常规超时 */ }
   return base;
 }
@@ -347,6 +358,16 @@ const BREAKER_LONG_MS = envMs('DSH_GATEWAY_BREAKER_LONG_MS', 30 * 60_000);  // �
 const BREAKER_BACKOFF_MAX_MS = envMs('DSH_GATEWAY_BREAKER_BACKOFF_MAX_MS', 30 * 60_000);
 const BREAKER_PROBE_TIMEOUT_MS = envMs('DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS', 10_000);
 
+/* 2026-09-23（审计 D1 修复）：半开探测名额的**兜底回收期**。
+ * half-open 是"单飞"状态——占了名额的那个请求必须最终调用 breakerRecordFail 或
+ * breakerRecordSuccess 之一才会释放。审计确认 forward() 里存在**漏释放的 early return**
+ *（账户级失败交回账户池那一支）。一旦命中，该家就永久卡在 half-open：breakerIsOpen() 对任何
+ * 请求都返回 true → 该家再也不会被选中，直到进程重启，而日志里只有满屏 `skip X (breaker …)`，
+ * 用户完全无从判断。现在给 half-open 加时间兜底：超期仍未结算的探测名额视为"遗弃"，
+ * 允许重新占用。这条兜底不依赖"把所有 return 都改对"——即使将来又漏一处也不会永久卡死。
+ *（env 名刻意取短，避免自身被降敏成占位符而无法在源码里检索。） */
+const BREAKER_STALE_MS = envMs('DSH_GW_BREAKER_STALE_MS', 180_000);
+
 /* 熔断状态机（审计修复 P2，本次）：closed / open / half-open
  * 旧版 breakerIsOpen() 带**副作用**（冷却到点即把 fails 重置、openUntil 清零），而同一个请求会
  * 调用它 2 次以上（预过滤 + 候选过滤）→ 冷却到点时 N 个并发请求**同时**判定"已恢复"，一起打向
@@ -414,12 +435,19 @@ async function retryWithoutThinking(provider, upstreamPath, upstreamHeaders, bod
   } finally { clearTimeout(t); }
 }
 
+/** D1：半开探测名额是否已被"遗弃"（占用超过兜底期仍未调用 recordFail/recordSuccess）。纯读。 */
+function probeSlotStale(b) {
+  if (!b || b.state !== 'half-open') return false;
+  return !!b.probeAt && (Date.now() - b.probeAt) > BREAKER_STALE_MS;
+}
+
 /** 纯读：该 provider 当前是否不可用（冷却窗口内，或半开探测名额已被别的请求占用）。 */
 function breakerIsOpen(providerId) {
   const b = breaker.get(providerId);
   if (!b) return false;
   if (b.state === 'open') return Date.now() < b.openUntil;   // 冷却中 → 跳过
-  if (b.state === 'half-open') return true;                  // 已有探测在途 → 其它并发请求跳过
+  // D1：半开名额若已被占用且超过兜底期仍未结算 → 视为遗弃，放行新探测（否则永久卡死）
+  if (b.state === 'half-open') return !probeSlotStale(b);    // 已有探测在途 → 其它并发请求跳过
   return false;                                              // closed
 }
 
@@ -427,9 +455,14 @@ function breakerIsOpen(providerId) {
 function breakerAcquire(providerId) {
   const b = breaker.get(providerId);
   if (!b || !b.state || b.state === 'closed') return true;
-  if (b.state === 'half-open') return false;                 // 单飞：探测名额已被占
-  if (Date.now() < b.openUntil) return false;                // 冷却未到点（并发窗口内）
+  // D1：单飞——但"遗弃名额"（超过 BREAKER_STALE_MS 未结算）允许被回收，否则该家永久失联
+  if (b.state === 'half-open' && !probeSlotStale(b)) return false;
+  if (b.state !== 'half-open' && Date.now() < b.openUntil) return false;   // 冷却未到点（并发窗口内）
+  if (b.state === 'half-open') {
+    log(`breaker HALF-OPEN: ${providerId} 上一个探测名额已超期（${Math.round(BREAKER_STALE_MS / 1000)}s）未结算，回收后重新放行`);
+  }
   b.state = 'half-open';
+  b.probeAt = Date.now();                                    // D1：结算兜底的时间基准
   b.fails = BREAKER_THRESHOLD - 1;                           // 探测失败 → 立刻回到 open
   breaker.set(providerId, b);
   log(`breaker HALF-OPEN: ${providerId} 冷却到点，放行一次探测（single-flight）`);
@@ -837,13 +870,32 @@ function providerSupportsVision(provider, logical) {
 
 /** 请求体里是否含图片块（兼容 Anthropic / OpenAI chat / Responses 三种形状） */
 function bodyHasImage(body) {
-  if (!body || typeof body !== 'object') return false;
-  const hasImg = (content) => Array.isArray(content) && content.some((b) => b && (
-    b.type === 'image' || b.type === 'image_url' || b.type === 'input_image' || b.image_url != null
-  ));
-  if (Array.isArray(body.messages) && body.messages.some((m) => m && hasImg(m.content))) return true;
-  if (Array.isArray(body.input) && body.input.some((m) => m && hasImg(m.content))) return true;   // Responses API
-  return false;
+  return imageBlockStats(body).total > 0;
+}
+
+/**
+ * 图片块计数（2026-09-18 用户排查"我明明没发图片"）：
+ * 客户端**每轮都会重发完整历史**，所以一张早期的截图会让之后每一轮请求都"含图片"
+ * （实测：14:43 用户贴的控制台截图，导致 14:57 起每一轮都命中多模态路由）；
+ * 只报"请求含图片"会让人误以为是自己**本轮**附了图 → 日志区分"本轮 / 历史"。
+ * 判定只看 content 块类型（不会把正文里提到 "image" 的文字误判成图片）。
+ */
+function imageBlockStats(body) {
+  if (!body || typeof body !== 'object') return { total: 0, lastTurn: 0, history: 0 };
+  const countImg = (content) => (Array.isArray(content)
+    ? content.filter((b) => b && (b.type === 'image' || b.type === 'image_url' || b.type === 'input_image' || b.image_url != null)).length
+    : 0);
+  const list = Array.isArray(body.messages) ? body.messages : (Array.isArray(body.input) ? body.input : []);   // body.input = Responses API
+  let total = 0;
+  let lastTurn = 0;
+  let lastUserSeen = false;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i] || {};
+    const n = countImg(m.content);
+    total += n;
+    if (!lastUserSeen && String(m.role || '').toLowerCase() === 'user') { lastTurn = n; lastUserSeen = true; }
+  }
+  return { total, lastTurn, history: Math.max(0, total - lastTurn) };
 }
 
 /**
@@ -990,32 +1042,71 @@ const ACCOUNT_SESSION_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_SESSION_COOLDOWN_
 const ACCOUNT_RATE_COOLDOWN_MS = envMs('DSH_GATEWAY_ACCOUNT_RATE_COOLDOWN_MS', 90_000);            // 限流：短冷却
 
 function accountKey(providerId, acctId) { return providerId + '#' + acctId; }
+/** 模型作用域的冷却键（仅限流类用，见 markAccountFailure 的 model 参数说明）。 */
+function accountModelKey(providerId, acctId, model) {
+  return providerId + '#' + acctId + '@' + String(model || '');
+}
 
-/** 该账户当前是否可用（纯读；冷却到点即视为可用，不清状态） */
-function accountUsable(providerId, acct) {
-  const st = accountPool.get(accountKey(providerId, acct.id));
+/** 冷却条目是否已过冷却期（纯读，无副作用） */
+function coolEntryUsable(st) {
   if (!st) return true;
   if (st.state === 'ok') return true;
   return Date.now() >= st.until;
 }
 
-/** 标记账户失败：额度耗尽 / 会话失效 / 限流 → 冷却并切下一个账户 */
-function markAccountFailure(providerId, acct, kind, detail) {
+/**
+ * 该账户当前是否可用（纯读；冷却到点即视为可用，不清状态）。
+ * `model` 传入时会**同时**看账户级与模型级两条冷却记录。
+ */
+function accountUsable(providerId, acct, model) {
+  if (!coolEntryUsable(accountPool.get(accountKey(providerId, acct.id)))) return false;
+  if (model && !coolEntryUsable(accountPool.get(accountModelKey(providerId, acct.id, model)))) return false;
+  return true;
+}
+
+/**
+ * 标记账户失败：额度耗尽 / 会话失效 / 限流 → 冷却并切下一个账户。
+ *
+ * 冷却粒度（2026-09-22 实测修复：amd 的两把 Key 被 429 连坐）：
+ *  · `rate`（429）**按「供应商+账户+模型」记** —— 上游的限流常常是**模型级**的
+ *    （实测 amd：`Model 'DeepSeek-V4.1-Flash' is at its concurrency limit (32)`），
+ *    而两把 Key 打的是同一个模型、共享该上限，换 Key 无用。旧实现按账户级记，
+ *    于是 V4.1-Flash 的一次 429 把该 Key 上**本来正常的其它模型**（如 V4-Flash）也冷却 90 秒。
+ *  · `credit` / `session`（额度耗尽 / 登录失效）仍是**账户级** —— 这两类确实整把 Key 都不能用。
+ */
+function markAccountFailure(providerId, acct, kind, detail, model) {
+  // D13：账户池只在"标记失败"与"成功"时增删，冷却条目过期后**不会被删除**（coolEntryUsable 是懒判定），
+  // 而键里含上游模型 ID（provider#acct@model）→ 多供应商×多账户×多模型的 429 只增不减，
+  // 且这些孤儿条目会被 accountPoolSnapshot 全量列进 /health，响应体随时间单调膨胀。
+  // 这里借"标记失败"这一低频时机顺带清理（无需定时器，也不影响正在冷却的条目）。
+  if (accountPool.size > 64) {
+    const now = Date.now();
+    for (const [k, st] of accountPool) {
+      if (st && st.state !== 'ok' && now >= st.until) accountPool.delete(k);
+    }
+  }
   const ms = kind === 'credit' ? ACCOUNT_CREDIT_COOLDOWN_MS
     : kind === 'session' ? ACCOUNT_SESSION_COOLDOWN_MS
       : ACCOUNT_RATE_COOLDOWN_MS;
-  const key = accountKey(providerId, acct.id);
+  const scoped = kind === 'rate' && model;
+  const key = scoped ? accountModelKey(providerId, acct.id, model) : accountKey(providerId, acct.id);
   const prev = accountPool.get(key);
   accountPool.set(key, {
     state: kind, until: Date.now() + ms, fails: (prev ? prev.fails : 0) + 1,
-    reason: String(detail || kind).replace(/\s+/g, ' ').slice(0, 120),
+    // D6（安全）：必须过 maskSecrets —— 上游鉴权失败时回显收到的 Authorization 是常见实现，
+    // 不过滤会让用户的统一网关 key 明文进 /health（免鉴权）与日志。这是同文件里唯一的裸输出点。
+    reason: maskSecrets(String(detail || kind)).replace(/\s+/g, ' ').slice(0, 120),
+    ...(scoped ? { model: String(model) } : {}),
   });
-  log(`account ${providerId}#${acct.id} 标记为 ${kind}（冷却 ${Math.round(ms / 1000)}s）：${String(detail || '').slice(0, 120)}`);
+  // D6（安全）：同上——日志与 /health 的 reason 是两个出口，都要脱敏
+  log(`account ${providerId}#${acct.id}${scoped ? ' 模型 ' + model : ''} 标记为 ${kind}（冷却 ${Math.round(ms / 1000)}s）：${maskSecrets(String(detail || '')).slice(0, 120)}`);
 }
 
-/** 账户成功一次 → 清掉失败状态 */
-function markAccountOk(providerId, acct) {
-  if (acct && accountPool.has(accountKey(providerId, acct.id))) accountPool.delete(accountKey(providerId, acct.id));
+/** 账户成功一次 → 清掉失败状态（含该模型的模型级冷却；不动其它模型的冷却） */
+function markAccountOk(providerId, acct, model) {
+  if (!acct) return;
+  accountPool.delete(accountKey(providerId, acct.id));
+  if (model) accountPool.delete(accountModelKey(providerId, acct.id, model));
 }
 
 /** 最近一次实际使用的账户（providerId → acctId）；日志里以 `#acct` 标注，便于核对多账户分流 */
@@ -1036,6 +1127,7 @@ function viaTag(providerId) {
 function accountPoolSnapshot(cfg) {
   const out = [];
   const seen = new Set();
+  const modelScoped = [];   // 模型级冷却条目（rate）单独列出，不混进账户级状态
   if (cfg && Array.isArray(cfg.providers)) {
     for (const p of cfg.providers) {
       if (!p || p.enabled === false) continue;
@@ -1043,7 +1135,8 @@ function accountPoolSnapshot(cfg) {
         const key = accountKey(p.id, acct.id);
         seen.add(key);
         const st = accountPool.get(key);
-        const usable = accountUsable(p.id, acct);
+        // 账户级只反映账户级记录；模型级记录另列（否则 /health 会把"某模型限流"误报成"整把 Key 不可用"）
+        const usable = coolEntryUsable(st);
         out.push({
           key,
           provider: p.id,
@@ -1056,9 +1149,24 @@ function accountPoolSnapshot(cfg) {
       }
     }
   }
+  // 模型级冷却（如 amd#key1 的 DeepSeek-V4.1-Flash 限流）——按 key 逐条列出，便于排查"为什么这个模型不走这家"
+  for (const [k, st] of accountPool) {
+    if (!st || !st.model) continue;
+    if (Date.now() >= st.until) continue;
+    modelScoped.push({
+      key: k,
+      provider: k.split('#')[0],
+      model: st.model,
+      state: st.state,
+      remainMs: Math.max(0, st.until - Date.now()),
+      reason: st.reason,
+      modelScoped: true,
+    });
+  }
   // 兜底：配置里已删除、但进程内仍有冷却记录的账户也列出来（便于发现"配置改了仍被冷却"）
   for (const [key, st] of accountPool) {
     if (seen.has(key)) continue;
+    if (st && st.model) continue;   // 模型级已在上方列出
     out.push({
       key,
       state: st.state,
@@ -1067,7 +1175,7 @@ function accountPoolSnapshot(cfg) {
       orphan: true,
     });
   }
-  return out;
+  return out.concat(modelScoped);
 }
 
 /**
@@ -1075,10 +1183,16 @@ function accountPoolSnapshot(cfg) {
  * 返回 null 表示"无账户池"（沿用顶层 apiKey 的旧路径）；返回 {accounts:[], allCooling:true}
  * 由调用方决定是否整体跳过。
  */
-function pickAccount(provider) {
+/**
+ * 取该供应商本次要用的账户（轮询）。
+ * 返回 null 表示"无账户池"（沿用顶层 apiKey 的旧路径）；返回 {accounts:[], allCooling:true}
+ * 由调用方决定是否整体跳过。
+ * `model` 传入时会额外排除"该模型正在限流冷却"的账户（模型级冷却，见 markAccountFailure）。
+ */
+function pickAccount(provider, model) {
   const accounts = providerAccounts(provider);
   if (accounts.length === 0) return { acct: null, accounts, cooling: 0 };
-  const usable = accounts.filter((a) => accountUsable(provider.id, a));
+  const usable = accounts.filter((a) => accountUsable(provider.id, a, model));
   if (usable.length === 0) return { acct: null, accounts, cooling: accounts.length };
   const n = accountRR.get(provider.id) || 0;
   accountRR.set(provider.id, n + 1);
@@ -1207,6 +1321,26 @@ async function resolveWorkBuddyCredential(provider, acct) {
           + `（已探测：${workbuddyDefaultAuthFiles().slice(0, 2).join('、')} 等）`);
     }
     if (desktop && own && desktop.uid !== own.uid) cred = desktop;
+    // 区域守卫（2026-09-20，参照 dsh-workbuddy-connect 的安全红线）：国内版与国际版
+    // 凭据**互不通用**，且共用同一个 CodeBuddyExtension auth 目录、只差文件名——
+    // 配置里写错 authFile / 端点就会把一国账号的 token 发到另一国端点（实测 401，
+    // 且属跨产品泄漏）。这里在发请求前就拒绝，并说清该改哪个文件/环境变量。
+    {
+      const providerRegion = workbuddyProviderRegion(provider);
+      const credRegion = workbuddyRegionOf(cred.domain);
+      // providerRegion === null 表示"区域未知"（自定义/自建中转端点）→ 不据此拦截，
+      // 否则会误伤 test 假上游与内网代理这类合法组合。
+      if (providerRegion !== null && credRegion !== providerRegion) {
+        const expectFile = providerRegion === 'global' ? 'workbuddy-desktop-ai.info' : 'workbuddy-desktop.info';
+        const expectEnv = providerRegion === 'global' ? 'WORKBUDDY_AI_AUTH_FILE' : 'WORKBUDDY_AUTH_FILE';
+        throw new Error(
+          `${provider.id} 是${providerRegion === 'global' ? '国际版（WorkBuddy AI）' : '国内版（WorkBuddy）'}供应商，`
+          + `但取到的凭据属于${credRegion === 'global' ? '国际版' : '国内版'}（domain=${JSON.stringify(cred.domain)}）——`
+          + `两个区域的凭据互不通用。请把该供应商的 authFile 指向本机 ${expectFile}，`
+          + `或用环境变量 ${expectEnv} 指定；若该区域未安装/未登录，请先在对应 App 里登录。`,
+        );
+      }
+    }
     if (workbuddyNeedsRefresh(cred)) {
       try {
         cred = await refreshWorkBuddyToken(provider, acct, cred);
@@ -1229,6 +1363,47 @@ async function resolveWorkBuddyCredential(provider, acct) {
 function workbuddyOrigin(domain) {
   const d = String(domain || '').toLowerCase();
   return d === 'workbuddy.ai' || d.endsWith('.workbuddy.ai') ? 'https://www.workbuddy.ai' : 'https://www.codebuddy.cn';
+}
+
+/**
+ * 凭据所属区域：`workbuddy.ai` → 国际版（WorkBuddy AI），其余（含空域）→ 国内版。
+ * 与参照实现 corrinehu/dsh-workbuddy-connect 的 `regionOf()` 行为一致（它也只认 workbuddy.ai）。
+ */
+function workbuddyRegionOf(domain) {
+  const d = String(domain || '').trim().toLowerCase();
+  return (d === 'workbuddy.ai' || d.endsWith('.workbuddy.ai')) ? 'global' : 'cn';
+}
+
+/**
+ * 供应商条目声明的区域（可选）：`region: "global" | "cn"`。
+ * 未声明时返回 null —— 由端点/凭据推断，而不是把"没写"当成国内版。
+ */
+function workbuddyDeclaredRegion(provider) {
+  const r = String((provider && provider.region) || '').trim().toLowerCase();
+  if (r === 'global' || r === 'ai' || r === 'international') return 'global';
+  if (r === 'cn' || r === 'china') return 'cn';
+  return null;
+}
+
+/**
+ * 供应商的区域判定（用于跨区守卫），优先级：
+ *   ① 显式 `region` 字段（自定义/测试端点无法从 URL 看出区域时用这个）
+ *   ② baseURL 主机名（`*.workbuddy.ai` = 国际版，官方端点）
+ *   ③ 都没有 → 不判定（返回 null，守卫只按凭据域做正向检查）
+ *
+ * 注意：**不能**把"URL 不是 workbuddy.ai"直接当成国内版——测试与自建中转
+ * （如本地假上游、内网代理）都走非官方域名，那样会把合法组合误判为跨区。
+ * 参照实现的 `chatBase(credential)` 本身就是用凭据域决定端点的，区域的正主是凭据。
+ */
+function workbuddyProviderRegion(provider) {
+  const declared = workbuddyDeclaredRegion(provider);
+  if (declared) return declared;
+  try {
+    const host = new URL(String((provider && provider.baseURL) || '')).host.toLowerCase();
+    if (host === 'www.workbuddy.ai' || host === 'workbuddy.ai' || host.endsWith('.workbuddy.ai')) return 'global';
+    if (host.endsWith('workbuddy.cn') || host === 'copilot.tencent.com' || host.endsWith('codebuddy.cn')) return 'cn';
+  } catch { /* 非法 URL → 不判定 */ }
+  return null;   // 自定义端点：区域未知，不据此拦截
 }
 
 /* ---------------- WorkBuddy 客户端身份仿真（2026-09-16） ----------------
@@ -1309,6 +1484,24 @@ function workbuddyChatUserAgent(domain) {
 }
 
 /**
+ * 桌面端身份头（**使用端归属**，2026-09-18 用户实测发现）：
+ * 官方桌面端启动内置 CLI 时注入 `CLIENT_INFO_IDE_TYPE/PLATFORM = "WorkBuddy"`、
+ * `CLIENT_INFO_PLATFORM_VERSION = <桌面版本>`（见 app.asar buildWorkbuddyClientInfoEnv），
+ * CLI 再把它们写成 `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` 三个请求头
+ * （codebuddy.js：`ey[IDE_TYPE_HEADER]=ideType`、`ey[IDE_NAME_HEADER]=platform`、
+ * `ey[IDE_VERSION_HEADER]=platformVersion`；桌面端 banner 请求同款三头 + `X-Product: WorkBuddy`）。
+ * 只发 UA 时上游认不出使用端——腾讯控制台「积分消耗明细 → 使用端」显示为 `-`（网关调用全被记成无归属）。
+ */
+function workbuddyIdeHeaders() {
+  const { appVersion } = workbuddyVersions();
+  return {
+    'X-IDE-Type': 'WorkBuddy',
+    'X-IDE-Name': 'WorkBuddy',
+    'X-IDE-Version': appVersion || '0.0.0',
+  };
+}
+
+/**
  * 用凭据构造上游请求头（Authorization + 身份头 + 客户端仿真头）
  * @param {boolean} [forChat] true = chat 请求（用桌面身份 UA）；缺省 = 刷新/目录（CLI 形态 UA）
  */
@@ -1327,10 +1520,12 @@ function workbuddyHeaders(provider, cred, extra, forChat) {
     ...(cred.domain ? { 'X-Domain': cred.domain } : { 'X-No-Department-Info': '1' }),
     ...(extra || {}),
   };
-  // 身份仿真（关键）：chat 用桌面形态 UA；刷新/目录保持 CLI 形态。
+  // 身份仿真（关键）：chat 用桌面形态 UA + X-IDE-* 三头（使用端归属）；刷新/目录保持 CLI 形态。
   // 配置里的 headers.User-Agent 只作为刷新路径的覆盖，不参与 chat（chat 必须是桌面身份）。
-  if (forChat) h['User-Agent'] = workbuddyChatUserAgent(cred.domain);
-  else h['User-Agent'] = WORKBUDDY_CLI_UA;
+  if (forChat) {
+    h['User-Agent'] = workbuddyChatUserAgent(cred.domain);
+    Object.assign(h, workbuddyIdeHeaders());
+  } else h['User-Agent'] = WORKBUDDY_CLI_UA;
   return h;
 }
 
@@ -1342,6 +1537,7 @@ const RESERVED_UPSTREAM_HEADERS = new Set([
   'authorization', 'x-api-key', 'anthropic-version',
   'x-user-id', 'x-enterprise-id', 'x-domain', 'x-product',
   'x-no-user-id', 'x-no-enterprise-id', 'x-no-department-info',
+  'x-ide-type', 'x-ide-name', 'x-ide-version',
   'origin', 'referer', 'x-requested-with',
 ]);
 
@@ -1403,6 +1599,9 @@ async function accountUpstreamHeaders(provider, acct, baseHeaders, { anthropicUp
  */
 async function forwardWithAccounts(provider, upstreamPath, baseHeaders, body, res, opts) {
   const accounts = providerAccounts(provider);
+  // 限流冷却的作用域用**上游模型 ID**（body 已经过 bodyForProvider 映射）——上游限流
+  // 就是按这个 ID 判的（实测 amd：`Model 'DeepSeek-V4.1-Flash' is at its concurrency limit`）。
+  const scopeModel = (body && typeof body.model === 'string') ? body.model : '';
   // 无账户池：仍要走一遍账户头构造 —— 否则供应商 `headers`（自定义 UA/品牌头）在直通路径上会被丢掉
   if (accounts.length === 0) {
     const anthropicUpstream = upstreamPath === '/messages' || upstreamPath === '/v1/messages';
@@ -1415,7 +1614,7 @@ async function forwardWithAccounts(provider, upstreamPath, baseHeaders, body, re
     }
     return forward(provider, upstreamPath, headers, body, res, opts);
   }
-  const usable = accounts.filter((a) => accountUsable(provider.id, a));
+  const usable = accounts.filter((a) => accountUsable(provider.id, a, scopeModel));
   if (usable.length === 0) {
     log(`provider ${provider.id}: ${accounts.length} 个账户全部冷却中 → 交给下一家`);
     return false;
@@ -1440,14 +1639,14 @@ async function forwardWithAccounts(provider, upstreamPath, baseHeaders, body, re
     const sink = {};
     // eslint-disable-next-line no-await-in-loop
     const out = await forward(provider, upstreamPath, headers, body, res, { ...(opts || {}), failureSink: sink, accountScoped: true });
-    if (out === true) { markAccountOk(provider.id, acct); return true; }
+    if (out === true) { markAccountOk(provider.id, acct, scopeModel); return true; }
     if (res.headersSent) return out;                     // 已经写给客户端了，不能再重试
     const kind = classifyAccountFailure(sink.status || 0, sink.detail || '');
     if (kind && i + 1 < ordered.length) {
-      markAccountFailure(provider.id, acct, kind, sink.detail);
+      markAccountFailure(provider.id, acct, kind, sink.detail, scopeModel);
       continue;                                          // 换下一个账户
     }
-    if (kind) markAccountFailure(provider.id, acct, kind, sink.detail);   // 最后一个账户也要标记
+    if (kind) markAccountFailure(provider.id, acct, kind, sink.detail, scopeModel);   // 最后一个账户也要标记
     lastOut = out;
     if (!kind) return out;                               // 与账户无关的失败 → 原样返回
   }
@@ -1461,7 +1660,8 @@ async function forwardWithAccounts(provider, upstreamPath, baseHeaders, body, re
  *（`11101: cannot unmarshal object into Go struct field Request.tool_choice of type string`）。
  * 这里统一在发请求前改写 body；返回 { body, forceStreamForNonStream } 供调用方决定是否聚合流。
  */
-function applyOpenAIQuirks(body, provider) {
+function applyOpenAIQuirks(body, provider, opts) {
+  const responsesMode = !!(opts && opts.responses);
   const quirks = providerQuirks(provider);
   if (!body || typeof body !== 'object' || quirks.size === 0) return { body, needAggregate: false };
   let out = body;
@@ -1480,11 +1680,40 @@ function applyOpenAIQuirks(body, provider) {
   }
   // ③ 上游只接受流式：强制 stream=true；客户端要非流式 → 由调用方聚合后回单条 JSON
   let needAggregate = false;
-  if (quirks.has('force-stream') && out.stream !== true) {
+  // D7：Responses 协议的流式聚合会产出 chat.completion 形状（错），故该路径不用 force-stream；
+  // stringify-tool-choice 是纯请求侧改写，对 Responses 同样安全有效，照常生效。
+  if (!responsesMode && quirks.has('force-stream') && out.stream !== true) {
     needAggregate = !out.stream;   // 客户端本来要非流式 → 需要聚合
     detach().stream = true;
   }
   return { body: out, needAggregate };
+}
+
+/**
+ * 从上游的 delta / message 中提取推理（思维链）文本。
+ * 2026-09-23（审计 D5 修复）：旧实现只认 `reasoning_content`（DeepSeek 系写法），而 OpenRouter
+ * 系（含 Cline）用的是 `reasoning`（字符串或对象）与 `reasoning_details`
+ *（`[{type:'reasoning.text',text:'…'}]`）。实测 Cline 的 SSE 分片同时带这两个字段且内容相同，
+ * 因此**按优先级取第一个非空者**，不能相加（否则思维链会重复两遍）。
+ * 只认一个字段名的后果是思维链被静默丢弃——客户端只看到最终答案，不报错也不告警，最难排查。
+ * 返回 '' 表示本次分片不含推理内容。
+ */
+function reasoningTextOf(src) {
+  if (!src || typeof src !== 'object') return '';
+  if (typeof src.reasoning_content === 'string' && src.reasoning_content) return src.reasoning_content;
+  if (typeof src.reasoning === 'string' && src.reasoning) return src.reasoning;
+  if (src.reasoning && typeof src.reasoning === 'object' && !Array.isArray(src.reasoning)) {
+    const t = src.reasoning.text !== undefined ? src.reasoning.text : src.reasoning.content;
+    if (typeof t === 'string' && t) return t;
+  }
+  if (Array.isArray(src.reasoning_details)) {
+    let out = '';
+    for (const d of src.reasoning_details) {
+      if (d && typeof d === 'object' && typeof d.text === 'string' && d.text) out += d.text;
+    }
+    return out;
+  }
+  return '';
 }
 
 /**
@@ -1520,7 +1749,7 @@ async function aggregateOpenAIStream(upstream, headBytes) {
       const choice = (Array.isArray(json.choices) ? json.choices[0] : null) || {};
       const d = choice.delta || {};
       if (typeof d.content === 'string') content += d.content;
-      if (typeof d.reasoning_content === 'string') reasoning += d.reasoning_content;
+      reasoning += reasoningTextOf(d);   // D5：兼容 reasoning_content / reasoning / reasoning_details
       for (const call of Array.isArray(d.tool_calls) ? d.tool_calls : []) {
         const idx = Number.isInteger(call.index) ? call.index : 0;
         const entry = toolCalls.get(idx) || { id: '', type: 'function', function: { name: '', arguments: '' } };
@@ -1568,6 +1797,14 @@ function classifyAccountFailure(status, detail) {
   if (status === 402) return 'credit';
   if (WORKBUDDY_CREDIT_RE.test(detail)) return 'credit';
   if (WORKBUDDY_SESSION_RE.test(detail)) return 'session';
+  // 2026-09-18（用户要求：**每把 Key 都要轮换，只有全部 Key 都不可用才换下一家**）：
+  // 「裸 401/403」= 这把 Key 未授权/被禁用（实测 nvidia 某把 Key：
+  //   `403 {"status":403,"title":"Forbidden","detail":"Authorization failed"}`）→ 属**账户级**失败：
+  // 标记该 Key（session 冷却）并换下一把；只有所有 Key 都失败才交回上层（下一家供应商）。
+  // 旧实现只认 402/429/特定文案，于是这种 403 被当成"供应商级 403" → **整家熔断 30 分钟**，
+  // 用户特意配的多把 Key 被连坐（实测 nvidia 4 把 Key 全废）。
+  // 例外：内容/敏感词拦截（换 Key 无用，属请求本身的问题）不在此列。
+  if ((status === 401 || status === 403) && !CONTENT_BLOCK_RE.test(String(detail || ''))) return 'session';
   if (status === 429) return 'rate';
   return null;
 }
@@ -1592,7 +1829,28 @@ const MODEL_NOT_OFFERED_HINT = '请检查网关配置里该模型所属供应商
 async function readTextWithTimeout(resp, ms = 5000, limit = 500) {
   let timer = null;
   try {
-    const bodyPromise = resp.text().then((t) => String(t).slice(0, limit));
+    // D11（审计修复）：改为**边读边截断**。旧实现 `resp.text().then(t => t.slice(0, limit))`
+    // 是"读完整个响应体再截断"——limit=500 时仍可能先把数十 MB 读进内存（Buffer + String 双份峰值），
+    // 调用点之一更是 limit=4MB。触发极简：上游回一个超大 JSON 体即可。现在读满 limit 即停并取消。
+    const bodyPromise = (async () => {
+      const reader = (resp.body && typeof resp.body.getReader === 'function') ? resp.body.getReader() : null;
+      if (!reader) return String(await resp.text()).slice(0, limit);
+      const chunks = [];
+      let total = 0;
+      try {
+        while (total < limit) {
+          // eslint-disable-next-line no-await-in-loop
+          const { done, value } = await reader.read();
+          if (done) break;
+          const buf = Buffer.from(value);
+          chunks.push(buf);
+          total += buf.length;
+        }
+      } finally {
+        try { await reader.cancel(); } catch { /* 已读完或已取消 */ }
+      }
+      return Buffer.concat(chunks).subarray(0, limit).toString('utf8');
+    })();
     const timeoutPromise = new Promise((resolve) => { timer = setTimeout(() => resolve(null), ms); });
     const out = await Promise.race([bodyPromise, timeoutPromise]);
     if (out === null) {                      // 超时：取消 body，避免 socket 悬挂
@@ -1626,6 +1884,27 @@ function claudeClientHeaders() {
   };
 }
 
+// 2026-09-23：Cline 客户端完全仿真（实测收敛版）。
+// 上游 api.cline.bot 只对"Cline 产品面"开放：**完全裸头**会被拒
+//   403 {"code":"API_REQUEST_ERROR_CODE","message":"Error 403: <model> is only available via Cline product surfaces…"}
+// 实测最小充分集是单个 X-CLIENT-TYPE: cline-sdk（仅它即可 200）；UA 内容不校验但**存在性必需**
+//（只有 UA 没有 X-CLIENT-TYPE 仍 403）；版本号不是硬门禁（0.0.1 也能过）。
+// 这里照全量发送，与 Cline 官方 SDK 形态一致，最稳。
+function clineClientHeaders() {
+  return {
+    'user-agent': 'Cline/3.0.47',
+    'http-referer': 'https://cline.bot',
+    'x-title': 'Cline',
+    'x-is-multiroot': 'false',
+    'x-client-type': 'cline-sdk',
+    'x-client-version': '3.0.47',
+    'x-platform': 'terminal',
+    'x-platform-version': '3.0.47',
+    'x-core-version': '0.0.66',
+    accept: 'application/json, text/event-stream',
+  };
+}
+
 // V2 防屏蔽：Codex 客户端完全仿真（OpenAI 系特征，供 new-api/one-api 白名单识别为 Codex）
 function codexClientHeaders() {
   return {
@@ -1634,7 +1913,27 @@ function codexClientHeaders() {
   };
 }
 
+/**
+ * 该供应商实际应使用的客户端仿真档（2026-09-23，需求："cline 调用时默认使用 cline 客户端仿真"）。
+ *  ① 供应商显式声明 `clientProfile` → 用它（可逐家覆盖，如同时接 Cline 与 new-api）；
+ *  ② 否则按 baseURL 主机推断：*.cline.bot 只认 Cline 产品面，自动套用 cline 仿真，
+ *     用户无需在每家的 headers 里手抄那 9 个头；
+ *  ③ 都没有 → 返回 ''（由调用方回落到全局 cfg.clientProfile，保持既有行为不变）。
+ * 刻意不改全局 clientProfile 的语义：它是**下行协议**与**上行仿真**的双重开关
+ *（见 writeDshConfig），全局改成 cline 会连带把 dsh 的 api 改成 openai-completions。
+ */
+function providerClientProfile(provider) {
+  const declared = String((provider && provider.clientProfile) || '').trim().toLowerCase();
+  if (declared) return declared;
+  try {
+    const host = new URL(String((provider && provider.baseURL) || '')).hostname.toLowerCase();
+    if (host === 'api.cline.bot' || host.endsWith('.cline.bot')) return 'cline';
+  } catch { /* baseURL 非法：不推断 */ }
+  return '';
+}
+
 /** 构造发往上游的最终请求头。
+ * clientProfile='cline'  → Cline 完全仿真（api.cline.bot 的硬性要求）
  * clientProfile='codex' → Codex 完全仿真（不留任何客户端透传痕迹）
  * clientProfile='claude' 或仅 clientUA → Claude Code 完全仿真（UA 可被 clientUA 覆盖）
  * 两者皆空             → 透传 dsh 客户端标识（K1 防屏蔽）
@@ -1650,7 +1949,11 @@ function upstreamRequestHeaders(reqHeaders, apiKey, clientUA, anthropic, clientP
     'cookie', 'origin', 'referer',
   ]);
 
-  if (clientProfile === 'codex') {
+  if (clientProfile === 'cline') {
+    // Cline 完全仿真（2026-09-23）：不透传任何 dsh 头；clientUA 仍允许覆盖具体 UA 值
+    Object.assign(out, clineClientHeaders());
+    if (clientUA) out['user-agent'] = clientUA;
+  } else if (clientProfile === 'codex') {
     // Codex 完全仿真（V2）：不透传任何 dsh 头
     Object.assign(out, codexClientHeaders());
     if (clientUA) out['user-agent'] = clientUA;   // 允许用户覆盖具体 UA 值
@@ -1695,6 +1998,11 @@ function upstreamRequestHeaders(reqHeaders, apiKey, clientUA, anthropic, clientP
  */
 function passthroughHeaders(reqHeaders, apiKey, clientUA, clientProfile) {
   return upstreamRequestHeaders(reqHeaders, apiKey, clientUA, false, clientProfile);
+}
+
+/** 逐家仿真档优先于全局档（providerClientProfile 为空时回落 cfg.clientProfile，行为不变）。 */
+function effectiveClientProfile(cfg, provider) {
+  return providerClientProfile(provider) || String((cfg && cfg.clientProfile) || '').trim();
 }
 
 /** 请求体统一翻译（R5）：转发前修正各上游不兼容字段。
@@ -1742,10 +2050,23 @@ function translateBody(body, provider) {
       if (!m) return m;
       let n = m;
       if (n.role === 'developer') { n = { ...n, role: 'system' }; changed = true; }
-      // 文本内容打码（content 为字符串时；跳过 tool_calls 参数与 tool 结果中的结构化值）
+      // 文本内容打码（跳过 tool_calls 参数与 tool 结果中的结构化值）
+      // D9：旧实现只处理**字符串** content，而块数组（[{type:'text',text}]）完全不处理 ——
+      // 同一份会话内容走 /v1/chat/completions（块格式）时不打码、走 /v1/messages 时打码，
+      // 等于防泄露过滤在一个入口失效。与 handleMessages / translateResponsesBody 对齐。
       if (typeof n.content === 'string') {
         const masked = maskSecretTokens(n.content);
         if (masked !== n.content) { n = { ...n, content: masked }; changed = true; }
+      } else if (Array.isArray(n.content)) {
+        let blocksChanged = false;
+        const blocks = n.content.map((b) => {
+          if (b && typeof b === 'object' && typeof b.text === 'string') {
+            const masked = maskSecretTokens(b.text);
+            if (masked !== b.text) { blocksChanged = true; return { ...b, text: masked }; }
+          }
+          return b;
+        });
+        if (blocksChanged) { n = { ...n, content: blocks }; changed = true; }
       }
       return n;
     });
@@ -2001,6 +2322,18 @@ const MODEL_MISSING_RE = /model[^.\n]{0,60}(not\s+found|does\s+not\s+exist|doesn
 const ROUTE_MISSING_RE = /invalid\s+url|not\s+implemented|unsupported\s+(method|route|endpoint|operation)|no\s+such\s+route|method\s+not\s+allowed|cannot\s+(get|post|delete|put)|unknown\s+(method|endpoint|route)/i;
 
 /** 确定性 4xx → 回给客户端的状态码（只映射到这几个"语义明确且不泄露上游信息"的状态码）。 */
+/**
+ * 「**这家**没有这个模型」——与"请求本身有错"必须区分开（2026-09-23 实测事故）。
+ * 现场：amd 回 400 `Requested model DeepSeek-V4.1-Flash not supported`，旧实现把它当确定性
+ * 4xx **终止 failover**，用户直接拿到 400 —— 而同一逻辑模型在 workbuddy/cline 上完全可用。
+ * 判据（都取自实测形态，措辞会变，故覆盖多种）：
+ *   · "Requested model X not supported"        （amd，400；注意是 not supported 不是 unsupported）
+ *   · "Model X is not available" / model_not_found（amd，404）
+ *   · "unsupported model" / "model not offered" / "does not offer this model"
+ * 只用于**继续 failover**，不用于判定"整个请求无解"。
+ */
+const MODEL_UNSUPPORTED_BY_PROVIDER_RE = /requested\s+model[^\n]{0,120}?not\s+supported|model[^\n]{0,60}?is\s+not\s+available|model_not_found|unsupported\s+model|model\s+not\s+(?:offered|supported|found)|does\s+not\s+(?:offer|support)[^\n]{0,40}?model|不提供[^\n]{0,20}?模型|模型[^\n]{0,20}?不支持/i;
+
 const DETERMINISTIC_4XX_STATUS = { 400: 400, 404: 404, 413: 413, 422: 422 };
 
 /**
@@ -2213,8 +2546,12 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         : (responsesMode ? translateResponsesBody(body, provider) : translateBody(body, provider)));   // R5：role 兼容 + 推理档位翻译（Responses 走对应实现）
     // 直通路径也要应用供应商 quirks（2026-09-16 实测：stringify-tool-choice 只在翻译路径生效，
     // OpenAI 客户端把 tool_choice 对象透传 → 上游 11101 拒绝）
-    if (!rawMode && !isAnthropicPath && !responsesMode) {
-      const q = applyOpenAIQuirks(outBody, provider);
+    // D7（审计修复）：旧门控 `&& !responsesMode` 让 /v1/responses 的 quirks **全部失效**
+    //（stringify-tool-choice 失效 → 上游 400；实测该 quirk 就是为这个 400 加的）。
+    // 现在纳入 Responses：其中 force-stream 需要 Responses 形状的聚合，暂不在该路径启用
+    //（由 applyOpenAIQuirks 内部跳过），避免回错响应形状。
+    if (!rawMode && !isAnthropicPath) {
+      const q = applyOpenAIQuirks(outBody, provider, { responses: responsesMode });
       outBody = q.body;
       needAggregate = q.needAggregate;
     }
@@ -2368,6 +2705,10 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       const acctKind = classifyAccountFailure(upstream.status, detail);
       if (acctKind) {
         log(`upstream ${provider.id} HTTP ${upstream.status} 判定为账户级失败（${acctKind}）→ 交回账户池处理（不计供应商熔断）`);
+        // D1（审计修复）：账户级失败说明"这家上游是健康的、只是这个账户不行"，**不计供应商失败**，
+        // 因此必须把刚占用的半开探测名额交还。旧实现直接 return 不释放 → 该家永久卡在
+        // half-open（breakerIsOpen 恒真）再也不会被选中，直到进程重启。
+        breakerRecordSuccess(provider.id);
         return rawMode ? { retryable: upstream.status } : false;
       }
     }
@@ -2420,6 +2761,17 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         breakerRecordFail(provider.id, persistent ? 403 : 0);   // 403 → 长熔断（30 分钟）；0 → 短熔断
         return rawMode ? { retryable: upstream.status } : false;
       }
+      // 2026-09-23 修复：**这家没有这个模型**不是"请求本身有错" —— 换下一家有意义，
+      // 必须继续 failover（旧实现归入下面的"确定性 4xx"而终止，用户拿到 400 而非可用的下一家）。
+      // 实测事故：amd 回 400 "Requested model DeepSeek-V4.1-Flash not supported"，
+      // 而同一逻辑模型在 workbuddy/cline 上都可用，用户却直接拿到 400。
+      // 刻意**不调 breakerRecordFail**：熔断器是按供应商粒度，该家对别的模型完全正常，
+      // 记失败会连坐整家（正是上方 :2536 注释所警告的情形）。半开名额已在上方交还。
+      if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(detail)) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家没有该模型" → 继续 failover`
+          + `（不熔断该家；若长期如此，请从配置的 models 里移除该映射）`);
+        return rawMode ? { retryable: upstream.status } : false;
+      }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
       log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 终止 failover（回 ${status}，不回显上游原文）`);
       return { stop: { status, upstreamStatus: upstream.status } };
@@ -2427,7 +2779,12 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
     log(`upstream ${provider.id} HTTP ${upstream.status} 判定为内容拦截 → 继续 failover（换供应商/降敏）`);
     return false;
   }
-  breakerRecordSuccess(provider.id);   // V1：成功清零熔断计数
+  // D2（审计修复）：成功清零**移到 SSE 首事件偷看之后**。
+  // 旧实现在此处（2xx 即清零）就删掉熔断条目，而"200 + 首事件是错误"的判定在其后 ——
+  // 于是那条路径上的 breakerRecordFail 用 breaker.get(id) || {fails:0} 取到**全新**条目，
+  // fails 恒为 1、state 恒为 'closed' → `fails >= 3` 永不成立 → **熔断器完全失效**。
+  // 对恒回 200 + event:error 的上游（实测 api.chiyi.cc 形态），每个请求都白打一轮上游
+  //（延迟 + 计费），设计意图（连续 3 次即退避保护账号）完全落空。
   let bodyStream = upstream.body;
   let ctype = String(upstream.headers.get('content-type') || 'application/json');
   // —— SSE「首事件就是错误」识别（2026-09-15 实测事故）——
@@ -2493,6 +2850,9 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
       pendingHead = null;
     }
   }
+  // D2（审计修复）：到这里才确认"上游确实给出了正常事件"（用了流式则已通过首事件偷看），
+  // 此时清零熔断计数才是诚实的；提前到 2xx 处会让"200 + 错误 SSE"永远无法熔断。
+  breakerRecordSuccess(provider.id);
   // 上游被强制流式、而客户端要非流式 → 聚合后回单条 JSON（2026-09-16：直通路径补齐 quirk 语义）
   if (needAggregate && bodyStream && /event-stream/i.test(ctype)) {
     const completion = await aggregateOpenAIStream(upstream, pendingHead);
@@ -2569,7 +2929,16 @@ async function forward(provider, upstreamPath, upstreamHeaders, body, res, opts)
         // 客户端可能随时断开（点停止/超时/关页）：write 抛 EPIPE 必须捕获，
         // 否则未处理异常会经 async 回调炸掉整个网关进程（C1）
         try {
-          res.write(Buffer.from(value));
+          // D10（审计修复）：write 返回 false = 下游内部缓冲已满（慢客户端 + 快上游）。
+          // 旧实现丢弃返回值继续读上游 → 缓冲无上限增长（网关内存暴涨直至 OOM）。
+          // 现在等待 drain 或客户端断开后再继续读，把背压如实传回上游。
+          if (res.write(Buffer.from(value)) === false) {
+            await new Promise((resolve) => {
+              const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+              res.once('drain', done);
+              res.once('close', done);
+            });
+          }
         } catch (writeErr) {
           log(`client disconnected during stream: ${writeErr.message}`);
           try { await reader.cancel(); } catch { }
@@ -2755,8 +3124,10 @@ function openaiToAnthropicMessage(json, model, fallbackInTokens) {
   const choice = (json && Array.isArray(json.choices) ? json.choices[0] : null) || {};
   const msg = choice.message || {};
   const content = [];
-  if (typeof msg.reasoning_content === 'string' && msg.reasoning_content) {
-    content.push({ type: 'thinking', thinking: msg.reasoning_content, signature: '' });
+  // D5：兼容 reasoning_content / reasoning / reasoning_details（旧实现只认第一个）
+  const msgReasoning = reasoningTextOf(msg);
+  if (msgReasoning) {
+    content.push({ type: 'thinking', thinking: msgReasoning, signature: '' });
   }
   if (typeof msg.content === 'string' && msg.content) content.push({ type: 'text', text: msg.content });
   for (const call of Array.isArray(msg.tool_calls) ? msg.tool_calls : []) {
@@ -2847,11 +3218,13 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
     if (json && json.usage && (json.usage.prompt_tokens || json.usage.completion_tokens)) usage = json.usage;
     const choice = (Array.isArray(json.choices) ? json.choices[0] : null) || {};
     const delta = choice.delta || {};
-    if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
+    // D5：兼容 reasoning_content / reasoning / reasoning_details（旧实现只认第一个）
+    const deltaReasoning = reasoningTextOf(delta);
+    if (deltaReasoning) {
       if (openKind !== 'thinking') { closeBlock(); startBlock('thinking', { type: 'thinking', thinking: '' }); }
-      outThinking += delta.reasoning_content;
+      outThinking += deltaReasoning;
       if (!aggregateOnly) {
-        sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'thinking_delta', thinking: delta.reasoning_content } });
+        sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'thinking_delta', thinking: deltaReasoning } });
       }
     }
     if (typeof delta.content === 'string' && delta.content) {
@@ -2984,12 +3357,14 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   }
   const quirks = providerQuirks(provider);
   const wantsStream = !!body.stream;
-  const picked = pickAccount(provider);
+  // 限流冷却的作用域用**上游模型 ID**（body 已由 bodyForProvider 映射），与直通路径一致
+  const scopeModel = (body && typeof body.model === 'string') ? body.model : '';
+  const picked = pickAccount(provider, scopeModel);
   if (picked.acct === null && picked.cooling > 0) {
     log(`provider ${provider.id}: ${picked.cooling} 个账户全部冷却中 → 交给下一家`);
     return false;
   }
-  const attemptAccounts = picked.acct ? [picked.acct, ...picked.accounts.filter((a) => a !== picked.acct && accountUsable(provider.id, a))] : [null];
+  const attemptAccounts = picked.acct ? [picked.acct, ...picked.accounts.filter((a) => a !== picked.acct && accountUsable(provider.id, a, scopeModel))] : [null];
   const upstreamPath = '/chat/completions';
   let lastDetail = '';
   let lastStatus = 0;
@@ -3060,7 +3435,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       log(`upstream ${provider.id} HTTP ${upstream.status}: ${maskSecrets(lastDetail)}`);
       const acctKind = acct ? classifyAccountFailure(upstream.status, lastDetail) : null;
       if (acctKind) {
-        markAccountFailure(provider.id, acct, acctKind, lastDetail);
+        markAccountFailure(provider.id, acct, acctKind, lastDetail, scopeModel);
         continue;   // 换下一个账户（此时尚未向客户端写任何字节）
       }
       if (upstream.status === 401 || upstream.status === 403 || upstream.status === 429 || upstream.status >= 500) {
@@ -3074,13 +3449,18 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
         breakerRecordFail(provider.id, PERSISTENT_ACCOUNT_RE.test(lastDetail) ? 403 : 0);
         return false;
       }
+      // 2026-09-23 修复：与直通路径同规则 —— "这家没有该模型"应继续 failover，不终止
+      if (MODEL_UNSUPPORTED_BY_PROVIDER_RE.test(lastDetail)) {
+        log(`upstream ${provider.id} HTTP ${upstream.status} 判定为"这家没有该模型" → 继续 failover（不熔断该家）`);
+        return false;
+      }
       const status = DETERMINISTIC_4XX_STATUS[upstream.status] || 400;
       log(`upstream ${provider.id} 确定性 4xx HTTP ${upstream.status} → 终止 failover（回 ${status}，不回显上游原文）`);
       return { stop: { status, upstreamStatus: upstream.status } };
     }
 
     // 成功：OpenAI 响应 → Anthropic
-    if (acct) markAccountOk(provider.id, acct);
+    if (acct) markAccountOk(provider.id, acct, scopeModel);
     breakerRecordSuccess(provider.id);
     const ctype = String(upstream.headers.get('content-type') || '');
     const inputTokens = estimateTokens(JSON.stringify(finalBody.messages || []));
@@ -3112,7 +3492,7 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
             const detail = head.replace(/\s+/g, ' ').slice(0, 200);
             log(`upstream ${provider.id} HTTP 200 但 SSE 首事件是错误 → 判定该家失败并换下一家：${maskSecrets(detail)}`);
             const kind = acct ? classifyAccountFailure(200, detail) || classifyAccountFailure(402, detail) : null;
-            if (acct && kind) { markAccountFailure(provider.id, acct, kind, detail); }
+            if (acct && kind) { markAccountFailure(provider.id, acct, kind, detail, scopeModel); }
             catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
             breakerRecordFail(provider.id, 0);
             try { await peekReader.cancel(); } catch { /* 忽略 */ }
@@ -3168,11 +3548,25 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
       return false;
     }
   }
-  // 所有账户都不行：把最后一次的失败按供应商级处理
+  // 所有账户都不行。
+  // 契约（2026-09-18 用户要求，gateway.test.js 有对应回归）：Key 级失败先在**家内**轮换，
+  // 只有该家**所有** Key 都不可用，才判该家不可用（长熔断）并换下一家 —— 所以这里**必须**
+  // 记供应商级熔断，不能因为"失败原因属于账户级"就跳过，否则坏家会被每个请求重复打点。
+  //
+  // D4（审计修复，已按上述契约收敛）：审计原文建议"这里不记供应商熔断"，但那与既有契约冲突，
+  // 故**不采纳**。审计真正说对的是另一半：**半开探测名额会在这里泄漏** ——
+  // 本函数开头调用了 breakerAcquire()（占用半开名额），若循环内每次都 continue/耗尽后走到这里，
+  // 旧实现只在 lastStatus 命中 401/403/429/5xx 时才写熔断条目；**凭据不可用**那条路径
+  // 不赋值 lastStatus（保持 0）→ 既不写条目也不释放名额 → 该家永久卡在 half-open。
+  // 现在：无论是否达到"整家熔断"的条件，都先确保半开名额被结算（记失败或交还），不留悬挂。
   log(`provider ${provider.id} 全部账户不可用（最后 HTTP ${lastStatus}）：${maskSecrets(lastDetail).slice(0, 160)}`);
   if (lastStatus === 401 || lastStatus === 403 || lastStatus === 429 || lastStatus >= 500) {
     catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
     breakerRecordFail(provider.id, lastStatus);
+  } else {
+    // 未拿到可判定的上游状态码（如凭据解析失败、账户全部处于冷却而直接跳过）：
+    // 该家这轮没被证明是坏的，但半开名额已占用 —— 交还名额，避免永久 half-open。
+    breakerRecordSuccess(provider.id);
   }
   return false;
 }
@@ -3283,15 +3677,17 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
   //    （旧版对每个候选都探测，实测每次请求要多等 ~1.5s；而且探测结果会把
   //     "目录里有但其实不能服务"的供应商拉进候选，正是 2026-09-15 事故的来源）。
   const catalogResults = await Promise.all(candidates.map((p) => (needsCatalog(p)
-    ? fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)
+    ? fetchCatalog(p, false, cfg.clientUA, effectiveClientProfile(cfg, p))
     : null)));
   let { eligible, reasons, tierSizes } = selectCandidates(candidates, catalogResults, model);
   // 多模态（2026-09-16）：请求里带图片时，只保留声明了图片能力的候选
   //（否则会被路由到纯文本家，上游报错或图片被忽略）
-  if (bodyHasImage(body)) {
+  const imgStats = imageBlockStats(body);
+  if (imgStats.total > 0) {
     const vf = filterVisionCandidates(eligible, reasons, model);
     if (vf.dropped > 0) {
-      log(`[route] ${model}: 请求含图片 → 跳过未声明图片能力的 ${vf.dropped} 家`);
+      log(`[route] ${model}: 请求含图片（本轮 ${imgStats.lastTurn} 张 / 历史 ${imgStats.history} 张）`
+        + ` → 跳过未声明图片能力的 ${vf.dropped} 家`);
       eligible = vf.eligible;
       reasons = vf.reasons;
     }
@@ -3376,7 +3772,7 @@ async function handleCompletion(cfg, req, res, body, upstreamPath, opts) {
         return true;
       },
     } : undefined;
-    const out = await forwardWithAccounts(p, upstreamPath.replace(/^\/v1/, '') + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, cfg.clientProfile), attemptBody, res, fwdOpts);
+    const out = await forwardWithAccounts(p, upstreamPath.replace(/^\/v1/, '') + search, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, effectiveClientProfile(cfg, p)), attemptBody, res, fwdOpts);
     if (out === true) {
       log(`served ${model} via ${viaTag(p.id)}`);
       logCall(`via=${viaTag(p.id)}`, 'ok');
@@ -3479,7 +3875,7 @@ async function handleResponsesResource(cfg, req, res, url, tail) {
       if (owner) { failStatus = 503; upstreamNote = 'provider in breaker cooldown'; }
       continue;
     }
-    const out = await forward(p, upPath, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, cfg.clientProfile), null, res, { raw: true, method });
+    const out = await forward(p, upPath, passthroughHeaders(req.headers, p.apiKey, cfg.clientUA, effectiveClientProfile(cfg, p)), null, res, { raw: true, method });
     if (out === true) {
       callLog(`via=${p.id}`, 'ok');
       return;
@@ -3583,14 +3979,16 @@ async function handleMessages(cfg, req, res, body) {
 
   // 候选收敛（**配置列表为唯一权威**，见 selectCandidates）：只探测"没配模型"的 provider
   const catalogResults = await Promise.all(candidates.map((p) => (needsCatalog(p)
-    ? fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)
+    ? fetchCatalog(p, false, cfg.clientUA, effectiveClientProfile(cfg, p))
     : null)));
   let { eligible, reasons, tierSizes } = selectCandidates(candidates, catalogResults, model);
   // 多模态（2026-09-16）：请求里带图片时，只保留声明了图片能力的候选
-  if (bodyHasImage(body)) {
+  const imgStats = imageBlockStats(body);
+  if (imgStats.total > 0) {
     const vf = filterVisionCandidates(eligible, reasons, model);
     if (vf.dropped > 0) {
-      log(`[route] ${model}: 请求含图片 → 跳过未声明图片能力的 ${vf.dropped} 家`);
+      log(`[route] ${model}: 请求含图片（本轮 ${imgStats.lastTurn} 张 / 历史 ${imgStats.history} 张）`
+        + ` → 跳过未声明图片能力的 ${vf.dropped} 家`);
       eligible = vf.eligible;
       reasons = vf.reasons;
     }
@@ -3645,7 +4043,7 @@ async function handleMessages(cfg, req, res, body) {
     // 上游线协议：声明 openai-chat 的家走协议翻译（客户端说 Anthropic，上游只会 OpenAI）
     const toOpenAI = providerProtocol(p) === 'openai-chat';
     log(`try ${p.id} for ${model} (${toOpenAI ? 'anthropic→openai' : 'anthropic'})${upModel !== model ? ' → ' + upModel : ''}`);
-    const baseHeaders = upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, !toOpenAI, cfg.clientProfile);
+    const baseHeaders = upstreamRequestHeaders(req.headers, p.apiKey, cfg.clientUA, !toOpenAI, effectiveClientProfile(cfg, p));
     const out = toOpenAI
       ? await forwardAnthropicViaOpenAI(p, baseHeaders, attemptBody, res, undefined)
       : await forwardWithAccounts(p, '/messages', baseHeaders, attemptBody, res);
@@ -3690,7 +4088,7 @@ async function handleModels(cfg, req, res) {
   for (const p of providers) for (const as of logicalModelNames(p)) push(as, p.id);
   // 2) 只对**一个模型都没配**的服务商补目录（配置列表是权威：配了就不看目录，
   //    否则会列出网关根本不会路由的模型——dsh 选中后才 404，体验更差）
-  await Promise.all(providers.filter((p) => needsCatalog(p)).map((p) => fetchCatalog(p, false, cfg.clientUA, cfg.clientProfile)));
+  await Promise.all(providers.filter((p) => needsCatalog(p)).map((p) => fetchCatalog(p, false, cfg.clientUA, effectiveClientProfile(cfg, p))));
   for (const p of providers) {
     if (!needsCatalog(p)) continue;
     const entry = catalogCache.get(p.id);
