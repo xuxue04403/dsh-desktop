@@ -44,6 +44,7 @@ if (!copyDir(vendorFrom, path.join(extra, 'vendor'), '默认插件 vendor')) {
 // 顺序：项目 node_modules\npm → 已构建绿色目录的 resources\node_modules\npm
 //      → 当前 node 运行时旁的 node_modules\npm（nvm/标准安装）
 const npmCandidates = [
+  path.join(root, 'out', '_npm', 'package'),   // scripts/fetch-npm.mjs 产出（本机无独立 Node 时唯一可行来源）
   path.join(root, 'node_modules', 'npm'),
   path.join(root, 'out', 'DSH-App', 'resources', 'node_modules', 'npm'),
   path.join(root, 'out', 'DSH-App-UAT', 'resources', 'node_modules', 'npm'),
