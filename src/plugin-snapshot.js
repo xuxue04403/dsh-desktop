@@ -723,10 +723,80 @@ function status(dataDir) {
   };
 }
 
+/**
+ * 校验快照的可迁移性（v1.9.0）：**声明的随包内容是否真的躺在数据目录里**。
+ *
+ * 动机来自本项目的核心用法——绿色目录直接拷到新电脑就能跑。而"能否直接跑"取决于
+ * 快照里承诺随包携带的东西是否齐全：
+ *   · `bundles` 列出的插件包体必须在 `plugin-bundle/<名>/package.json`；
+ *   · 被声明为随包、实际又没有的条目，新机器上只能联网安装（离线环境即失败）；
+ *   · `dshConfig.files` 列出的配置文件必须在 `dsh-config/` 且有内容。
+ *
+ * 只读，不修改任何文件；任何异常都收敛为 ok:false 而不是抛出（调用点位于启动路径）。
+ *
+ * @param {string} dataDir - 本应用数据目录。
+ * @returns {{ok: boolean, snapshotExists: boolean, message: string, plugins: object, config: object, missingBundles: string[], missingConfig: string[], issues: string[]}}
+ */
+function verify(dataDir) {
+  const empty = { ok: false, snapshotExists: false, message: '本数据目录尚无迁移快照', plugins: { total: 0, bundled: 0, registry: [] }, config: { files: 0, dirs: 0 }, missingBundles: [], missingConfig: [], issues: [] };
+  if (!dataDir) return Object.assign({}, empty, { message: '缺少数据目录' });
+
+  let snap;
+  try { snap = readJson(snapshotPath(dataDir)); } catch (_) { snap = null; }
+  if (!snap) return empty;
+
+  const issues = [];
+  const plugins = Array.isArray(snap.plugins) ? snap.plugins : [];
+  const bundles = Array.isArray(snap.bundles) ? snap.bundles : [];
+  const bundledSet = new Set(bundles);
+
+  // 1) 随包插件的包体是否真的在
+  const missingBundles = [];
+  for (const name of bundles) {
+    try {
+      if (!fs.existsSync(path.join(bundleDirFor(dataDir, name), 'package.json'))) missingBundles.push(name);
+    } catch (_) { missingBundles.push(name); }
+  }
+  if (missingBundles.length) {
+    issues.push(missingBundles.length + ' 个随包插件在 plugin-bundle/ 下缺失（新机器将改为联网安装）：' + missingBundles.join(', '));
+  }
+
+  // 2) dsh 配置文件是否真的在且非空
+  const cfg = snap.dshConfig || {};
+  const cfgRoot = dshConfigRoot(dataDir);
+  const missingConfig = [];
+  for (const f of (cfg.files || [])) {
+    try {
+      if (!fileHasContent(path.join(cfgRoot, f))) missingConfig.push(f);
+    } catch (_) { missingConfig.push(f); }
+  }
+  if (missingConfig.length) {
+    issues.push(missingConfig.length + ' 个 dsh 配置文件在快照中缺失或为空：' + missingConfig.join(', '));
+  }
+
+  // 3) 无随包的插件需要联网安装——不是缺陷，但要如实报出来（离线机器会装不上）
+  const registry = plugins.filter((p) => p && p.name && !bundledSet.has(p.name)
+    && !(p.fromVendor && !p.spec)).map((p) => p.name);
+
+  const summary = bundles.length + ' 个随包插件、' + (cfg.files || []).length + ' 个配置文件';
+  return {
+    ok: issues.length === 0,
+    snapshotExists: true,
+    capturedAt: snap.capturedAtLocal || snap.capturedAt || null,
+    plugins: { total: plugins.length, bundled: bundles.length, registry },
+    config: { files: (cfg.files || []).length, dirs: (cfg.dirs || []).length },
+    missingBundles,
+    missingConfig,
+    issues,
+    message: issues.length ? issues.join('；') : '快照完整（' + summary + '）',
+  };
+}
+
 module.exports = {
   capture,
   applyIfNeeded,
   status,
+  verify,
   snapshotPath,
   appliedPath,
   bundleDirFor,
