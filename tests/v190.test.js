@@ -499,6 +499,18 @@ t('接线：启动时幂等确保内嵌 node.exe（构建清空目录后可自�
     '确保 node.exe 的调用必须紧跟 launcher.detect()');
 });
 
+// 2026-09-26：一键使用 zip 里混进了应用根目录的 node.exe。它正是上面那条测试说的
+// 「启动时由 DSH-App.exe 硬链接再生」的内嵌运行期入口，与 app exe 同为约 237 MB 的
+// Electron 二进制——留着等于白背一份（实测 372.5 MB → 269.4 MB，省 103 MB）。
+// publish.mjs 的绿色包早已排除它（ZIP_SKIP_FILES），pack-slim 必须对齐。
+t('pack-slim：排除启动时再生的 node.exe（否则 zip 白涨约 103 MB）', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'pack-slim.mjs'), 'utf8');
+  assert.ok(/rm\(path\.join\(work, 'node\.exe'\)/.test(src),
+    'pack-slim.mjs 必须删除应用根目录的 node.exe');
+  assert.ok(src.includes('硬链接再生'),
+    '删除处必须写明它是启动时硬链接再生的产物（否则后人会以为是随包文件又加回去）');
+});
+
 // 2026-09-25：dsh 0.1.7-rc.2 起目录模型的字段多了一个 inputModalities（多模态输入能力）。
 // R28 补丁靠字符串锚点改写该函数——锚点与替换体必须**成对**匹配：只改锚点不改替换体，
 // 会把新字段从补丁后的代码里吃掉，表现为「获取模型」列出的模型悄悄丢掉图片能力。
