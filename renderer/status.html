@@ -43,6 +43,10 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   h1 { font-size: 22px; font-weight: 600; color: #edf1f7; letter-spacing: .4px; margin-bottom: 10px; }
   .phase { font-size: 14px; color: #9aa7bc; line-height: 1.8; min-height: 24px; }
+  /* v1.9.0：迁移自检结论（拷到新电脑前"能不能直接跑"） */
+  .mig { margin-top: 12px; font-size: 13px; line-height: 1.7; padding: 8px 12px; border-radius: 8px; text-align: left; }
+  .mig.ok { color: #7ad1a0; background: rgba(122, 209, 160, 0.08); }
+  .mig.warn { color: #ffcf7a; background: rgba(255, 207, 122, 0.10); }
   .badge {
     display: inline-block; margin: 14px 0 0; padding: 7px 16px; border-radius: 8px;
     background: #241d0e; color: #ffcf6e; font-size: 13px;
@@ -78,10 +82,11 @@
       <button id="btnSettings">设置</button>
     </div>
     <div class="meta" id="meta"></div>
+    <div class="mig hidden" id="mig"></div>
   </div>
   <script>
     const $ = (id) => document.getElementById(id);
-    const dot = $('dot'), phase = $('phase'), badge = $('badge'), meta = $('meta');
+    const dot = $('dot'), phase = $('phase'), badge = $('badge'), meta = $('meta'), mig = $('mig');
 
     function render(s) {
       const cls = {
@@ -98,6 +103,13 @@
       // R25（审计低-1）：innerHTML 插值必须转义（dshVersion 来自包元数据，防注入）
       const esc = (v) => String(v == null ? '' : v).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
       meta.innerHTML = 'dsh <b>' + esc(s.dshVersion || '未检测') + '</b> · 端口 <b>' + esc(s.port) + '</b>';
+      // v1.9.0：迁移自检结论——"绿色目录现在能不能直接拷到新电脑跑"，当场给出答案
+      const mc = s.migrationCheck;
+      mig.classList.toggle('hidden', !(mc && mc.message));
+      if (mc && mc.message) {
+        mig.className = 'mig ' + (mc.ok ? 'ok' : 'warn');
+        mig.textContent = (mc.ok ? '✓ 迁移自检：' : '⚠ 迁移自检：') + mc.message;
+      }
       $('btnStart').textContent =
         (s.service === 'starting') ? '启动中…' :
         (s.service === 'ready' || s.service === 'safe') ? '重新启动' : '启动 dsh 服务';
