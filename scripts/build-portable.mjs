@@ -171,7 +171,16 @@ const exeOld = path.join(appDir, 'electron.exe');
 const exeNew = path.join(appDir, 'DSH-App.exe');
 if (existsSync(exeOld)) renameSync(exeOld, exeNew);
 const defaultAsar = path.join(appDir, 'resources', 'default_app.asar');
-if (existsSync(defaultAsar)) rmSync(defaultAsar, { force: true });
+// 删不掉也不中止构建：它是 Electron 的兜底默认应用，仅在缺少 app.asar 时才加载，
+// 而本构建必定产出 app.asar。原因与重试参数见 build-uat.mjs 同处注释。
+if (existsSync(defaultAsar)) {
+  try {
+    rmSync(defaultAsar, { force: true, recursive: true, maxRetries: 5, retryDelay: 500 });
+  } catch (err) {
+    console.log('[警告] 未能删除 default_app.asar（' + ((err && err.code) || err) + '）——'
+      + '不影响运行（有 app.asar 时它不会被加载），可稍后手工删除。');
+  }
+}
 
 // —— 3.5) 内嵌 npm（v1.5.17 零系统依赖链路）——————————————————
 // 放 resources\node_modules\npm（asar 外的真实文件——ELECTRON_RUN_AS_NODE 子进程
@@ -181,13 +190,18 @@ if (existsSync(defaultAsar)) rmSync(defaultAsar, { force: true });
 {
   // npm 来源：项目 node_modules\npm 优先；无则用当前 node 自带的 npm（nvm/标准安装都在
   // node 旁 node_modules\npm）。复制时排除文档/测试减体积（保留 bin/lib/node_modules 依赖）。
-  let npmSrc = path.join(root, 'node_modules', 'npm');
-  if (!existsSync(npmSrc)) {
-    const sysNpm = path.join(path.dirname(process.execPath), 'node_modules', 'npm');
-    if (existsSync(sysNpm)) npmSrc = sysNpm;
-  }
+  // 2026-09-25 修复：候选源补上 out\_npm（scripts/fetch-npm.mjs 产出）。
+  // 本机没有独立 Node.js（`node` 就是 Electron，其发行包**不含 npm**），所以原先的两个
+  // 候选必然落空 → 产物完全没有内嵌 npm → dsh 自动升级回退到 PATH 的 `npm`，
+  // 报 `'npm' 不是内部或外部命令`（这正是 2026-09-25 用户遇到的"升级失败"）。
+  const npmCandidates = [
+    path.join(root, 'out', '_npm', 'package'),
+    path.join(root, 'node_modules', 'npm'),
+    path.join(path.dirname(process.execPath), 'node_modules', 'npm'),
+  ];
+  const npmSrc = npmCandidates.find((p) => existsSync(path.join(p, 'bin', 'npm-cli.js')));
   const npmDst = path.join(appDir, 'resources', 'node_modules', 'npm');
-  if (existsSync(npmSrc)) {
+  if (npmSrc) {
     rmSync(path.join(appDir, 'resources', 'node_modules'), { recursive: true, force: true });
     cpSync(npmSrc, npmDst, { recursive: true });
     // 减体积：npm 的文档/测试/多语言不在运行链路上
@@ -195,9 +209,10 @@ if (existsSync(defaultAsar)) rmSync(defaultAsar, { force: true });
       const j = path.join(npmDst, junk);
       try { if (existsSync(j)) rmSync(j, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
     }
-    console.log('[内嵌] npm → resources\\node_modules\\npm（源: ' + npmSrc + '）');
+    console.log('[内嵌] npm ← ' + path.relative(root, npmSrc));
   } else {
-    console.log('[警告] 未找到 npm（项目与系统均无）——内嵌安装/升级将回退系统 npm');
+    console.log('[警告] 未找到内嵌 npm（试过：' + npmCandidates.map((p) => path.relative(root, p)).join(' / ') + '）');
+    console.log('        → dsh 自动升级会回退系统 npm，零依赖机器上必然失败。先运行：node scripts/fetch-npm.mjs');
   }
 }
 
