@@ -18,7 +18,31 @@
     "  网关自动解析 + 到期前刷新（只读该文件，刷新结果写在网关自己的目录）。",
     "【多 Key】apiKeys: [\"sk-a\", \"sk-b\"]（设置页「多 Key」输入框，每行一把）—— 同一供应商多把 Key，",
     "  网关映射成账户池轮换：某把额度耗尽/失效/限流就换下一把，/health 的 accounts 里逐把可见。",
-    "  只填 1 把时不写该字段（沿用顶层 apiKey 的旧路径）。"
+    "  只填 1 把时不写该字段（沿用顶层 apiKey 的旧路径）。",
+    "【超时】timeoutMs 是该家「到响应头」的超时（毫秒；不写则 60 秒）。慢速中转（首字节十几秒）必须显式",
+    "  声明，否则会被判超时。注意：**声明了 timeoutMs 的家，熔断后的半开探测也按它执行**——",
+    "  不声明时探测只给 10 秒（探测在替全家试错，不该让用户等满）。",
+    "  实测教训（2026-09-22）：某家 DeepSeek-V4.1-Flash 首字节稳定 13.7–15.5s，未声明 timeoutMs 时",
+    "  探测永远 10s 超时 → 熔断开了就再也恢复不了，所有请求都落到备用家。",
+    "【限流冷却粒度】账户池里 429（限流）按「供应商+账户+模型」冷却——上游限流常是模型级",
+    "  （如 Model 'X' is at its concurrency limit），不应连坐同一把 Key 上的其它模型；",
+    "  额度耗尽（402）/登录失效仍是账户级（整把 Key 不可用）。",
+    "【客户端仿真 clientProfile】'claude' | 'codex' | 'cline' | 空。控制发往上游的请求头形态，",
+    "  用于通过上游的客户端白名单/产品面校验。也可**逐家**在供应商条目里写 clientProfile 覆盖全局；",
+    "  未写时按 baseURL 主机名自动推断（*.cline.bot → cline 仿真）。",
+    "  ⚠ 顶层 clientProfile 同时决定 dsh 的 api 协议（claude → anthropic-messages），",
+    "    仅想改某家的头形态时，请写在**供应商条目**里而不是顶层。",
+    "【Cline（api.cline.bot）实测要点 2026-09-23】",
+    "  ① baseURL 填 https://api.cline.bot/api/v1 —— 目录 /models 与推理 /chat/completions 都由网关自动拼接；",
+    "  ② **必须** quirks: [\"force-stream\"]：Cline 非流式响应被包在 {\"data\":…,\"success\":true} 非标准",
+    "     envelope 里（顶层没有 choices），只有流式才是标准 OpenAI 格式；不强制流式客户端会拿到空响应；",
+    "  ③ 免费模型必须**显式声明** models —— 免费桶 ID（cline-free/*）不在 /api/v1/models 目录里",
+    "     （实测 0 条命中），留空靠目录兜底会得到 454 个付费模型（调用一律 402 Insufficient balance）；",
+    "  ④ 身份头是硬门禁：完全裸头被拒 403 \"only available via Cline product surfaces\"，",
+    "     配 clientProfile: \"cline\" 即可自动带全套（最小充分集是 X-CLIENT-TYPE: cline-sdk）；",
+    "  ⑤ 实测可免费调用（余额 $0.00）：cline-free/* 五个 + z-ai/glm-5.3-flash + deepseek/deepseek-v4-flash",
+    "     + 部分 :free 档；**z-ai/glm-5.3（不带 flash）与 moonshotai/kimi-k3 需付费**。",
+    "  ⑥ 注意 max_tokens 不能太小：这些模型会把 token 先用于思考，过小会得到 HTTP 500 empty response content。"
   ],
   "port": 3091,
   "apiKey": "dsh-gateway-change-me",
@@ -57,6 +81,26 @@
         { "id": "acct1" }
       ],
       "models": ["glm-5.3", "glm-5.2", "deepseek-v4-pro", "deepseek-v4-flash", "kimi-k3"],
+      "enabled": false
+    },
+    {
+      "_说明": "Cline（api.cline.bot）：免费模型接入。clientProfile 自动仿真 Cline 客户端身份头；quirks 的 force-stream 是必需的（非流式响应带非标准 envelope）；模型必须显式声明（免费桶不在上游目录里）。",
+      "id": "cline",
+      "baseURL": "https://api.cline.bot/api/v1",
+      "protocol": "openai-chat",
+      "apiKey": "sk_在此填入你的_Cline_API_Key",
+      "quirks": ["force-stream"],
+      "clientProfile": "cline",
+      "models": [
+        { "id": "cline-free/deepseek-v4.1-flash", "as": "deepseek-v4.1-flash", "vision": true, "contextWindow": 1048576 },
+        { "id": "cline-free/mimo-v2.6-flash", "as": "mimo-v2.6-flash", "contextWindow": 262144 },
+        { "id": "cline-free/muse-spark-1.3-contributor", "as": "muse-spark-1.3-contributor", "vision": true, "contextWindow": 1048576 },
+        { "id": "cline-free/solar-pro4", "as": "solar-pro4", "contextWindow": 262144 },
+        { "id": "poolside/laguna-s-2.1:free", "as": "laguna-s-2.1:free", "contextWindow": 262144 },
+        { "id": "z-ai/glm-5.3-flash", "as": "glm-5.3-flash", "contextWindow": 1310720 }
+      ],
+      "timeoutMs": 60000,
+      "priority": 6,
       "enabled": false
     }
   ]
