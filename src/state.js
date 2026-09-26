@@ -17,6 +17,7 @@ class AppState extends EventEmitter {
     this.safePlugins = '';
     this.failReason = '';
     this.dshVersion = '';
+    this.migrationCheck = null;   // v1.9.0：迁移快照自检结果 { ok, message, at }
   }
 
   // 更新并广播快照
@@ -36,6 +37,7 @@ class AppState extends EventEmitter {
       safePlugins: this.safePlugins,
       failReason: this.failReason,
       dshVersion: this.dshVersion,
+      migrationCheck: this.migrationCheck,
     };
   }
 }
