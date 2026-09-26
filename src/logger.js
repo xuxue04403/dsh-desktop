@@ -62,10 +62,54 @@ function appendLog(line) {
   write(logFile, '[' + stamp() + '] ' + line + '\r\n');
 }
 
-// dsh web 输出日志（原样追加，无时间戳前缀）
+// dsh web 输出日志（逐行加时间戳前缀，2026-09-22 用户要求）
+//
+// 背景：web.log 是 dsh 子进程 stdout/stderr 的直通，**原来没有任何时间信息**。
+// 2026-09-22 新电脑启动故障排查时，无法判断崩溃发生在哪一次启动、距启动多久、
+// 与 app.log 里的事件谁先谁后——只能靠猜。现在每行前缀 `[YYYY-MM-DD HH:mm:ss] `，
+// 与 app.log 同一时间口径（timestamp.js，缺省北京时间）。
+//
+// 关键约束（不能踩的坑）：
+//   · **看门狗按行解析**这份日志（parseFailedPlugins / classifyDidNotActivate）——
+//     解析侧会先剥掉时间戳前缀（watchdog.js 的 stripLogStamp），否则条目名会被污染。
+//   · stdout 的 chunk **不保证按行切**：一个 chunk 可能是半行，也可能含多行。
+//     做法是"整行立即落盘 + 半行暂存"：只有见到 \n 才认为一行结束并补时间戳；
+//     暂存段若在 FLUSH_IDLE_MS 内没有后续数据（说明那就是一整行、只是没带换行），
+//     就按行补时间戳落盘。这样既不把堆栈打成一堆时间戳，也不会把完整行误当续行。
+const FLUSH_IDLE_MS = 250;
+let webPending = '';        // 未见到 \n 的暂存段
+let webFlushTimer = null;
+
+function flushWebPending() {
+  if (webFlushTimer) { clearTimeout(webFlushTimer); webFlushTimer = null; }
+  if (!webPending) return;
+  const line = webPending;
+  webPending = '';
+  write(webLogFile, '[' + stamp() + '] ' + line + '\r\n');
+}
+
 function appendWeb(text) {
   if (!text) return;
-  write(webLogFile, text + '\r\n');
+  const s = String(text).replace(/\r\n/g, '\n');
+  const parts = s.split('\n');
+  // 最后一段：文本以 \n 结尾时它是空串（行已结束），否则是待续的半行
+  const tail = parts.pop();
+  for (const line of parts) {
+    const full = webPending + line;
+    webPending = '';
+    write(webLogFile, '[' + stamp() + '] ' + full + '\r\n');
+  }
+  if (tail) {
+    webPending += tail;
+    if (webFlushTimer) clearTimeout(webFlushTimer);
+    webFlushTimer = setTimeout(flushWebPending, FLUSH_IDLE_MS);
+    if (webFlushTimer.unref) webFlushTimer.unref();
+  }
+}
+
+// 进程退出/切换时把暂存段落盘（否则最后一行永远留在内存里）
+function flushWebNow() {
+  flushWebPending();
 }
 
 function write(file, text) {
@@ -76,6 +120,11 @@ function write(file, text) {
     fs.appendFileSync(file, buf);
     sizes.set(file, (sizes.get(file) || 0) + buf.length);
   } catch (_) { /* 忽略 */ }
+}
+
+// 每次 dsh 启动前：把上次残留的暂存段落盘并清空（新进程应从头开始记）。
+function resetWebLineState() {
+  flushWebPending();
 }
 
 function logDirPath() {
@@ -95,4 +144,6 @@ function webLogSize() {
   } catch (_) { return 0; }
 }
 
-module.exports = { init, appendLog, appendWeb, logDirPath, webLogPath, webLogSize };
+module.exports = {
+  init, appendLog, appendWeb, resetWebLineState, flushWebNow, logDirPath, webLogPath, webLogSize,
+};
