@@ -6,7 +6,7 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { parseFailedPlugins, resolveEntryIds } = require('../src/watchdog');
+const { parseFailedPlugins, resolveEntryIds, classifyDidNotActivate, isolationCandidates } = require('../src/watchdog');
 const { compareVersions, REGEX_URL_LINE } = require('../src/launcher');
 const { validateConfigText } = require('../src/gateway-manager');
 const { migrateGatewayConfig, isMockLikeConfig } = require('../src/datadir');
@@ -360,6 +360,63 @@ t('parseFailedPlugins 形态3：双插件同时故障 → 全部收集', () => {
     + 'failed to import loader entry qqbot (dsh-qqbot): not found\r\n';
   const names = parseFailedPlugins(log);
   assert.deepStrictEqual(names, ['dsh-email-bridge', 'dsh-qqbot']);
+});
+
+// —— 2026-09-22 新电脑事故：安全模式把"依赖受害者"当故障隔离，导致结构性启动失败 ——
+// 现场日志（web.log）：13 条 pending 全是「等依赖」，而生成的 safe.yml 却禁用了
+// typert / settings / credentials / llm-pi-ai / connection / sandbox-policy 等**服务提供者**，
+// 安全模式自身必然起不来（用户被锁死在无法自愈的状态）。
+const DID_NOT_ACTIVATE_LOG = [
+  'dsh: 13 entries did not activate',
+  '@deepseek-ai/dsh-typert-loader: pending (waiting for service: typert)',
+  '@deepseek-ai/dsh-api-gateway: pending (waiting for service: typert)',
+  '@deepseek-ai/dsh-pwsh-sandbox: pending (waiting for service: sandboxPolicy)',
+  '@deepseek-ai/dsh-session-log-export: pending (waiting for service: connection)',
+  '@deepseek-ai/dsh-api-workspace-files: pending (waiting for services: fs, sandboxPolicy, typert)',
+  '',
+].join('\r\n');
+
+t('classifyDidNotActivate：pending(等依赖) 与真 Error 必须分开', () => {
+  const r = classifyDidNotActivate(DID_NOT_ACTIVATE_LOG);
+  assert.deepStrictEqual(r.faults, [], '待依赖行不是真故障：' + JSON.stringify(r.faults));
+  assert.strictEqual(r.dependents.length, 5, '应识别出 5 条受害者：' + r.dependents.length);
+  const mixed = classifyDidNotActivate(
+    'dsh: 2 entries did not activate\r\n'
+    + '@linxin666/dsh-web-ui-all: Error: Cannot find module \'x\'\r\n'
+    + '@deepseek-ai/dsh-typert-loader: pending (waiting for service: typert)\r\n',
+  );
+  assert.deepStrictEqual(mixed.faults.map((f) => f.name), ['@linxin666/dsh-web-ui-all']);
+  assert.deepStrictEqual(mixed.dependents.map((d) => d.name), ['@deepseek-ai/dsh-typert-loader']);
+});
+
+t('isolationCandidates：纯"等依赖"级联 → 一个都不隔离（旧版会把核心服务也禁掉）', () => {
+  const v = isolationCandidates(DID_NOT_ACTIVATE_LOG, { thirdParty: new Set() });
+  assert.deepStrictEqual(v.names, [], '不得隔离任何条目：' + JSON.stringify(v.names));
+  assert.ok(/等依赖|受害者/.test(v.reason), '原因应说明是依赖级联：' + v.reason);
+});
+
+t('isolationCandidates：真故障是第三方插件 → 可隔离；核心 dsh-* 故障 → 不隔离', () => {
+  const tp = new Set(['@linxin666/dsh-web-ui-all']);
+  const v1 = isolationCandidates(
+    'dsh: 1 entry did not activate\r\n@linxin666/dsh-web-ui-all: Error: Cannot find module \'x\'\r\n',
+    { thirdParty: tp },
+  );
+  assert.deepStrictEqual(v1.names, ['@linxin666/dsh-web-ui-all'], '第三方真故障应可隔离：' + JSON.stringify(v1.names));
+  const v2 = isolationCandidates(
+    'dsh: 1 entry did not activate\r\n@deepseek-ai/dsh-llm-pi-ai: Error: boom\r\n',
+    { thirdParty: tp },
+  );
+  assert.deepStrictEqual(v2.names, [], '核心服务故障不得隔离（禁了就没有服务提供者）：' + JSON.stringify(v2.names));
+  assert.ok(/核心/.test(v2.reason), '原因应点明核心条目：' + v2.reason);
+});
+
+t('isolationCandidates：故障条目过多 → 判定系统性故障，不做 Level 1 隔离', () => {
+  const tp = new Set(['p1', 'p2', 'p3', 'p4', 'p5', 'p6', 'p7', 'p8']);
+  const lines = ['dsh: 8 entries did not activate'];
+  for (const n of tp) lines.push(n + ': Error: boom');
+  const v = isolationCandidates(lines.join('\r\n') + '\r\n', { thirdParty: tp });
+  assert.deepStrictEqual(v.names, [], '过多故障不应逐个隔离：' + JSON.stringify(v.names));
+  assert.ok(/系统性/.test(v.reason), '原因应说明系统性：' + v.reason);
 });
 
 t('validateConfigText R22 端口校验：缺/非法端口拒绝', () => {
