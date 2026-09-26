@@ -118,6 +118,31 @@ for (const rel of ['data/logs', 'data/gateway', 'data/broker', 'data/market']) r
 if (dropNpm) rm(path.join(work, 'resources', 'node_modules', 'npm'), '内嵌 npm');
 if (dropDsh) rm(path.join(work, 'data', 'node-global'), '内置 dsh（首次启动需联网安装）');
 
+// ---------- 换机清洗（2026-09-22）----------
+// 目的：让"复制到新电脑"尽量一键。这里只删"只对原机器成立/会主动误导"的残留；
+// 真正的换机适配（写死的凭据路径、WorkBuddy 区域、本地代理）由应用**首次启动时**
+// 自动完成，见 src/machine-adapt.js —— 所以那些字段不用在这里改，保留原样即可。
+{
+  // ① 适配/迁移标记：这两个标记都是"按机器指纹决定要不要干活"的闸门。
+  //    留着的话，新电脑只要**主机名与用户名恰好相同**（同名机、克隆镜像、同一个人
+  //    换机后沿用同名账户）就会被判成"本机已处理过"而**跳过换机适配与插件装回**。
+  //    删掉：新机必定重新适配一次、重新装回一次（幂等逻辑本身保证重复执行无副作用）。
+  for (const rel of ['data/machine-adapt.applied.json', 'data/plugin-snapshot.applied.json']) {
+    const p = path.join(work, rel);
+    if (fs.existsSync(p)) {
+      fs.rmSync(p, { force: true });
+      console.log('      - ' + rel.replace('data/', '').padEnd(30) + '（删除：让新机必定重新适配/装回）');
+    }
+  }
+  // ② 路径绑定脚本（data/broker/launch-dsh.cmd、data/market/*/pnpm.cmd 里写死了绿目录
+  //    绝对路径）已经由上面的 `data/broker` / `data/market` 整目录删除覆盖，这里不重复处理。
+  // ③ 上次残留的临时副本
+  for (const rel of ['data/gateway.config.json.tmp', 'data/settings.json.tmp']) {
+    const p = path.join(work, rel);
+    try { if (fs.existsSync(p)) fs.rmSync(p, { force: true }); } catch { /* 忽略 */ }
+  }
+}
+
 for (const [label, bytes] of removed) if (label && bytes > 0) console.log('      - ' + label.padEnd(26) + human(bytes));
 const after = measure(work);
 console.log('[3/5] 精简后：' + human(after.bytes) + ' / ' + after.files + ' 文件（减少 ' + human(before.bytes - after.bytes) + '）');
