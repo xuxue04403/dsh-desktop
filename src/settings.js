@@ -21,6 +21,7 @@ const DEFAULTS = {
   checkUpdates: true,       // 启动时检查 dsh 新版本
   installDefaultPlugins: true,   // v1.7.0：随 app 分发默认插件（dsh-email-bridge 邮箱桥接）并挂载到 dsh profile
   trayBalloonShown: false,   // 托盘"首次运行"气泡是否已提示过（审计修复：旧版每次启动都弹）
+  confirmQuitWhenBusy: true, // v1.9.0：退出时若检测到最近仍有活动（会话写入/网关流量）则先确认，避免误退打断任务
   // —— 安全模式状态（程序自身维护，勿手改）——
   safeMode: false,
   safeModeLevel: 0,         // 1=补丁禁用故障插件 2=临时剥离第三方插件
