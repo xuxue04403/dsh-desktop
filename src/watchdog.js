@@ -25,18 +25,26 @@ const RE_FAILED_TO_LOAD = /plugin\(s\) failed to load:\s*([^;]+)/;
 const RE_DID_NOT_ACTIVATE = /(\d+)\s+entr(?:y|ies)\s+did\s+not\s+activate\s+([\s\S]*?)(?:\r?\n\s*\r?\n|$)/;
 const RE_LOADER_ENTRY_FAILED = /failed to (?:import|apply) loader entry\s+(\S+?)(?:\s+\(([^)]+)\))?[\s:]/g;
 
+// web.log 每行时间戳前缀（2026-09-22 起 logger 会加）：`[2026-09-22 09:22:02] `
+// 解析前必须剥掉——否则条目名会带上前缀而匹配不到 profile 条目 id。
+const RE_LOG_STAMP = /^\[\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?\]\s?/;
+function stripLogStamp(line) {
+  return String(line == null ? '' : line).replace(RE_LOG_STAMP, '');
+}
+
 // 从 dsh 启动日志提取"失败插件名"（跨版本容错）
 function parseFailedPlugins(logText) {
   const names = [];
   if (!logText) return names;
-  const m1 = RE_FAILED_TO_LOAD.exec(logText);
+  const cleaned = String(logText).split('\n').map(stripLogStamp).join('\n');
+  const m1 = RE_FAILED_TO_LOAD.exec(cleaned);
   if (m1) {
     for (const s of m1[1].split(',')) {
       const t = s.trim();
       if (t) names.push(t);
     }
   }
-  const m2 = RE_DID_NOT_ACTIVATE.exec(logText);
+  const m2 = RE_DID_NOT_ACTIVATE.exec(cleaned);
   if (m2) {
     for (const raw of m2[2].split('\n')) {
       const t = raw.replace(/\r$/, '');
@@ -49,7 +57,7 @@ function parseFailedPlugins(logText) {
   // "loader entry include (cordis:include)" 是包装条目，真正失败的是内层插件）；
   // cordis:* 核心包装不可隔离，跳过。R25（审计）：收集**全部**有效 token——
   // 双插件同时故障时只禁用一个会导致第二次失败（旧版如此）。
-  const entryMatches = [...logText.matchAll(RE_LOADER_ENTRY_FAILED)];
+  const entryMatches = [...cleaned.matchAll(RE_LOADER_ENTRY_FAILED)];
   if (entryMatches.length > 0) {
     // 收集全部有效 token（按文档序）；cordis:* 核心包装不可隔离，跳过
     for (const m of entryMatches) {
@@ -60,6 +68,104 @@ function parseFailedPlugins(logText) {
   }
   // 去重（保序）
   return names.filter((n, i) => names.indexOf(n) === i);
+}
+
+/**
+ * 「N entries did not activate」块里每一行的语义分类（2026-09-22 新电脑事故）。
+ *
+ * 该块的每一行形如 `<包名或条目 id>: <原因>`，但**原因是两类完全不同的东西**：
+ *   · `pending (waiting for service: X)` —— 这行是**受害者**：它没起来是因为服务 X
+ *     没被提供。真正该修的是 X 的提供者，不是它。
+ *   · `Error: …` —— 这行才是**真故障**（apply/import 抛错）。
+ *
+ * 旧版把两类一视同仁，于是把 typert / settings / credentials / connection /
+ * sandboxPolicy 这些**服务提供者**也写进 safe.yml 禁用——依赖它们的条目随即永远
+ * 等不到服务（实测 13 条 pending），安全模式**自身**必然启动失败，用户被锁死在
+ * 一个无法自愈的状态里（只能手删 safe.yml）。所以隔离候选只看真故障。
+ */
+function classifyDidNotActivate(logText) {
+  const faults = [];
+  const dependents = [];
+  if (!logText) return { faults, dependents };
+  const cleaned = String(logText).split('\n').map(stripLogStamp).join('\n');
+  const m = RE_DID_NOT_ACTIVATE.exec(cleaned);
+  if (!m) return { faults, dependents };
+  for (const raw of m[2].split('\n')) {
+    const t = raw.replace(/\r$/, '');
+    if (!t || t[0] === ' ' || t[0] === '\t') continue;
+    const ci = t.indexOf(': ');
+    if (ci <= 0) continue;
+    const name = t.slice(0, ci).trim();
+    const detail = t.slice(ci + 2).trim();
+    if (!name) continue;
+    if (/^pending\b/i.test(detail) || /waiting for service/i.test(detail)) dependents.push({ name, detail });
+    else faults.push({ name, detail });
+  }
+  return { faults, dependents };
+}
+
+/** 单个故障条目名是否属于"永不隔离"的核心/基础设施（见 isCorePackage）。 */
+function isCorePackage(name, thirdParty) {
+  const n = String(name || '').trim();
+  if (!n) return true;
+  if (thirdParty && thirdParty.has(n)) return false;         // 明确是第三方插件 → 可隔离
+  return /^@deepseek-ai\/dsh-/.test(n);                       // 其余 dsh-* 视为核心：提供关键服务
+}
+
+/**
+ * 从启动失败日志算出**可安全隔离**的插件名。
+ *
+ * 规则（2026-09-22 事故后收紧）：
+ *   ① 只取真故障（`classifyDidNotActivate().faults`），
+ *      `plugin(s) failed to load` / `failed to apply loader entry` 两类形态照旧全收；
+ *   ② 核心/基础设施条目（`@deepseek-ai/dsh-*` 且不在 profile dependencies 里）**一律不隔离**——
+ *      禁用它们等于抽掉服务提供者，安全模式自己就起不来；
+ *   ③ 真故障数量超过 `maxIsolate`（默认 6）视为**系统性故障**（整棵树没起来，而非某个坏插件），
+ *      不做 Level 1 隔离，交由 Level 2（剥离第三方插件）或用户处理。
+ *
+ * @returns {{ names: string[], reason: string }} names 为空时 reason 说明为什么放弃隔离
+ */
+function isolationCandidates(logText, opts) {
+  const thirdParty = (opts && opts.thirdParty) || new Set();
+  const maxIsolate = (opts && Number.isFinite(opts.maxIsolate)) ? opts.maxIsolate : 6;
+  const { faults, dependents } = classifyDidNotActivate(logText);
+  // 形态1 / 形态3 没有"待依赖"语义，全部视为真故障
+  const all = parseFailedPlugins(logText);
+  const fromForms = all.filter((n) => !faults.some((f) => f.name === n) && !dependents.some((d) => d.name === n));
+  const faultNames = [...faults.map((f) => f.name), ...fromForms];
+  const unique = faultNames.filter((n, i) => faultNames.indexOf(n) === i);
+  if (!unique.length) {
+    // 待依赖行的 detail 本身就带 "pending (waiting for service: X)"，这里只取服务名，
+    // 避免拼成 "如 waiting for service: pending (waiting for service: typert)" 这种重复文案
+    const svc = dependents.length ? (/service[s]?:\s*([^)]+)/.exec(dependents[0].detail) || [])[1] : '';
+    return {
+      names: [],
+      reason: dependents.length
+        ? '全部 ' + dependents.length + ' 条都是「等依赖」的受害者'
+          + (svc ? '（首个在等 ' + svc.trim().split(',')[0].trim() + '）' : '')
+          + '，未定位到真正的故障条目'
+        : '日志中未出现故障条目',
+    };
+  }
+  const isolatable = unique.filter((n) => !isCorePackage(n, thirdParty));
+  const skippedCore = unique.filter((n) => isCorePackage(n, thirdParty));
+  if (!isolatable.length) {
+    return {
+      names: [],
+      reason: '故障条目全部是核心/基础设施（' + skippedCore.slice(0, 6).join(', ') +
+        (skippedCore.length > 6 ? ' 等 ' + skippedCore.length + ' 个' : '') + '），隔离它们会让整棵树缺服务',
+    };
+  }
+  if (isolatable.length > maxIsolate) {
+    return {
+      names: [],
+      reason: '故障条目达 ' + isolatable.length + ' 个（> ' + maxIsolate + '），判定为系统性故障而非单个坏插件',
+    };
+  }
+  return {
+    names: isolatable,
+    reason: skippedCore.length ? '跳过核心条目 ' + skippedCore.length + ' 个' : '',
+  };
 }
 
 // 从 dump-config 的 YAML 文本解析 id→name 映射，返回与失败插件名匹配的条目 id
@@ -110,6 +216,26 @@ class Watchdog {
     );
   }
 
+  /**
+   * profile 里声明的第三方依赖包名集合（用于把"可隔离的第三方插件"与
+   * "提供核心服务、禁用即瘫痪"的 `@deepseek-ai/dsh-*` 区分开）。
+   * 读取失败返回空集合——此时 `isCorePackage` 会保守地把 dsh-* 都视为核心。
+   */
+  thirdPartyPackages() {
+    const set = new Set();
+    try {
+      const pj = path.join(this.profileDir, 'package.json');
+      if (!fs.existsSync(pj)) return set;
+      const doc = JSON.parse(fs.readFileSync(pj, 'utf8'));
+      for (const field of ['dependencies', 'devDependencies']) {
+        const deps = doc && doc[field];
+        if (!deps || typeof deps !== 'object') continue;
+        for (const name of Object.keys(deps)) if (!/^@deepseek-ai\/dsh-/.test(name)) set.add(name);
+      }
+    } catch (_) { /* 读不到 → 空集合（保守处理） */ }
+    return set;
+  }
+
   // 启动失败（未就绪即退出 / 或等待超时）时由 main 调用
   async tryRecover() {
     const logPath = path.join(this.settings.dir, 'logs', 'web.log');
@@ -126,6 +252,11 @@ class Watchdog {
       }
     } catch (_) { /* 忽略 */ }
     const names = parseFailedPlugins(logText);
+    // 2026-09-22 新电脑事故：`N entries did not activate` 里多数行是「等依赖」的受害者，
+    // 旧版把它们连同服务提供者一起写进 safe.yml → 安全模式缺少核心服务、必然启动失败，
+    // 用户被锁死。这里改用 isolationCandidates 计算**可安全隔离**的子集。
+    const verdict = isolationCandidates(logText, { thirdParty: this.thirdPartyPackages() });
+    const isolate = verdict.names;
 
     const data = this.settings.data;
 
@@ -168,12 +299,30 @@ class Watchdog {
       return;
     }
 
+    if (!isolate.length) {
+      // 检测到故障名，但**没有可安全隔离的条目**（全是核心服务、或纯属"等依赖"的级联、
+      // 或数量过多属系统性故障）。此时写 safe.yml 只会造出一个必然失败的启动配置
+      //（2026-09-22 事故：禁用了 typert/settings/credentials/connection 等提供者）。
+      // 交还用户 + 保留完整日志指引，不做自动隔离。
+      this.state.update({
+        service: 'failed',
+        phase: '启动失败（不宜自动隔离）',
+        failReason: '检测到 ' + names.length + ' 个未激活条目，但' + (verdict.reason || '没有可安全隔离的插件')
+          + '。已跳过安全模式以免破坏启动配置；请打开日志查看首个 "Error:" 行定位真因。',
+      });
+      this.log('跳过自动隔离：' + (verdict.reason || '无可隔离条目')
+        + '（原检测到: ' + names.join(', ') + '）');
+      return;
+    }
+
     // —— 插件故障 → Level 1：按条目禁用 ——
-    this.log('检测到故障插件: ' + names.join(', ') + '，尝试自动隔离…');
+    this.log('检测到故障插件: ' + isolate.join(', ')
+      + (isolate.length !== names.length ? '（另有 ' + (names.length - isolate.length) + ' 个条目因属核心/依赖受害而保留）' : '')
+      + '，尝试自动隔离…');
     // 审计修复（P2）：dump-config 失败（受限权限下会 EPERM）时退回 profile patch 索引，
     // 避免直接升级到"剥离全部第三方插件"的 Level 2。
     const yaml = this.runDumpConfig() || this.patchEntryIndex();
-    const ids = resolveEntryIds(yaml, names);
+    const ids = resolveEntryIds(yaml, isolate);
     if (ids.length && this.writeSafePatch(ids)) {
       data.safeMode = true;
       data.safeModeLevel = 1;
@@ -384,4 +533,6 @@ class Watchdog {
   }
 }
 
-module.exports = { Watchdog, parseFailedPlugins, resolveEntryIds };
+module.exports = {
+  Watchdog, parseFailedPlugins, resolveEntryIds, classifyDidNotActivate, isolationCandidates, stripLogStamp,
+};
