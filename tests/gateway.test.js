@@ -926,7 +926,8 @@ let upstreamPort = 0;
       assert.strictEqual(upText.st.calls, 1, '纯文本家不得收到带图片的请求，实际 ' + upText.st.calls);
       assert.strictEqual(upVision.st.calls, 1, '声明图片能力的家应收到，实际 ' + upVision.st.calls);
       const logText = fs.readFileSync(gw.logPath, 'utf8');
-      assert.ok(/请求含图片 → 跳过未声明图片能力的 1 家/.test(logText), '日志应记录图片路由：' + logText.slice(-400));
+      assert.ok(/请求含图片（本轮 1 张 \/ 历史 0 张） → 跳过未声明图片能力的 1 家/.test(logText),
+        '日志应记录图片路由，并区分"本轮/历史"（2026-09-18 用户排查：历史里的截图会让每轮都命中多模态路由）：' + logText.slice(-400));
       // ③ 若没有任何候选声明图片能力 → 保持原候选（交给上游报错，不凭空 404）
       const upPlain = await startFakeUpstream({});
       const gw2 = await startGatewayWith([providerOf('only-plain', upPlain, { models: ['test-model'] })], 'visionnofallback');
@@ -941,6 +942,39 @@ let upstreamPort = 0;
         assert.strictEqual(b.status, 200, '无图片候选时应照常转发（不得凭空 404），实际 ' + b.status + ' ' + b.text.slice(0, 160));
         assert.strictEqual(upPlain.st.calls, 1, '应转发给唯一候选，实际 ' + upPlain.st.calls);
       } finally { killGw(gw2); closeUp(upPlain); }
+    } finally { killGw(gw); closeUp(upText); closeUp(upVision); }
+  });
+
+  t('图片计数：历史消息里的旧截图计入"历史"，本轮无图时不谎报"本轮含图片"（2026-09-18 用户排查）', async () => {
+    // 现场：用户 14:43 贴了一张控制台截图 → 之后**每一轮**请求（含纯文字追问）都命中多模态路由，
+    // 日志只写"请求含图片"，看上去像"我没发图片却说我发了"。真实原因：客户端每轮重发完整历史。
+    const upText = await startFakeUpstream({});
+    const upVision = await startFakeUpstream({});
+    const gw = await startGatewayWith([
+      providerOf('plain2', upText, { models: ['test-model'] }),
+      providerOf('vlm2', upVision, { models: [{ id: 'test-model', vision: true }] }),
+    ], 'visionhist');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: {
+          model: 'test-model', max_tokens: 16,
+          messages: [
+            // 历史：用户上一轮贴的截图（带图）+ 助手回复
+            { role: 'user', content: [{ type: 'text', text: '如图，我发现个问题' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGk=' } }] },
+            { role: 'assistant', content: [{ type: 'text', text: '收到' }] },
+            // 本轮：纯文字追问，**没有**图片
+            { role: 'user', content: [{ type: 'text', text: '继续排查' }] },
+          ],
+        },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      assert.strictEqual(upText.st.calls, 0, '历史含图 → 仍必须只发给声明图片能力的家（否则上游会收到图片），实际 ' + upText.st.calls);
+      assert.strictEqual(upVision.st.calls, 1, '实际 ' + upVision.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/请求含图片（本轮 0 张 \/ 历史 1 张） → 跳过未声明图片能力的 1 家/.test(logText),
+        '日志必须区分本轮/历史（否则会被误读成"用户刚发了图片"）：' + logText.slice(-400));
     } finally { killGw(gw); closeUp(upText); closeUp(upVision); }
   });
 
@@ -1403,6 +1437,22 @@ let upstreamPort = 0;
           res.end(JSON.stringify({ code: 0, msg: 'ok', data: { accessToken: 'AT-REFRESHED', refreshToken: 'rt-new', expiresIn: 3600, domain: 'codebuddy.cn' } }));
           return;
         }
+        if (behavior === 'rate429') {
+          // 模型级限流（实测 amd 措辞）：classifyAccountFailure 判为 rate → 只冷却该模型
+          res.writeHead(429, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: "Model '" + (body && body.model) + "' is at its concurrency limit (32); please retry later" } }));
+          return;
+        }
+        if (behavior === 'err500') {
+          res.writeHead(500, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'internal error' } }));
+          return;
+        }
+        if (behavior === 'big400') {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify(opts.bigBody || { error: { message: 'x'.repeat(2 * 1024 * 1024) } }));
+          return;
+        }
         if (behavior === 'credit') {
           res.writeHead(402, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ code: 0, msg: 'insufficient credit: 积分不足' }));
@@ -1411,6 +1461,13 @@ let upstreamPort = 0;
         if (behavior === 'session') {
           res.writeHead(401, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ code: 0, msg: 'Offline user session not found 12153' }));
+          return;
+        }
+        // 2026-09-18：**裸 403**（实测 nvidia 形态）——没有账号/额度措辞，旧实现按"供应商级 403"熔断整家；
+        // 现在应判为账户级（这把 Key 未授权）→ 换下一把 Key
+        if (behavior === 'forbidden') {
+          res.writeHead(403, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ status: 403, title: 'Forbidden', detail: 'Authorization failed' }));
           return;
         }
         if (behavior === 'boom') {
@@ -1809,7 +1866,7 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(up); }
   });
 
-  t('WorkBuddy 身份仿真：chat 用桌面形态 UA（WorkBuddy/<app> … CLI/<cli>），刷新用 CLI 形态 UA', async () => {
+  t('WorkBuddy 身份仿真：chat 用桌面形态 UA（WorkBuddy/<app> … CLI/<cli>）+ X-IDE-* 使用端三头，刷新用 CLI 形态 UA', async () => {
     const up = await startFakeOpenAIUpstream({ json: true });
     const dir = fs.mkdtempSync(path.join(tmp, 'wb-ua-'));
     // 合成一个"已安装的 WorkBuddy"：install-manifest.json 给 App 版本；
@@ -1833,10 +1890,72 @@ let upstreamPort = 0;
       assert.ok(chatIdx >= 0, '应有 chat 请求：' + JSON.stringify(up.st.paths));
       assert.strictEqual(up.st.headers[chatIdx]['user-agent'], 'WorkBuddy/9.9.9 WorkBuddy/9.9.9 CLI/3.3.3',
         'chat 必须是桌面客户端形态 UA：' + up.st.headers[chatIdx]['user-agent']);
+      // 使用端归属（2026-09-18 用户实测）：官方桌面端把 CLIENT_INFO_IDE_TYPE/PLATFORM = "WorkBuddy"、
+      // CLIENT_INFO_PLATFORM_VERSION = 桌面版本 写成 X-IDE-Type / X-IDE-Name / X-IDE-Version 三头，
+      // 后端按它填控制台「积分消耗明细 → 使用端」；缺这三头时该列显示 `-`。
+      assert.strictEqual(up.st.headers[chatIdx]['x-ide-type'], 'WorkBuddy',
+        'chat 必须声明使用端类型：' + JSON.stringify(up.st.headers[chatIdx]));
+      assert.strictEqual(up.st.headers[chatIdx]['x-ide-name'], 'WorkBuddy',
+        'chat 必须声明使用端名称：' + JSON.stringify(up.st.headers[chatIdx]));
+      assert.strictEqual(up.st.headers[chatIdx]['x-ide-version'], '9.9.9',
+        'chat 的 X-IDE-Version 必须是本机桌面版本：' + up.st.headers[chatIdx]['x-ide-version']);
       const refreshIdx = up.st.paths.findIndex((p) => /token\/refresh$/.test(p));
       assert.ok(refreshIdx >= 0, '临期账户应触发刷新：' + JSON.stringify(up.st.paths));
       assert.strictEqual(up.st.headers[refreshIdx]['user-agent'], 'CLI/2.63.2 CodeBuddy/2.63.2',
         '刷新路径保持 CLI 形态 UA（与插件一致）：' + up.st.headers[refreshIdx]['user-agent']);
+      assert.ok(!up.st.headers[refreshIdx]['x-ide-type'],
+        '刷新路径不注入使用端身份头（保持原样，避免影响凭据链路）：' + JSON.stringify(up.st.headers[refreshIdx]));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('WorkBuddy 区域守卫：国内凭据不得发往国际版端点（反之亦然），必须明确报错而非跨区泄漏', async () => {
+    // 2026-09-20 实测（新电脑用国际版场景）：两个区域共用同一个 CodeBuddyExtension auth 目录、
+    // 只差文件名，配置里端点/凭据写错就会把一国账号的 token 发到另一国端点——实测 apisix
+    // 返回 `401 Authorization Required`，且这属于跨产品凭据泄漏（参照 dsh-workbuddy-connect
+    // 对此有明确的安全红线）。守卫要求：发请求前就拒绝，并说清该改哪个文件/环境变量。
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-region-'));
+    // 国内版凭据（domain=www.workbuddy.cn）
+    const cnAuth = writeWorkBuddyAuth(dir, 'cn.info', { token: 'AT-CN', uid: 'uid-cn', domain: 'www.workbuddy.cn' });
+    // 国际版供应商端点（www.workbuddy.ai）→ 与上面的凭据区域不匹配
+    const gw = await startGatewayWith([
+      openaiProvider('wbgl', up, { region: 'global', auth: 'workbuddy', accounts: [{ id: 'g1', authFile: cnAuth }] }),
+    ], 'wbreion1');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 503, '跨区凭据必须被拒（而非拿 401 或把 token 发出去），实际 ' + r.status);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/是国际版（WorkBuddy AI）供应商，但取到的凭据属于国内版/.test(logText),
+        '日志必须指明区域不匹配：' + logText.slice(-400));
+      assert.ok(/workbuddy-desktop-ai\.info|WORKBUDDY_AI_AUTH_FILE/.test(logText),
+        '日志必须告诉用户该改哪个文件/环境变量：' + logText.slice(-400));
+      assert.strictEqual(up.st.calls, 0, '根本不该向上游发出请求（否则就是跨区泄漏），实际 ' + up.st.calls);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('WorkBuddy 区域守卫：国际版凭据配国际版端点 → 正常放行（不误伤）', async () => {
+    // 反向用例：区域匹配时必须照常工作，证明守卫只拦不匹配的组合。
+    // 这里的上游是本地假服务器（自定义端点），区域须由条目的 `region: "global"` 显式声明——
+    // 守卫对"区域未知"的自定义端点不做拦截（否则内网代理/测试上游会被误判）。
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const dir = fs.mkdtempSync(path.join(tmp, 'wb-region-ok-'));
+    const glAuth = writeWorkBuddyAuth(dir, 'gl.info', { token: 'AT-GL', uid: 'uid-gl', domain: 'www.workbuddy.ai' });
+    const gw = await startGatewayWith([
+      openaiProvider('wbglok', up, { region: 'global', auth: 'workbuddy', accounts: [{ id: 'g1', authFile: glAuth }] }),
+    ], 'wbreion2');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '区域匹配应正常放行，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      assert.ok(up.st.calls >= 1, '应真的调用上游，实际 ' + up.st.calls);
+      const chatIdx = up.st.paths.findIndex((p) => /chat\/completions$/.test(p));
+      assert.ok(chatIdx >= 0, '应有 chat 请求：' + JSON.stringify(up.st.paths));
+      // 国际版身份：产品名 WorkBuddy AI + Origin/Referer 指向 www.workbuddy.ai
+      assert.ok(/WorkBuddy AI\//.test(up.st.headers[chatIdx]['user-agent'] || ''),
+        '国际版 chat UA 应含 WorkBuddy AI 产品名：' + up.st.headers[chatIdx]['user-agent']);
+      assert.strictEqual(up.st.headers[chatIdx].origin, 'https://www.workbuddy.ai',
+        '国际版 Origin 应为 www.workbuddy.ai：' + up.st.headers[chatIdx].origin);
     } finally { killGw(gw); closeUp(up); }
   });
 
@@ -1903,6 +2022,9 @@ let upstreamPort = 0;
       assert.strictEqual(up.st.headers[0]['user-agent'], 'claude-cli/2.0.0 (external, cli)',
         '普通供应商必须保持 Claude Code 仿真：' + up.st.headers[0]['user-agent']);
       assert.ok(!/WorkBuddy/.test(up.st.headers[0]['user-agent']), '普通供应商绝不能带上 WorkBuddy 身份');
+      assert.ok(!up.st.headers[0]['x-ide-type'] && !up.st.headers[0]['x-ide-name'] && !up.st.headers[0]['x-ide-version'],
+        '使用端身份三头（X-IDE-*）只能给 auth=workbuddy 的供应商，其余供应商一条都不能带：'
+        + JSON.stringify(up.st.headers[0]));
     } finally { killGw(gw); }
 
     // ② codex 仿真 → 普通供应商：UA 必须是 Codex 形态
@@ -1925,6 +2047,8 @@ let upstreamPort = 0;
       await call({ port: gw.port, p: '/v1/chat/completions', body: { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] } });
       assert.strictEqual(up.st.headers[before]['user-agent'], 'my-agent/1.0',
         '供应商配置的 UA 应生效且不被拼接：' + up.st.headers[before]['user-agent']);
+      assert.ok(!up.st.headers[before]['x-ide-type'],
+        '配置了自定义 UA 的普通供应商同样不得带上使用端身份头：' + JSON.stringify(up.st.headers[before]));
     } finally { killGw(gw); }
 
     // ④ WorkBuddy 供应商（同一个网关配置里）→ 必须是桌面 WorkBuddy 身份
@@ -1944,6 +2068,9 @@ let upstreamPort = 0;
         'WorkBuddy 必须用桌面身份 UA：' + h['user-agent']);
       assert.ok(!/claude-cli/.test(h['user-agent']), 'WorkBuddy 请求不得混入 claude-cli（旧 bug 会拼成两个 UA）');
       assert.strictEqual(h['x-user-id'], 'uid-scope', 'WorkBuddy 身份头应存在');
+      assert.strictEqual(h['x-ide-type'], 'WorkBuddy', 'WorkBuddy 请求必须带使用端身份（控制台归属）：' + JSON.stringify(h));
+      assert.strictEqual(h['x-ide-name'], 'WorkBuddy', '同上（X-IDE-Name）');
+      assert.strictEqual(h['x-ide-version'], '9.9.9', 'X-IDE-Version 应为本机桌面版本');
     } finally { killGw(gw); closeUp(up); }
   });
 
@@ -2093,6 +2220,108 @@ let upstreamPort = 0;
       const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
       assert.strictEqual(r.status, 200, '实际 ' + r.status);
       assert.strictEqual(up.st.headers[0].authorization, 'Bearer sk-only-one', '单 Key 仍按旧路径使用');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // ================= 2026-09-22：amd 实测事故（换机后 deepseek-v4.1-flash 永远选不上 amd）=================
+  // 现象：每个请求都 `skip amd (breaker open)` → 落到 workbuddy。根因两条，各配一个回归：
+  //   ① 半开探测超时被 Math.min 压到 10s，而该模型首字节稳定 13.7–15.5s → 探测必然超时
+  //      → 熔断重新 open → 退避递增 → **永远无法恢复**（配了 timeoutMs 也没用）；
+  //   ② 上游 429 是**模型级**并发上限，旧实现按账户级冷却 → 该 Key 上其它正常模型被连坐 90s。
+
+  t('熔断探测超时：供应商显式声明 timeoutMs 时，半开探测不再被压到 10s（否则慢家永远无法恢复）', async () => {
+    // 假上游：前 2 次快速失败（把 dead 推进熔断），之后"恢复"但**响应很慢**（首字节 1.2s）。
+    // 探测超时压到 10s 的旧实现下，只要把探测超时设小就能复现同样的死循环；
+    // 这里用 DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS=300 模拟"探测超时 < 首字节"。
+    const up = await startFakeUpstream({ status: 500 });
+    const gw = await startGatewayWith([providerOf('slowp', up, { priority: 1, timeoutMs: 5000 })], 'probetimeout', {
+      DSH_GATEWAY_BREAKER_SHORT_MS: '300', DSH_GATEWAY_BREAKER_PROBE_TIMEOUT_MS: '300',
+    });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // 连打几次把熔断打开（阈值 3）
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const log1 = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/breaker OPEN/.test(log1), '应已开闸：' + log1.slice(-300));
+      // 等冷却到点，让上游"恢复"但变慢（首字节 1.2s > 探测超时 300ms）
+      up.st.status = 200;
+      up.st.delayMs = 1200;
+      await sleep(400);
+      let ok = 0;
+      for (let i = 0; i < 8 && !ok; i++) {
+        const r = await call({ port: gw.port });
+        if (r.status === 200) ok = 1;
+        else await sleep(400);
+      }
+      // 关键断言：**显式 timeoutMs=5000 必须让探测有 5 秒**，所以 1.2s 的慢响应不该被判超时。
+      // 旧实现（Math.min → 300ms）下这里必然失败。
+      assert.strictEqual(ok, 1, '声明了 timeoutMs 的供应商，半开探测应按该超时执行（1.2s 慢响应应成功）');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('账户冷却模型级：某模型的 429 不连坐同 Key 上其它模型（amd 两把 Key 实测事故）', async () => {
+    // 上游：对 model-a 回 429（模型级并发上限），对 model-b 正常
+    const st429 = { calls: 0 };
+    const server = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        st429.calls++;
+        let body = null;
+        try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'); } catch { /* 忽略 */ }
+        if (body && body.model === 'model-a') {
+          res.writeHead(429, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ detail: { error: { message: "Model 'model-a' is at its concurrency limit (32); please retry later or use another model", type: 'rate_limit_error' } } }));
+          return;
+        }
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.end('data: {"choices":[{"delta":{"content":"ok"},"index":0}]}\n\ndata: [DONE]\n\n');
+      });
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+    const up = { port, st: st429, server };
+    const gw = await startGatewayWith([
+      openaiProvider('amdl', up, { models: ['model-a', 'model-b'], priority: 1, apiKeys: ['sk-1', 'sk-2'] }),
+    ], 'modelcool');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // ① 打 model-a → 429 → 两把 Key 都标记（模型级冷却）
+      const r1 = await call({ port: gw.port, p: '/v1/messages', body: { model: 'model-a', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.ok(r1.status >= 400, 'model-a 限流应失败，实际 ' + r1.status);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/模型 model-a 标记为 rate/.test(logText),
+        '限流日志应标明是**模型级**冷却：' + logText.slice(-500));
+      // /health：账户级应仍是 ok（不把"某模型限流"误报成"整把 Key 不可用"），模型级单独列出
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      const acctLevel = (h.accounts || []).filter((a) => !a.modelScoped);
+      assert.ok(acctLevel.every((a) => a.state === 'ok'),
+        'model-a 限流不得把账户级状态改成冷却（会连坐其它模型）：' + JSON.stringify(acctLevel));
+      const ms = (h.accounts || []).filter((a) => a.modelScoped);
+      assert.ok(ms.length > 0 && ms.every((a) => a.model === 'model-a'),
+        '/health 应把模型级冷却单独列出并标注模型：' + JSON.stringify(ms));
+      // ② 打 model-b：同一把 Key、同一供应商 —— 不该被 model-a 的限流连坐
+      const r2 = await call({ port: gw.port, p: '/v1/messages', body: { model: 'model-b', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r2.status, 200, 'model-b 不该被 model-a 的限流连坐（旧实现按账户级冷却 90s），实际 ' + r2.status + ' ' + String(r2.text).slice(0, 200));
+    } finally { killGw(gw); try { server.close(); } catch { /* 忽略 */ } }
+  });
+
+  t('账户冷却账户级：额度耗尽（402）仍是账户级，会连坐该 Key 的所有模型', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true, script: ['credit', 'ok'] });
+    const gw = await startGatewayWith([
+      openaiProvider('amdc', up, { models: ['m1', 'm2'], priority: 1, apiKeys: ['sk-1', 'sk-2'] }),
+    ], 'creditcool');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      await call({ port: gw.port, p: '/v1/messages', body: { model: 'm1', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      // 402 是"整把 Key 都没额度"，必须仍是账户级（不带"模型"字样）
+      assert.ok(/标记为 credit/.test(logText), '应标记为 credit：' + logText.slice(-400));
+      assert.ok(!/模型 m1 标记为 credit/.test(logText),
+        '额度耗尽不该退化成模型级（整把 Key 都不可用）：' + logText.slice(-400));
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      const cooling = (h.accounts || []).filter((a) => !a.modelScoped && a.state === 'credit');
+      assert.ok(cooling.length >= 1, '额度耗尽应体现在账户级状态上：' + JSON.stringify(h.accounts));
     } finally { killGw(gw); closeUp(up); }
   });
 
@@ -2292,6 +2521,367 @@ let upstreamPort = 0;
       assert.ok(/try dualid for test-model \(anthropic\) → DeepSeek-V4-Flash-Vision-Exp/.test(logText),
         '日志应显示映射到 vision ID：' + logText.slice(-300));
     } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('多 Key：某把 Key 被上游 403（未授权）→ 换下一把 Key 成功，**不熔断整家**（2026-09-18 用户要求）', async () => {
+    const upPool = await startFakeOpenAIUpstream({ script: ['forbidden', 'ok'], json: true });
+    const gw = await startGatewayWith([
+      openaiProvider('mk403', upPool, { apiKeys: ['sk-bad-key', 'sk-good-key'] }),
+    ], 'multikey403');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '应换到第 2 把 Key 后成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(upPool.st.calls, 2, '同一供应商内应重试一次（换 Key），实际 ' + upPool.st.calls);
+      const used = upPool.st.headers.map((h) => h.authorization);
+      assert.strictEqual(used[0], 'Bearer sk-bad-key', '第一次应用第 1 把 Key：' + JSON.stringify(used));
+      assert.strictEqual(used[1], 'Bearer sk-good-key', '403 后必须换第 2 把 Key：' + JSON.stringify(used));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/标记为 session/.test(logText), '未授权的 Key 应被标记（session 冷却）：' + logText.slice(-400));
+      assert.ok(!/breaker OPEN/.test(logText),
+        '403 是 Key 级问题，**不得熔断整家**（旧实现会把整家断 30 分钟）：' + logText.slice(-300));
+    } finally { killGw(gw); closeUp(upPool); }
+  });
+
+  t('多 Key：所有 Key 都 403 时，才交给下一家供应商（不是第一把失败就换家）', async () => {
+    const upPool = await startFakeOpenAIUpstream({ behavior: 'forbidden' });
+    const upNext = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      openaiProvider('mk403all', upPool, { apiKeys: ['k1', 'k2', 'k3'], priority: 1 }),
+      providerOf('fallback403', upNext, { priority: 2 }),
+    ], 'multikey403b');
+    try {
+      const r = await call({ port: gw.port, p: '/v1/messages', body: { model: 'test-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] } });
+      assert.strictEqual(r.status, 200, '最终应由下一家服务，实际 ' + r.status);
+      assert.strictEqual(upPool.st.calls, 3, '该家 3 把 Key 必须**逐把试完**才换家，实际 ' + upPool.st.calls);
+      assert.strictEqual(upNext.st.calls, 1, '换家后应打下一家一次，实际 ' + upNext.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      // 契约：Key 级失败先在**家内**轮换；只有该家所有 Key 都不可用，才判该家不可用（长熔断）并换下一家
+      assert.ok(/provider mk403all 全部账户不可用/.test(logText),
+        '必须逐把 Key 试完后才判该家不可用：' + logText.slice(-400));
+      assert.ok(logText.indexOf('全部账户不可用') < logText.indexOf('try fallback403'),
+        '顺序必须是：先试完该家所有 Key → 再换下一家：' + logText.slice(-400));
+      assert.ok(/breaker OPEN: mk403all/.test(logText),
+        '所有 Key 都 403 = 该家确实不可用，应长熔断保护上游账号：' + logText.slice(-400));
+    } finally { killGw(gw); closeUp(upPool); closeUp(upNext); }
+  });
+
+  // ==================== 2026-09-23 审计修复回归 ====================
+
+  // D5：思维链字段名兼容。旧实现只认 reasoning_content（DeepSeek 系），而 OpenRouter 系
+  //（含 Cline，实测 delta.reasoning / delta.reasoning_details）用别的字段名 → 思维链被**静默丢弃**。
+  t('D5：上游用 reasoning / reasoning_details 时思维链不再丢失（OpenRouter/Cline 形态）', async () => {
+    // 专用假上游：只发 reasoning / reasoning_details（**不发** reasoning_content），模拟 Cline。
+    // 注意不能用 startFakeOpenAIUpstream({sseRaw})：那个分支会被 st.json 等前面的分支截胡。
+    const raw = [
+      'data: ' + JSON.stringify({ id: 'c1', choices: [{ index: 0, delta: { reasoning: '第一步：' } }] }) + '\n\n',
+      'data: ' + JSON.stringify({ id: 'c1', choices: [{ index: 0, delta: { reasoning_details: [{ type: 'reasoning.text', text: '先想一下' }] } }] }) + '\n\n',
+      'data: ' + JSON.stringify({ id: 'c1', choices: [{ index: 0, delta: { content: '答案是 42' } }] }) + '\n\n',
+      'data: ' + JSON.stringify({ id: 'c1', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n',
+      'data: [DONE]\n\n',
+    ].join('');
+    const upServer = http.createServer((req, res) => {
+      const ch = [];
+      req.on('data', (c) => ch.push(c));
+      req.on('end', () => {
+        upServer.st.calls++;
+        upServer.st.headers.push(req.headers);
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.end(raw);
+      });
+    });
+    upServer.st = { calls: 0, headers: [] };
+    await new Promise((r) => upServer.listen(0, '127.0.0.1', r));
+    const up = { server: upServer, st: upServer.st, port: upServer.address().port };
+
+    const gw = await startGatewayWith([openaiProvider('rc', up)], 'reasoning');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // 走 Anthropic 路径：thinking 块最容易断言（非流式聚合）
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '应成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const j = JSON.parse(r.text);
+      const think = (j.content || []).filter((b) => b.type === 'thinking');
+      assert.strictEqual(think.length, 1, '应产出 1 个 thinking 块（旧实现为 0 = 静默丢弃）：' + JSON.stringify(j.content));
+      assert.strictEqual(think[0].thinking, '第一步：先想一下', '思维链内容应按分片顺序拼接且不重复：' + think[0].thinking);
+      const text = (j.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
+      assert.strictEqual(text, '答案是 42', '正文应正常：' + text);
+      // 关键反证：不得因 reasoning 与 reasoning_details 同时存在而重复
+      assert.ok(!/第一步：第一步：/.test(think[0].thinking), '同一分片内两字段内容相同，不得相加导致重复');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // 需求2：Cline 客户端仿真。上游 api.cline.bot **完全裸头**会被 403 拒绝
+  //（实测 "only available via Cline product surfaces"），最小充分集是 X-CLIENT-TYPE。
+  // ① 主机名推断是纯函数，直接从源码提取后单测（不能真连 api.cline.bot——那会走公网）。
+  t('Cline 仿真：providerClientProfile 按 *.cline.bot 主机名推断（纯函数，从源码提取测试）', async () => {
+    const src = fs.readFileSync(MJS, 'utf8');
+    const start = src.indexOf('function providerClientProfile(provider) {');
+    assert.ok(start >= 0, '源码里应存在 providerClientProfile');
+    // 取到函数结束（下一个顶层 function 声明之前）
+    const rest = src.slice(start);
+    const endIdx = rest.indexOf('\n}\n');
+    assert.ok(endIdx > 0, '应能定位函数体结束');
+    const fnSrc = rest.slice(0, endIdx + 3);
+    // eslint-disable-next-line no-new-func
+    const providerClientProfile = new Function(fnSrc + '\nreturn providerClientProfile;')();
+
+    assert.strictEqual(providerClientProfile({ baseURL: 'https://api.cline.bot/api/v1' }), 'cline',
+      'api.cline.bot 应推断为 cline 仿真');
+    assert.strictEqual(providerClientProfile({ baseURL: 'https://www.cline.bot/v1' }), 'cline',
+      '*.cline.bot 子域也应推断为 cline');
+    assert.strictEqual(providerClientProfile({ baseURL: 'https://API.CLINE.BOT/api/v1' }), 'cline',
+      '主机名匹配应大小写不敏感');
+    assert.strictEqual(providerClientProfile({ baseURL: 'https://openrouter.ai/api/v1' }), '',
+      '非 cline 主机不应推断出仿真档');
+    assert.strictEqual(providerClientProfile({ baseURL: 'not-a-url' }), '',
+      '非法 baseURL 不得抛错（应返回空串）');
+    assert.strictEqual(providerClientProfile({ baseURL: 'https://api.cline.bot/v1', clientProfile: 'codex' }), 'codex',
+      '供应商显式声明应优先于主机名推断');
+  });
+
+  t('Cline 仿真：显式 clientProfile=cline 时发出完整 Cline 身份头（端到端）', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([
+      openaiProvider('cl2', up, { models: ['test-model'], clientProfile: 'cline' }),
+    ], 'clinesim2', null, { clientProfile: 'codex' });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '应成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const h = up.st.headers[0] || {};
+      assert.strictEqual(h['x-client-type'], 'cline-sdk', '必须发 X-CLIENT-TYPE: cline-sdk（上游硬门禁）：' + JSON.stringify(h));
+      assert.ok(/^Cline\//.test(String(h['user-agent'])), 'User-Agent 应为 Cline 形态（裸 UA 会被 403）：' + h['user-agent']);
+      assert.strictEqual(h['x-core-version'], '0.0.66', '应带 X-CORE-VERSION：' + h['x-core-version']);
+      assert.strictEqual(h['x-platform'], 'terminal', '应带 X-PLATFORM：' + h['x-platform']);
+      assert.strictEqual(h['http-referer'], 'https://cline.bot', '应带 HTTP-Referer：' + h['http-referer']);
+      assert.strictEqual(h['x-is-multiroot'], 'false', '应带 X-IS-MULTIROOT：' + h['x-is-multiroot']);
+      // 全局 clientProfile=codex 不应泄漏到这家（逐家仿真优先）
+      assert.ok(!/codex/i.test(String(h['user-agent'])), '不得把全局 codex 仿真串到 cline 家：' + h['user-agent']);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('Cline 仿真：供应商显式 clientProfile 覆盖主机名推断；非 cline 家不受影响', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    // 主机名不是 cline.bot，但显式声明 clientProfile=cline → 应生效
+    const gw = await startGatewayWith([
+      openaiProvider('explicit', up, { clientProfile: 'cline' }),
+    ], 'clineexp');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200, '应成功，实际 ' + r.status);
+      const h = up.st.headers[0] || {};
+      assert.strictEqual(h['x-client-type'], 'cline-sdk',
+        '显式 clientProfile=cline 应覆盖主机名推断：' + JSON.stringify(h));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // D2：旧实现把 breakerRecordSuccess 放在 SSE 偷看**之前**，于是"HTTP 200 + 首事件是 error"
+  // 那条路径上的 breakerRecordFail 拿到的是被清零后的新条目 → fails 恒为 1 → **永不开闸**。
+  t('D2：HTTP 200 + SSE 首事件是错误 → 连续 3 次后确实开闸（旧实现熔断器完全失效）', async () => {
+    const raw = 'event: error\ndata: ' + JSON.stringify({ error: { message: 'Service temporarily unavailable' } }) + '\n\n';
+    // 专用假上游（同上：sseRaw 分支会被 startFakeOpenAIUpstream 前面的分支截胡）
+    const upServer = http.createServer((req, res) => {
+      const ch = [];
+      req.on('data', (c) => ch.push(c));
+      req.on('end', () => {
+        upServer.st.calls++;
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+        res.end(raw);
+      });
+    });
+    upServer.st = { calls: 0 };
+    await new Promise((r) => upServer.listen(0, '127.0.0.1', r));
+    const up = { server: upServer, st: upServer.st, port: upServer.address().port };
+
+    const up2 = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      openaiProvider('sse200', up, { priority: 1 }),
+      providerOf('fb', up2, { priority: 2 }),
+    ], 'd2breaker');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/breaker OPEN: sse200/.test(logText),
+        '连续 3 次"200+错误SSE"后应开闸（旧实现 fails 恒为 1、永不开闸）：' + logText.slice(-500));
+    } finally { killGw(gw); closeUp(up); closeUp(up2); }
+  });
+
+  // D1：半开探测名额泄漏 → 该家永久卡在 half-open（breakerIsOpen 恒真）再也选不中。
+  // 原始泄漏点是 forward() 的 accountScoped 分支（账户级失败 → 直接 return，不释放名额）。
+  // 观测量设计：用**模型级**限流（429 → rate 冷却只作用于该模型）触发账户级失败分支，
+  // 这样换一个模型请求时账户仍可用 → 会真正走到 forward()，从而暴露熔断状态是否卡死。
+  //（若用 402 额度耗尽，则是账户级冷却 1800s，后续请求根本到不了 forward()，测不出熔断状态。）
+  t('D1：账户级失败后释放半开名额（旧实现会让该家永久卡死，只能重启恢复）', async () => {
+    const up = await startFakeOpenAIUpstream({
+      script: ['err500', 'err500', 'err500', 'rate429', 'rate429', 'rate429', 'ok', 'ok'],
+    });
+    const prov = openaiProvider('leak', up, { priority: 1, apiKeys: ['k1'], models: ['test-model', 'test-model-2'] });
+    const gw = await startGatewayWith([prov], 'd1leak', { DSH_GATEWAY_BREAKER_SHORT_MS: '500' });
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      // ① 3 次 500 → 开闸
+      for (let i = 0; i < 3; i++) await call({ port: gw.port });
+      let logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/breaker OPEN: leak/.test(logText), '应先开闸：' + logText.slice(-400));
+
+      // ② 冷却到点（压到 500ms）→ 放行半开探测；该次探测返回 429
+      //    → 账户级失败分支（模型级冷却）→ 必须释放半开名额
+      await new Promise((r) => setTimeout(r, 900));
+      await call({ port: gw.port });
+      logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/breaker HALF-OPEN: leak/.test(logText), '冷却到点应放行半开探测：' + logText.slice(-400));
+      assert.ok(/判定为账户级失败/.test(logText), '该次探测应被判为账户级失败（触发泄漏分支）：' + logText.slice(-400));
+
+      // ③ 关键断言：换一个模型请求（该账户对它有可用性）→ 必须**再次进入** forward()
+      //    旧实现名额未释放 → 这里会打 `skip leak (breaker ...)`，永远不再尝试。
+      const callsBefore = up.st.calls;
+      await call({ port: gw.port, body: { model: 'test-model-2', messages: [{ role: 'user', content: 'hi' }] } });
+      const after = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!/skip leak \(breaker/.test(after.slice(after.indexOf('判定为账户级失败'))),
+        '账户级失败后不得再出现 skip ...(breaker)（旧实现名额泄漏 → 永久 half-open）：' + after.slice(-500));
+      assert.ok(up.st.calls > callsBefore,
+        '该家必须被再次真正请求（名额已释放），实际上游调用数 ' + callsBefore + ' → ' + up.st.calls);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // D6：账户失败原因未脱敏 → 用户统一网关 key 可能明文进 /health（免鉴权）与日志。
+  t('D6：账户失败原因必须脱敏（上游回显 Authorization 时不得把 key 写进 /health）', async () => {
+    const leaky = 'Bearer ' + GATEWAY_KEY;   // 模拟上游把收到的 Authorization 回显在错误体里
+    const up = await startFakeOpenAIUpstream({ behavior: 'credit', errorBody: { error: { message: 'insufficient credit: ' + leaky } } });
+    const gw = await startGatewayWith([openaiProvider('mask', up, { apiKeys: ['k1'] })], 'd6mask');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!logText.includes(leaky), '日志不得含明文 Authorization 值：' + logText.slice(-400));
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      const reasons = JSON.stringify(h.accounts || []);
+      assert.ok(!reasons.includes(leaky), '/health 的 reason 不得含明文 Authorization 值：' + reasons);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // D7：/v1/responses 路径的 quirks 曾全部失效（门控排除 responsesMode）
+  t('D7：/v1/responses 路径也应用 stringify-tool-choice（旧实现该路径 quirks 全失效）', async () => {
+    const up = await startFakeOpenAIUpstream({ json: true });
+    const gw = await startGatewayWith([
+      openaiProvider('resp', up, { protocol: 'openai-chat', quirks: ['stringify-tool-choice'] }),
+    ], 'd7resp');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/responses',
+        body: {
+          model: 'test-model', input: 'hi',
+          tool_choice: { type: 'function', function: { name: 'get_weather' } },
+          tools: [{ type: 'function', name: 'get_weather', parameters: { type: 'object', properties: {} } }],
+        },
+      });
+      // 只要上游被调用就说明路径通了；关键是发出去的 tool_choice 必须是字符串
+      assert.ok(up.st.calls >= 1, '上游应被调用，实际 ' + up.st.calls + ' 客户端状态 ' + r.status);
+      const sent = up.st.bodies[0] || {};
+      if (sent.tool_choice !== undefined) {
+        assert.strictEqual(typeof sent.tool_choice, 'string',
+          'Responses 路径的 tool_choice 也应被 stringify（旧实现为对象 → 上游 400）：' + JSON.stringify(sent.tool_choice));
+      }
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // D11：readTextWithTimeout 曾"读完整个响应体再截断"，limit 形同虚设
+  t('D11：上游超大错误体只读前 500 字符即停（旧实现先读完整 body 再截断）', async () => {
+    // 上游返回 8MB 错误体；网关只应读前 500 字符。若旧行为，仍会返回（但内存峰值 8MB+）。
+    // 这里断言"能快速返回且错误处理正确"，作为行为护栏。
+    const big = 'x'.repeat(2 * 1024 * 1024);
+    const up = await startFakeOpenAIUpstream({ behavior: 'big400', bigBody: { error: { message: big } } });
+    const gw = await startGatewayWith([openaiProvider('big', up)], 'd11big');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const t0 = Date.now();
+      const r = await call({ port: gw.port });
+      const ms = Date.now() - t0;
+      assert.ok(ms < 15000, '超大错误体不应拖慢处理（读满即停）：' + ms + 'ms');
+      assert.ok(r.status >= 400, '应把上游错误如实处理，实际 ' + r.status);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      // 日志里只该有截断后的片段（500 字符上限），不应出现完整 2MB
+      assert.ok(!logText.includes(big), '日志不得含完整超大错误体：' + logText.length + ' 字符');
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // 执行
+  // 2026-09-23 实测事故：上游说"**这家**没有这个模型"，旧实现当"请求本身有错"终止 failover，
+  // 用户直接拿到 400 —— 而同一逻辑模型在下一家完全可用。
+  // 关键区分：换下一家有意义（供应商侧问题） vs 换也没用（参数/体积类请求错误）。
+  t('上游回"这家没有该模型"→ 继续 failover（不再终止；amd 实测形态）', async () => {
+    // amd 的真实措辞（400，注意是 "not supported" 不是 "unsupported"）
+    const up1 = await startFakeUpstream({
+      status: 400,
+      errorBody: { error: { message: 'Requested model test-model not supported', type: 'invalid_request_error', param: null, code: null } },
+    });
+    const up2 = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('nomodel', up1, { priority: 1 }),
+      providerOf('good', up2, { priority: 2 }),
+    ], 'unsup');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 200,
+        '应由下一家服务（旧实现终止 failover 回 400）：' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(up1.st.calls, 1, '第一家只应被尝试一次，实际 ' + up1.st.calls);
+      assert.ok(up2.st.calls >= 1, '必须换到下一家，实际 ' + up2.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/这家没有该模型/.test(logText), '日志应说明判定为"这家没有该模型"：' + logText.slice(-400));
+      // 关键：不得熔断该家（熔断是按供应商粒度，该家对别的模型可能正常 → 连坐）
+      assert.ok(!/breaker OPEN: nomodel/.test(logText),
+        '不得因"没有这个模型"熔断整家（会连坐该家其它模型）：' + logText.slice(-400));
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('对照：真正的"请求本身有错"（参数非法）仍终止 failover（不 N 倍重发）', async () => {
+    const up1 = await startFakeUpstream({
+      status: 400,
+      errorBody: { error: { message: 'invalid temperature: must be <= 2' } },
+    });
+    const up2 = await startFakeUpstream({ status: 200 });
+    const gw = await startGatewayWith([
+      providerOf('badparam', up1, { priority: 1 }),
+      providerOf('good2', up2, { priority: 2 }),
+    ], 'badparam');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({ port: gw.port });
+      assert.strictEqual(r.status, 400, '参数错应原样回 400，实际 ' + r.status);
+      assert.strictEqual(up2.st.calls, 0,
+        '参数错不得重发给下一家（N 倍计费），实际 ' + up2.st.calls);
+    } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+  });
+
+  t('"这家没有该模型"的多种措辞都能识别（amd 400/404 与通用 unsupported）', async () => {
+    const variants = [
+      'Requested model test-model not supported',          // amd 400（Anthropic 形）
+      'Model test-model is not available',                 // amd 404 形态的措辞
+      'unsupported model: test-model',                     // 通用措辞
+      'model not offered by this provider',                // 通用措辞
+    ];
+    for (const [i, msg] of variants.entries()) {
+      const up1 = await startFakeUpstream({ status: 400, errorBody: { error: { message: msg } } });
+      const up2 = await startFakeUpstream({ status: 200 });
+      const gw = await startGatewayWith([
+        providerOf('v' + i, up1, { priority: 1 }),
+        providerOf('ok' + i, up2, { priority: 2 }),
+      ], 'unsupv' + i);
+      try {
+        assert.ok(gw.ready, '实例 ' + i + ' 应就绪');
+        const r = await call({ port: gw.port });
+        assert.strictEqual(r.status, 200, '措辞「' + msg + '」应继续 failover，实际 ' + r.status);
+        assert.ok(up2.st.calls >= 1, '措辞「' + msg + '」应换到下一家');
+      } finally { killGw(gw); closeUp(up1); closeUp(up2); }
+    }
   });
 
   // 执行
