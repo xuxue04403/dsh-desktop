@@ -266,6 +266,11 @@ Get-ChildItem $root -Recurse -File | ForEach-Object {
     if ($rel -like 'tests/*.tmp*') { return }
     if ($rel -like 'anywhere-lab-sdsh-desktop/*') { return }
     if ($rel -match '(^|/)node_modules/') { return }
+    # G1（v1.9.0 安全修复）：与 publish.mjs:293-297 对齐——一律不上传任何 `*.bak` 变体。
+    # `.bak-scrub` 是脱敏前的**原始值**备份（含真实邮箱/密钥），而本脚本的 `-Scrub` 恰好
+    # 会生成它；`.bak-nobom-*` / `.bak-version` 等同理。此前本脚本没有这条规则，
+    # 而 publish.mjs 早已有 → 构成"原始凭据经旧发布链外泄"的通道。
+    if ($rel -match '(^|/)[^/]*\.bak($|-)') { return }
 
     $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName))
     $uri = "https://api.github.com/repos/$login/$RepoName/contents/$rel"
