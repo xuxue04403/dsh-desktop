@@ -39,8 +39,18 @@ const PATH_BOUND = new Set([
   'market/bin/pnpm.cmd',
 ]);
 
+// 各目录**自己的运行参数**——永不复制。
+// settings.json 里含 `port`：实测 UAT 用 3081、主目录用 3080（用户有意区分），
+// 整份同步会把 UAT 的端口静默改回 3080（下次启动 dsh web 就换了端口，界面 URL/书签全变），
+// 而这不是"用户数据以主目录为准"的范畴——端口属于"这个实例怎么跑"。
+const NEVER_SYNC = new Set(['settings.json']);
+
 // 永不复制的前缀
-const EXCLUDE_PREFIX = ['node-global/'];
+// `gateway/` 是**派生的运行时副本**：data\gateway\model-gateway.mjs 每次应用启动都会由
+// gateway-manager.ensureRuntimeExtracted 从 asar 重新解包覆盖；workbuddy-auth\ 是刷新出的令牌副本。
+// 实测教训（2026-09-27）：把它一起同步后，UAT 的运行时副本被换成**主目录那份旧构建**的内容，
+// 与 UAT 自己的 asar 不一致 —— 校验直接报不一致，且要等下次启动才自愈。
+const EXCLUDE_PREFIX = ['node-global/', 'gateway/'];
 if (!INCLUDE_LOGS) EXCLUDE_PREFIX.push('logs/');
 
 if (!fs.existsSync(SRC)) { console.error('[FAIL] 源目录不存在: ' + SRC); process.exit(1); }
@@ -57,6 +67,7 @@ function walk(root) {
       const r = rel ? rel + '/' + e.name : e.name;
       if (EXCLUDE_PREFIX.some((p) => r.startsWith(p))) continue;
       if (PATH_BOUND.has(r)) continue;
+      if (NEVER_SYNC.has(r)) continue;
       const a = path.join(abs, e.name);
       if (e.isDirectory()) stack.push([r, a]);
       else if (e.isFile()) {
