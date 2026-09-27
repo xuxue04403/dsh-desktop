@@ -17,8 +17,16 @@ function tzOffsetMin() {
   if (v === 'local' || v === 'system') return null;
   const m = /^([+-])(\d{1,2})(?::?(\d{2}))?$/.exec(v);
   if (m) {
-    const mins = Number(m[2]) * 60 + Number(m[3] || 0);
-    return m[1] === '-' ? -mins : mins;
+    const hh = Number(m[2]);
+    const mm = Number(m[3] || 0);
+    // 第二轮审计修复：旧实现不校验范围 —— `+99:99` / `+24:00` 会被照单接受并直接参与
+    // `getTime() + off*60000`，日志时间静默偏移最多约 4 天，时间戳与真实事件顺序矛盾
+    //（正是本模块头注释里"排查先后顺序被严重误导"那类故障，只是换了个入口）。
+    // 现实时区范围是 UTC-12..+14，分钟必须 <60；越界一律回退缺省值。
+    if (hh <= 14 && mm <= 59) {
+      const mins = hh * 60 + mm;
+      return m[1] === '-' ? -mins : mins;
+    }
   }
   return 480;   // 缺省：北京时间
 }
