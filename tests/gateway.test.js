@@ -1418,6 +1418,7 @@ let upstreamPort = 0;
       withToolCall: !!opts.withToolCall,
       sseRaw: opts.sseRaw || null,        // 自定义 SSE 文本
       toolNameLate: !!opts.toolNameLate,  // 工具名在**后续分片**才到（真实上游常见）
+      parallelToolCalls: !!opts.parallelToolCalls,   // 两个工具调用的参数分片**交错**到达（第三轮回归）
     };
     const server = http.createServer((req, res) => {
       const chunks = [];
@@ -1458,6 +1459,13 @@ let upstreamPort = 0;
           res.end(JSON.stringify({ code: 0, msg: 'insufficient credit: 积分不足' }));
           return;
         }
+        if (behavior === 'sseCredit') {
+          // 第三轮回归：额度耗尽以 **HTTP 200 + SSE 首事件 error** 的形态返回
+          //（amd / cline 实测就是这种形态）→ 应判为**账户级**失败并换同供应商的下一把 Key
+          res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+          res.end('data: {"error":{"message":"credit insufficient balance: balance=0","type":"api_error"}}\n\n');
+          return;
+        }
         if (behavior === 'session') {
           res.writeHead(401, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ code: 0, msg: 'Offline user session not found 12153' }));
@@ -1491,7 +1499,15 @@ let upstreamPort = 0;
         chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { content: '你好' } }] });
         chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { content: '，世界' } }] });
         if (st.withToolCall) {
-          if (st.toolNameLate) {
+          if (st.parallelToolCalls) {
+            // 第三轮回归：**并行工具调用 + 交错分片**（A→B→A→B）。
+            // 这是 OpenAI 流式的常规形态。旧实现"边到边"写 input_json_delta 且用当前块号，
+            // 于是 A 的续片会落进 B 刚开的块 → 两边参数 JSON 都被污染。
+            chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_A', function: { name: 'get_weather', arguments: '{"city":' } }] } }] });
+            chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 1, id: 'call_B', function: { name: 'get_time', arguments: '{"tz":' } }] } }] });
+            chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: '"北京"}' } }] } }] });
+            chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 1, function: { arguments: '"UTC"}' } }] } }] });
+          } else if (st.toolNameLate) {
             // 真实上游常见形态：先给 id（无 name），名字与参数在后续分片到达
             chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: '', arguments: '' } }] } }] });
             chunk({ id: 'chatcmpl-1', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'get_weather' } }] } }] });
@@ -1852,6 +1868,37 @@ let upstreamPort = 0;
     } finally { killGw(gw); closeUp(upBad); closeUp(upGood); }
   });
 
+  // 第二轮审计修复：`HTTP 200 + SSE 首事件是错误` 曾被**无条件**判成"额度耗尽"——
+  // classifyAccountFailure 的第一句就是 `if (status === 402) return 'credit'`（只看状态码、
+  // 不看文案），所以 `classifyAccountFailure(200,detail) || classifyAccountFailure(402,detail)`
+  // 的**后半段恒为真**。后果：瞬时 503 / 上下文超限 / 不支持 thinking 这类与额度毫无关系的
+  // 错误，会把该 Key 按"额度耗尽"做**账户级 30 分钟冷却**（ACCOUNT_CREDIT_COOLDOWN_MS），
+  // 该 Key 上**所有模型**一起连坐。这里锁住"与额度无关的 200+SSE 错误不得标记 credit"。
+  t('第二轮：与额度无关的 200+SSE 错误不得把账户标记为 credit（旧实现恒判 credit → 全模型连坐 30 分钟）', async () => {
+    const errSse = 'data: {"error":{"message":"Service temporarily unavailable","type":"api_error"}}\n\n';
+    const up = await startFakeOpenAIUpstream({ sseRaw: errSse });
+    // 必须带账户池（apiKeys）才会走进"标记账户"的分支
+    const gw = await startGatewayWith([openaiProvider('sseAcct', up, { apiKeys: ['k1'] })], 'sseacct');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 503, '唯一候选失败应为 503，实际 ' + r.status + ' ' + r.text.slice(0, 160));
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      // 先证明"账户池确实生效"——否则 acct 恒为 null，标记分支根本不可达，本用例会退化成
+      // 永远通过的假绿灯（旧代码也不会标记）。
+      const mine = (h.accounts || []).filter((a) => a.provider === 'sseAcct');
+      assert.ok(mine.length >= 1, '本用例前提：apiKeys 应产出账户池条目，实际 ' + JSON.stringify(h.accounts));
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(!/标记为 credit/.test(logText),
+        '与额度无关的 SSE 错误不得标记账户为 credit（会全模型连坐 30 分钟）：' + logText.slice(-500));
+      const credit = (h.accounts || []).filter((a) => a.state === 'credit');
+      assert.strictEqual(credit.length, 0, '不应有账户处于 credit 冷却：' + JSON.stringify(h.accounts));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
   t('协议翻译：唯一候选 200+SSE error → 回网关自己的 503（不写 200 空回复）', async () => {
     const errSse = 'data: {"error":{"message":"Service temporarily unavailable"}}\n\n';
     const up = await startFakeOpenAIUpstream({ sseRaw: errSse });
@@ -2110,6 +2157,93 @@ let upstreamPort = 0;
         assert.ok(tu && tu.name === 'get_weather', '聚合路径同样要有正确的工具名：' + JSON.stringify(out.content));
         assert.deepStrictEqual(tu.input, { city: '北京' }, '聚合路径参数应完整：' + JSON.stringify(tu.input));
       } finally { killGw(gw2); closeUp(up2); }
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('第三轮：并行工具调用交错分片 → 每个 tool_use 块只拿到自己的参数（旧实现会串台）', async () => {
+    // 既存缺陷（第三轮审计发现）：旧实现一拿到 name 就开块、并**立即**用"当前块号"写
+    // input_json_delta。并行工具调用 A→B→A→B 交错时，A 的续片会写进 B 的块，
+    // 两边参数 JSON 都被污染（客户端 parse 失败 → 工具入参为空）。修法是延迟到流结束统一开块。
+    const up = await startFakeOpenAIUpstream({ withToolCall: true, parallelToolCalls: true });
+    const gw = await startGatewayWith([openaiProvider('par', up, { quirks: ['force-stream'] })], 'parallel');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 128, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const events = r.text.split(/\n\n/).map((blk) => (/^data:\s*(.*)$/m.exec(blk) || [])[1]).filter(Boolean)
+        .map((d) => { try { return JSON.parse(d); } catch { return null; } }).filter(Boolean);
+      // 按块号归集：content_block_start 记 name，content_block_delta 累积该块的 partial_json
+      const blocks = new Map();
+      for (const e of events) {
+        if (e.type === 'content_block_start' && e.content_block && e.content_block.type === 'tool_use') {
+          blocks.set(e.index, { name: e.content_block.name, args: '' });
+        } else if (e.type === 'content_block_delta' && e.delta && e.delta.type === 'input_json_delta') {
+          const b = blocks.get(e.index);
+          assert.ok(b, 'input_json_delta 必须落在已开启的 tool_use 块上（index=' + e.index + '）：' + r.text.slice(0, 400));
+          b.args += e.delta.partial_json;
+        }
+      }
+      const list = [...blocks.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+      assert.strictEqual(list.length, 2, '应恰好 2 个 tool_use 块：' + JSON.stringify(list));
+      assert.deepStrictEqual(list.map((b) => b.name), ['get_weather', 'get_time'],
+        '工具名应按槽位顺序且非空：' + JSON.stringify(list));
+      const parsed = list.map((b) => {
+        try { return JSON.parse(b.args); } catch (e) { return 'PARSE_FAIL:' + b.args; }
+      });
+      assert.deepStrictEqual(parsed[0], { city: '北京' },
+        '第 1 个块的参数被别的调用污染了（串台）：' + JSON.stringify(list));
+      assert.deepStrictEqual(parsed[1], { tz: 'UTC' },
+        '第 2 个块的参数被别的调用污染了（串台）：' + JSON.stringify(list));
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('第三轮：续片重复携带同一个非空 id 时不得分裂成多个槽（同一次调用只能有一个 tool_use）', async () => {
+    // 第三轮审计发现（我在第二轮引入的新失效模式）：toolCallSlot 原先只判断"有没有 id"，
+    // 续片若重复发同一个非空 id 会被当成"新调用"分配新槽 → 同一次调用的参数被切成多份，
+    // 产出多条 id 相同、参数各半截的 tool_call（下游按"重复 tool id"直接报错）。
+    const sse = 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_X","function":{"name":"get_weather","arguments":"{\\"city\\":"}}]}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_X","function":{"arguments":"\\"北京\\"}"}}]}}]}\n\n'
+      + 'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+      + 'data: [DONE]\n\n';
+    const up = await startFakeOpenAIUpstream({ sseRaw: sse });
+    const gw = await startGatewayWith([openaiProvider('dup', up, { quirks: ['force-stream'] })], 'dupid');
+    try {
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      const events = r.text.split(/\n\n/).map((blk) => (/^data:\s*(.*)$/m.exec(blk) || [])[1]).filter(Boolean)
+        .map((d) => { try { return JSON.parse(d); } catch { return null; } }).filter(Boolean);
+      const starts = events.filter((e) => e.type === 'content_block_start' && e.content_block && e.content_block.type === 'tool_use');
+      assert.strictEqual(starts.length, 1, '同一次调用只能开一个 tool_use 块：' + JSON.stringify(starts.map((e) => e.content_block)));
+      const args = events.filter((e) => e.type === 'content_block_delta' && e.delta && e.delta.type === 'input_json_delta')
+        .map((e) => e.delta.partial_json).join('');
+      assert.deepStrictEqual(JSON.parse(args), { city: '北京' }, '参数应拼成完整 JSON：' + args);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  t('第三轮：200+SSE 报额度耗尽 → 换同供应商的下一把 Key（旧实现只换下一家供应商）', async () => {
+    // 第三轮审计发现：该分支原为一律 `return false`（换下一家供应商），与函数契约
+    //（"额度耗尽/会话失效/限流 → 换同供应商的下一个账户"）及非 2xx 分支的 continue 不一致，
+    // 等于把多 Key 容灾在这条路径上废掉。文案用 b.ai 实测形态 "credit insufficient balance"
+    //（词序与旧正则的 "insufficient credit" 相反，也是本轮补的正则缺口）。
+    const up = await startFakeOpenAIUpstream({ script: ['sseCredit', 'ok'] });
+    const gw = await startGatewayWith([openaiProvider('ssekey', up, { apiKeys: ['k1', 'k2'] })], 'ssekey');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      const r = await call({
+        port: gw.port, p: '/v1/messages',
+        body: { model: 'test-model', max_tokens: 64, stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      });
+      assert.strictEqual(r.status, 200, '第二把 Key 应成功，实际 ' + r.status + ' ' + r.text.slice(0, 200));
+      assert.strictEqual(up.st.calls, 2, '应调用两次（第一把 Key 额度失败 → 换第二把 Key），实际 ' + up.st.calls);
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      assert.ok(/换同供应商的下一把 Key/.test(logText), '日志应记录换 Key：' + logText.slice(-500));
+      assert.ok(/标记为 credit/.test(logText), '应把该 Key 标记为 credit：' + logText.slice(-500));
     } finally { killGw(gw); closeUp(up); }
   });
 
@@ -2763,6 +2897,35 @@ let upstreamPort = 0;
       const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
       const reasons = JSON.stringify(h.accounts || []);
       assert.ok(!reasons.includes(leaky), '/health 的 reason 不得含明文 Authorization 值：' + reasons);
+    } finally { killGw(gw); closeUp(up); }
+  });
+
+  // P1（二次复核修复）：旧 maskSecrets 只认 sk-/dsh-gateway-/eyJ/api-key 头四类，
+  // 而本网关聚合的供应商里有大量**不属于这四类**的 key（nvidia 的 nvapi-、amd 的 rc-、
+  // x666/windhub/agentrouter 的随机串）。上游在错误体里回显凭证时，这些会明文落进
+  // logs/gateway.log，并经**免鉴权的 /health**（必须保持免鉴权：网关进程内自检就是无鉴权
+  // GET /health）的 reason 字段对外可见。这里锁住新增的三类兜底规则。
+  t('P1：非 sk- 前缀的凭证（nvapi-/rc-/裸 Bearer）也必须脱敏', async () => {
+    const leakyNv = 'nvapi-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456';
+    const leakyRc = 'rc-0123456789abcdef0123456789abcdef';
+    const leakyPlain = 'Authorization failed for key ZZZZ1111YYYY2222XXXX3333';
+    const body = { error: { message: `bad key ${leakyNv} / ${leakyRc} / ${leakyPlain}` } };
+    const up = await startFakeOpenAIUpstream({ behavior: 'credit', errorBody: body });
+    const gw = await startGatewayWith([openaiProvider('mask2', up, { apiKeys: ['k1'] })], 'p1mask');
+    try {
+      assert.ok(gw.ready, '独立网关实例应就绪');
+      await call({ port: gw.port });
+      const logText = fs.readFileSync(gw.logPath, 'utf8');
+      for (const leaky of [leakyNv, leakyRc, leakyPlain]) {
+        assert.ok(!logText.includes(leaky), '日志不得含明文凭证 ' + leaky + '：' + logText.slice(-400));
+      }
+      const h = JSON.parse((await call({ port: gw.port, method: 'GET', p: '/health', body: null, key: '' })).text);
+      const reasons = JSON.stringify(h.accounts || []);
+      for (const leaky of [leakyNv, leakyRc, leakyPlain]) {
+        assert.ok(!reasons.includes(leaky), '/health 的 reason 不得含明文凭证 ' + leaky + '：' + reasons);
+      }
+      // 关键：/health 仍须免鉴权可读（网关自带 watchdog 依赖它，加鉴权会导致自我判死）
+      assert.ok(Array.isArray(h.accounts), '/health 仍应免鉴权返回 accounts');
     } finally { killGw(gw); closeUp(up); }
   });
 
