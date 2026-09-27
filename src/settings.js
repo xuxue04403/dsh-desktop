@@ -28,6 +28,51 @@ const DEFAULTS = {
   safeModeNames: '',
 };
 
+// 设置键白名单 + 逐键类型（P0-3 修复）。
+// 旧实现是 `Object.assign(this.data, patch)`——**任意键、任意类型**都直接落盘。IPC 是公共
+// 入口，而 `workDir` 会直接成为 `dsh web` 子进程的 cwd（改变 dsh 可读写的文件树范围），
+// `safeMode`/`installDefaultPlugins` 会改变启动行为，`confirmQuitWhenBusy` 会静默关掉退出
+// 保护。渲染层正常只提交下面这些键，但守卫不该依赖"调用方都守规矩"。
+const BOOL_KEYS = ['autoStart', 'autoStartService', 'autoOpenBrowser', 'minimizeToTray',
+  'checkUpdates', 'installDefaultPlugins', 'trayBalloonShown', 'confirmQuitWhenBusy', 'safeMode'];
+const INT_KEYS = ['safeModeLevel', 'port'];
+const STR_KEYS = ['workDir', 'safeModeNames'];
+
+/**
+ * 过滤出可落盘的设置项（白名单 + 类型校验），未知键与非预期类型一律丢弃。
+ *
+ * @param {object} patch - 待应用的补丁。
+ * @param {(msg: string) => void} [onDrop] - 丢弃回调（用于把静默丢弃变成可见日志）。
+ * @returns {object} 只含合法键值的新对象。
+ */
+function sanitizePatch(patch, onDrop) {
+  const out = {};
+  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return out;
+  for (const k of Object.keys(patch)) {
+    if (!Object.prototype.hasOwnProperty.call(DEFAULTS, k)) {
+      if (onDrop) onDrop('未知设置键已忽略：' + k);
+      continue;
+    }
+    const v = patch[k];
+    if (BOOL_KEYS.includes(k)) {
+      if (typeof v === 'boolean') out[k] = v;
+      else if (onDrop) onDrop('设置 ' + k + ' 类型不符（需 boolean）已忽略');
+    } else if (INT_KEYS.includes(k)) {
+      // 接受整数或纯数字字符串（手改 settings.json 常写成 "3100"）；越界由下游
+      // 端口兜底统一处理（见 update()），这里只保证"是整数"。
+      const n = typeof v === 'number'
+        ? v
+        : (typeof v === 'string' && /^-?\d+$/.test(v.trim()) ? Number(v) : NaN);
+      if (Number.isInteger(n)) out[k] = n;
+      else if (onDrop) onDrop('设置 ' + k + ' 类型不符（需整数）已忽略');
+    } else if (STR_KEYS.includes(k)) {
+      if (typeof v === 'string') out[k] = v;
+      else if (onDrop) onDrop('设置 ' + k + ' 类型不符（需字符串）已忽略');
+    }
+  }
+  return out;
+}
+
 class Settings {
   constructor(userDataDir) {
     this.dir = userDataDir;
@@ -39,7 +84,9 @@ class Settings {
     try {
       if (fs.existsSync(this.file)) {
         const raw = JSON.parse(fs.readFileSync(this.file, 'utf8'));
-        Object.assign(this.data, DEFAULTS, raw);
+        // P0-3：手改 settings.json 同样过白名单与类型校验（否则 `"minimizeToTray": "false"`
+        // 这种字符串会被当真值使用，复选框状态与实际行为不一致）
+        Object.assign(this.data, DEFAULTS, sanitizePatch(raw));
       }
     } catch (err) {
       this.logError('settings load', err);
@@ -66,14 +113,23 @@ class Settings {
   save() {
     try {
       fs.mkdirSync(this.dir, { recursive: true });
-      fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2), 'utf8');
+      const text = JSON.stringify(this.data, null, 2);
+      // P0-3：原子写（tmp + rename）。旧实现直接 writeFileSync 覆盖，写入过程中断电/崩溃
+      // 会留下**半截 JSON**；而 load() 的 JSON.parse 失败被 logError 吞掉 → 静默退回全默认
+      // 值（端口回 3080、safeMode 丢失、已卸载的默认插件被重装）。网关配置早已用
+      // tmp+rename（gateway-manager.saveConfig），这里对齐。
+      const tmp = this.file + '.tmp';
+      fs.writeFileSync(tmp, text, 'utf8');
+      fs.renameSync(tmp, this.file);   // Windows 上 rename 会替换已存在的目标
     } catch (err) {
       this.logError('settings save', err);
     }
   }
 
   update(patch) {
-    Object.assign(this.data, patch);
+    // P0-3：白名单 + 类型校验后合并（丢弃项写日志，不静默）
+    const clean = sanitizePatch(patch, (m) => this.logError('settings update', new Error(m)));
+    Object.assign(this.data, clean);
     // 审计修复（P1）：端口在**写入路径**上就要兜底。旧版只在 load() 里校验，渲染层
     // 手填 99999 / 0 / 空串会原样落盘并被 launcher 拼进 `dsh web --port`（连不上端口 →
     // 走看门狗恢复），且 UI 显示与落盘值不一致。
@@ -96,4 +152,4 @@ class Settings {
   }
 }
 
-module.exports = { Settings, DEFAULTS };
+module.exports = { Settings, DEFAULTS, sanitizePatch };
