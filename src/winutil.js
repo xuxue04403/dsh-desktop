@@ -7,15 +7,25 @@
 // C:\WINDOWS\system32\cmd.exe）→ spawn 该路径 ENOENT，dsh 永远起不来。
 // 这里按"存在性校验 + 多候选回退"解析 cmd.exe，解析不到就返回 null，由调用方走无 broker 的
 // 直接启动路径（功能不受影响，只是少了"隐藏控制台宿主"这一层）。
+//
+// 第二轮审计修正（文档与实现对齐）：**实现不会返回 null** —— 最后一个候选是交给 PATH 解析的
+// `'cmd.exe'`（见下方 resolveCmdExe），因此在"所有绝对路径都不存在"的机器上它仍返回一个
+// 命令名而不是 null。调用方（launcher.js / market.js）里 `if (!cmdExe)` 的分支实际不可达；
+// 这是刻意保留的折中：改成返回 null 会切到无 broker 的直接启动路径，反而丢掉"隐藏控制台
+// 宿主"这一层（历史上弹黑窗的成因），而 spawn('cmd.exe') 真失败时调用方的 error 事件兜底
+// 会正常接管。若要恢复"返回 null"的语义，必须同时确认直接启动路径的控制台隐藏能力。
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
 
 /**
- * 解析可用的 cmd.exe 绝对路径（或 'cmd.exe' 交给 PATH 解析）；都没有则返回 null。
+ * 解析可用的 cmd.exe 绝对路径（或 'cmd.exe' 交给 PATH 解析）。
  * 候选顺序：ComSpec（**须存在**）→ %SystemRoot%\System32\cmd.exe → %windir%\System32\cmd.exe
  *          → C:\Windows\System32\cmd.exe → 'cmd.exe'（PATH 兜底）
+ *
+ * @returns {string} 命令名/绝对路径。**保证非空**（最差是 'cmd.exe'，交由 PATH 解析）——
+ *   调用方的 `if (!cmdExe)` 分支因此不可达，理由见文件头注释。
  */
 function resolveCmdExe() {
   const cands = [];
