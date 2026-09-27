@@ -127,7 +127,17 @@ function migrateGatewayConfig(portable, sources) {
       if (!probeWritable(portable)) return null;
       if (targetExists) {
         const bak = target + '.bak-mock';
-        try { if (!fs.existsSync(bak)) fs.copyFileSync(target, bak); } catch (_) { /* 备份失败继续 */ }
+        // P1（二次复核修复）：**备份失败必须中止覆盖**。旧实现是
+        // `catch (_) { /* 备份失败继续 */ }` 后直接 copyFileSync(from, target) —— 把目标文件
+        // 覆盖掉却**没有任何副本**，而覆盖不可逆。这里的目标虽已被判定为"模拟数据"，
+        // 但"没有备份就不可逆"不该赌：这次不迁移，下次启动还会再来。
+        try {
+          if (!fs.existsSync(bak)) fs.copyFileSync(target, bak);
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.log('[datadir] 备份失败，已中止覆盖（原文件与来源均不动）：' + (e && e.message ? e.message : e));
+          return null;
+        }
       }
       fs.copyFileSync(from, target);
       // R25（审计修复）：端口归一——桌面助手（3090）的真实配置迁入 dsh-app 时原样
