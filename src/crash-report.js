@@ -210,8 +210,12 @@ function record(source, error, extra) {
 /**
  * 清理旧报告，只保留最近 {@link MAX_KEEP} 份。
  *
- * 只删本模块自己产出的 `crash-*.log`（不碰目录里的其它文件），按文件名排序——
- * 文件名前缀就是时间戳，字典序即时间序，无需 stat。
+ * 只删本模块自己产出的 `crash-*.log`（不碰目录里的其它文件）。
+ *
+ * P1（二次复核修复）：**按 mtime 排序，不再按文件名排序**。旧实现依赖"字典序即时间序"，
+ * 但同毫秒撞名时 uniquePath 加的是 `-2 / -10` 后缀，字典序里 `'2' > '1'` 使 `-10` 排在
+ * `-2` **之前**；而且不带后缀的第一份（`…-345-main.log`）排在同毫秒全部分片**之后**。
+ * 结果是把**更新的**报告当成"最旧"删掉——恰好丢掉最原始那次故障，与该模块的设计初衷相反。
  *
  * @returns {number} 删除的份数。
  */
@@ -219,13 +223,18 @@ function prune() {
   if (!crashDir) return 0;
   try {
     const names = fs.readdirSync(crashDir)
-      .filter((n) => n.startsWith(CRASH_PREFIX) && n.endsWith(CRASH_SUFFIX))
-      .sort();
-    const excess = names.length - MAX_KEEP;
+      .filter((n) => n.startsWith(CRASH_PREFIX) && n.endsWith(CRASH_SUFFIX));
+    if (names.length <= MAX_KEEP) return 0;
+    const entries = [];
+    for (const n of names) {
+      try { entries.push({ n, t: fs.statSync(path.join(crashDir, n)).mtimeMs }); } catch (_) { /* 单个取不到 → 跳过 */ }
+    }
+    entries.sort((a, b) => a.t - b.t);   // 旧 → 新
+    const excess = entries.length - MAX_KEEP;
     if (excess <= 0) return 0;
     let removed = 0;
-    for (const n of names.slice(0, excess)) {
-      try { fs.rmSync(path.join(crashDir, n), { force: true }); removed++; } catch (_) { /* 忽略 */ }
+    for (const e of entries.slice(0, excess)) {
+      try { fs.rmSync(path.join(crashDir, e.n), { force: true }); removed++; } catch (_) { /* 忽略 */ }
     }
     return removed;
   } catch (_) {
