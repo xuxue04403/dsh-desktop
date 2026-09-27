@@ -130,7 +130,12 @@ async function primeSessionCookie(session, authUrl, log) {
         path: c.path || '/',
         httpOnly: !!c.httpOnly,
         secure: !!c.secure,
-        sameSite: c.sameSite || 'unspecified',
+        // 第三轮审计修复：**缺失时收紧为 strict，而不是 unspecified**。
+        // 实测 dsh 签发的是 `HttpOnly; SameSite=Strict`，但这依赖上游不回归；一旦哪天
+        // 少了 SameSite，`unspecified` 会被 Chromium 按 Lax 处理，页面内脚本（dsh 页面里
+        // 还有第三方插件的客户端脚本）就更容易带着会话 cookie 发起跨站请求。
+        // 收紧只会影响"服务端没明说"这一种情况，服务端明说了就照它。
+        sameSite: c.sameSite || 'strict',
       };
       if (c.expirationDate !== undefined) spec.expirationDate = c.expirationDate;
       await jar.set(spec);
@@ -161,7 +166,11 @@ async function primeSessionCookie(session, authUrl, log) {
 function targetUrl(primed, authUrl) {
   if (!primed) return authUrl;
   try {
-    return new URL(authUrl).origin + '/';
+    const u = new URL(authUrl);
+    // P1（二次复核修复）：**保留原 pathname**。旧实现返回 `origin + '/'`，一旦 dsh 把界面
+    // 挂在非根路径（或就绪行带路径前缀）就会加载到 404 页，而调用方在 webAuthPrimed 为真时
+    // 不会回退带令牌 URL → 用户只看到白屏，只能整目录重来。
+    return u.origin + (u.pathname || '/');
   } catch (_) {
     return authUrl;   // URL 解析不了就老实回退，绝不构造一个猜出来的地址
   }
