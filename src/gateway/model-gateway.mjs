@@ -516,12 +516,26 @@ function breakerCooldownSecs(providers) {
 
 // V1 防封：日志脱敏——catalog/上游错误体可能回显 key，统一打码各类凭证片段
 // R25（审计）：补 Bearer/JWT(eyJ)/统一网关 key（dsh-gateway-）与 api-key 头形态
+// P1（二次复核修复）：旧规则只认 4 类前缀（sk- / dsh-gateway- / eyJ / api-key 头），
+// 而本网关聚合的供应商里大量 key **不属于这 4 类**——nvidia 的 `nvapi-…`、amd 的 `rc-…`、
+// x666/windhub/agentrouter 的纯随机串、WorkBuddy 的 OAuth token。上游在 401/403/400
+// 响应体里回显收到的凭证是常见实现，一旦命中就会**明文落进 logs/gateway.log，并经免鉴权的
+// /health 的 reason 字段对外可见**（/health 必须保持免鉴权：网关进程内自检 watchdog 就是
+// 无鉴权 GET /health，加鉴权会让它把自己判死并自杀重启）。
+// 因此这里补三类兜底：可识别前缀（nvapi-/rc-）、带关键词的赋值形态、裸 Bearer/Basic。
 function maskSecrets(text) {
   return String(text || '')
-    .replace(/sk-[A-Za-z0-9_\-]{8,}/g, (m) => `sk-***${m.slice(-4)}`)
+    .replace(/\bsk[-_][A-Za-z0-9_\-]{8,}/g, (m) => `sk-***${m.slice(-4)}`)
+    .replace(/\bnvapi-[A-Za-z0-9_\-]{8,}/g, (m) => `nvapi-***${m.slice(-4)}`)   // NVIDIA NIM
+    .replace(/\brc-[A-Za-z0-9]{8,}/g, (m) => `rc-***${m.slice(-4)}`)            // AMD Radeon Cloud
     .replace(/dsh-gateway-[A-Za-z0-9_\-]{8,}/g, (m) => `dsh-gateway-***${m.slice(-4)}`)
     .replace(/eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}/g, 'eyJ***.***.***')  // JWT
-    .replace(/((?:x-api-key|api-key|authorization)["':\s=]+)(Bearer\s+)?([^\s"',}]+)/gi, (m, p1, p2) => p1 + (p2 || '') + '***');
+    // 关键词赋值形态（不限前缀）：apiKey/token/secret/password … = <长串>
+    .replace(/((?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|refresh[_-]?token|token|secret|password|passwd)["']?\s*[:=]\s*["']?)([A-Za-z0-9._+/=\-]{12,})/gi, '$1***')
+    .replace(/((?:x-api-key|api-key|authorization)["':\s=]+)(Bearer\s+)?([^\s"',}]+)/gi, (m, p1, p2) => p1 + (p2 || '') + '***')
+    // 裸 Bearer/Basic 兜底：上游回显鉴权头时未必带 "authorization" 关键词
+    //（实测语境形如 `Authorization failed for key <token>`）
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._+/=\-]{12,}/gi, '$1 ***');
 }
 
 async function fetchCatalog(provider, force, clientUA, clientProfile) {
@@ -1731,6 +1745,7 @@ async function aggregateOpenAIStream(upstream, headBytes) {
   let finish = null;
   let usage = null;
   const toolCalls = new Map();
+  const toolCallState = { last: 0 };   // 第二轮审计修复：缺 index 的分片按"新调用/续片"分流，不再一律落 0
   const feed = (text) => {
     buf += text;
     let nl;
@@ -1751,7 +1766,7 @@ async function aggregateOpenAIStream(upstream, headBytes) {
       if (typeof d.content === 'string') content += d.content;
       reasoning += reasoningTextOf(d);   // D5：兼容 reasoning_content / reasoning / reasoning_details
       for (const call of Array.isArray(d.tool_calls) ? d.tool_calls : []) {
-        const idx = Number.isInteger(call.index) ? call.index : 0;
+        const idx = toolCallSlot(call, toolCalls, toolCallState);
         const entry = toolCalls.get(idx) || { id: '', type: 'function', function: { name: '', arguments: '' } };
         if (call.id) entry.id = call.id;
         if (call.function && call.function.name) entry.function.name = call.function.name;
@@ -1791,7 +1806,11 @@ async function aggregateOpenAIStream(upstream, headBytes) {
 }
 
 /** 账户级失败判定（额度耗尽 / 会话失效 / 限流）——决定"换账户"而不是"换供应商" */
-const WORKBUDDY_CREDIT_RE = /insufficient credit|no credit|credit exhausted|credits exhausted|out of credit|quota exceeded|quota exhaust|payment required|credit not enough|not enough credit|积分不足|额度不足|余额不足|积分用完|额度用尽|没有积分/i;
+// 第三轮审计补强：补上真实中转常见的**词序变体与形态** ——
+// 实测事故（2026-09-15）是 b.ai 回 `credit insufficient balance: balance=0`，
+// 而原正则只有 `insufficient credit`（词序相反）；另有 `insufficient_balance`、
+// `insufficient_user_quota`、`You exceeded your current quota` 等 new-api/one-api 措辞。
+const WORKBUDDY_CREDIT_RE = /insufficient credit|credit insufficient|no credit|credit exhausted|credits exhausted|out of credit|quota exceeded|quota exhaust|payment required|credit not enough|not enough credit|insufficient[_ ]?balance|insufficient[_a-z]*quota|exceeded\s+your\s+(?:current\s+)?quota|积分不足|额度不足|余额不足|积分用完|额度用尽|没有积分/i;
 const WORKBUDDY_SESSION_RE = /Offline user session not found|12153|session not found|login expired|重新登录/i;
 function classifyAccountFailure(status, detail) {
   if (status === 402) return 'credit';
@@ -2994,9 +3013,58 @@ function anthropicPartsToOpenAI(content) {
 function toolResultText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
-    return content.map((b) => (b && b.type === 'text' && typeof b.text === 'string' ? b.text : '')).join('');
+    // 第二轮审计修复：非文本块旧实现映射成空串 → 工具返回图片时模型只看到"空结果"，
+    // 会误判工具失败或反复重试。用占位符保留"有内容但不是文本"这一信息。
+    return content.map((b) => {
+      if (!b || typeof b !== 'object') return '';
+      if (b.type === 'text' && typeof b.text === 'string') return b.text;
+      if (b.type === 'image') return '[image]';
+      return '';
+    }).join('');
   }
   return '';
+}
+
+/**
+ * 解析 tool_calls 分片应落入的槽位（第二轮审计修复）。
+ *
+ * 背景：OpenAI 规范要求**每个**分片都带 `index`，但自建/中转上游常只在首个分片带 `id`、
+ * 后续参数分片既无 index 也无 id。旧实现是 `Number.isInteger(call.index) ? call.index : 0`，
+ * 把这类分片**一律归到槽位 0**：多个工具调用会挤进同一条（id/name 被后来者覆盖、arguments
+ * 拼成非法 JSON），聚合路径解析失败后还会退化成空 input，客户端拿到参数错乱的 tool_use。
+ *
+ * 规则（按可靠性排序）：
+ *   ① `index` 是整数（或纯数字字符串）→ 直接用它，并记为"上次槽位"；
+ *   ② 分片带非空 `id` → 视为**新调用**，分配下一个未占用槽位；
+ *   ③ 两者都没有 → 视为**上一个槽位的续片**（首个分片之前则用 0）。
+ *
+ * @param {object} call - 单个 tool_calls 分片。
+ * @param {Map<number, object>} toolCalls - 已建立的槽位表。
+ * @param {{ last: number }} state - 跨分片状态（记录上次落位的槽位）。
+ * @returns {number} 槽位下标。
+ */
+function toolCallSlot(call, toolCalls, state) {
+  const raw = call && call.index;
+  const n = typeof raw === 'number'
+    ? raw
+    : (typeof raw === 'string' && /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : NaN);
+  if (Number.isInteger(n) && n >= 0) { state.last = n; return n; }
+  const id = call && typeof call.id === 'string' ? call.id : '';
+  if (id) {
+    // 第三轮审计修复：**先按 id 归并**。只判断"有没有 id"是不够的 —— 上游在**续片**里
+    // 重复发同一个非空 id 时（规范只要求首片带 id，但并非所有上游都遵守），旧逻辑会
+    // 把它当成"新调用"而分配新槽位，同一次调用的 arguments 被切进多个槽：
+    // 聚合路径产出多条 id 相同、参数各半截的 tool_calls（JSON.parse 必失败），
+    // 流式路径还会给空名槽开出 `unknown tool ""`。按 id 归并即可让续片回到自己的槽位。
+    for (const [k, e] of toolCalls) {
+      if (e && e.id === id) { state.last = k; return k; }
+    }
+    let next = 0;
+    for (const k of toolCalls.keys()) { if (k >= next) next = k + 1; }
+    state.last = next;
+    return next;
+  }
+  return Number.isInteger(state.last) ? state.last : 0;
 }
 
 /**
@@ -3049,10 +3117,14 @@ function anthropicToOpenAIRequest(body, provider) {
     for (const b of content) {
       if (b && b.type === 'tool_result') {
         if (droppedToolIds.has(String(b.tool_use_id || ''))) continue;   // 对应的 tool_use 已被丢弃 → 不留孤儿子消息
+        // 第二轮审计修复：保留 is_error 语义。OpenAI 的 role:'tool' 没有该字段，旧实现直接
+        // 丢掉 → 模型可能把**失败的工具调用当成成功**（然后基于错误结果继续推理）。
+        // 约定俗成的降级做法是把错误标记前置到 content 里。
+        const text = toolResultText(b.content);
         messages.push({
           role: 'tool',
           tool_call_id: String(b.tool_use_id || ''),
-          content: toolResultText(b.content),
+          content: b.is_error ? '[tool_error] ' + (text || '(no output)') : text,
         });
       }
     }
@@ -3064,9 +3136,13 @@ function anthropicToOpenAIRequest(body, provider) {
 
   const out = {
     model: body.model,
-    max_tokens: body.max_tokens,
     messages,
   };
+  // 第二轮审计修复：Anthropic 协议规定 max_tokens 必填，但网关只校验 model；
+  // 客户端漏传时 `max_tokens: undefined` 会被 JSON.stringify **整个丢掉该键**，
+  // 而部分 OpenAI 上游对缺键直接 400。给一个保守兜底（4096），仅缺失时生效。
+  const maxTokens = Number(body.max_tokens);
+  out.max_tokens = Number.isFinite(maxTokens) && maxTokens > 0 ? maxTokens : 4096;
   if (droppedCount) {
     // 去重（2026-09-17）：同一段坏历史会在**每个请求**上重复命中（实测 165 行/天，淹没有效日志）。
     // 丢弃行为不受影响，只是告警改成"首次 + 每 100 次汇总一行"。
@@ -3101,7 +3177,12 @@ function anthropicToOpenAIRequest(body, provider) {
   const th = body.thinking;
   if (th && typeof th === 'object' && th.type !== 'disabled') {
     const budget = Number(th.budget_tokens) || 0;
-    out.reasoning_effort = budget >= 16384 ? 'max' : budget >= 8192 ? 'high' : budget >= 2048 ? 'medium' : 'low';
+    // 第二轮审计修复：budget 缺失/为 0 时旧实现落到 'low'，把"未指定预算"显式降成**最低档**
+    // （配了 reasoningEffortMap 的家会真的把这个档位发出去，而不是让上游用默认）。
+    // 语义上"未指定"就该不下发该字段 —— 只有真给了正数预算才映射档位。
+    if (budget > 0) {
+      out.reasoning_effort = budget >= 16384 ? 'max' : budget >= 8192 ? 'high' : budget >= 2048 ? 'medium' : 'low';
+    }
   }
   return out;
 }
@@ -3183,6 +3264,7 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   let outText = '';
   let outThinking = '';
   const toolCalls = new Map();  // index → { id, name, args }
+  const toolCallState = { last: 0 };   // 第二轮审计修复：缺 index 的分片按"新调用/续片"分流，不再一律落 0
   let usage = null;
 
   const startBlock = (kind, block) => {
@@ -3235,13 +3317,12 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
       }
     }
     for (const call of Array.isArray(delta.tool_calls) ? delta.tool_calls : []) {
-      const idx = Number.isInteger(call.index) ? call.index : 0;
+      const idx = toolCallSlot(call, toolCalls, toolCallState);
       let entry = toolCalls.get(idx);
       if (!entry) {
-        // 关键（2026-09-16 真实事故回归）：**不要立刻开块**——很多上游先发 id、名字在后续分片才到；
-        // 若此时开块，客户端记录到的 tool_use 名字就是空串（pi-ai 只认 content_block_start 里的 name），
-        // 表现为 `unknown tool ""`，下一轮再把空名工具回传 → 上游 400 打死整轮。
-        // 现在：先缓冲 id/名字/参数，**拿到非空名字才开块**，并一次性补发已缓冲的参数分片。
+        // 第三轮审计修复：这里**只累积，不开块**（开块统一延到流结束的 flushToolCalls）。
+        // 原因见 flushToolCalls 的注释：边到边写会用"当前块号"，交错分片必然串台。
+        // 顺带保留了 2026-09-16 事故的修复意图——名字未到就不开块，客户端不会拿到空名 tool_use。
         entry = { id: call.id || ('call_' + Math.random().toString(36).slice(2, 10)), name: '', args: '', started: false, sent: 0 };
         toolCalls.set(idx, entry);
       }
@@ -3249,29 +3330,28 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
       if (call.function && typeof call.function.name === 'string' && call.function.name) entry.name = call.function.name;
       const frag = (call.function && call.function.arguments) || '';
       if (frag) entry.args += frag;
-      if (!entry.started && entry.name) {
-        closeBlock();
-        startBlock('tool_use', { type: 'tool_use', id: entry.id, name: entry.name, input: {} });
-        entry.started = true;
-        if (entry.args) {   // 名字到达前缓冲的参数分片在此一次性补发（不能丢）
-          if (!aggregateOnly) {
-            sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: entry.args } });
-          }
-          entry.sent = entry.args.length;
-        }
-      } else if (entry.started && entry.args.length > entry.sent) {
-        const chunkText = entry.args.slice(entry.sent);
-        entry.sent = entry.args.length;
-        if (!aggregateOnly) {
-          sseWrite(res, 'content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'input_json_delta', partial_json: chunkText } });
-        }
-      }
     }
     if (choice.finish_reason) { stopReason = stopReasonFromFinish(choice.finish_reason); finished = true; }
   };
 
-  /** 流结束时仍未开块的工具调用（上游始终没给名字）：兜底开块并补发参数，绝不静默丢调用 */
-  const flushPendingToolCalls = () => {
+  /**
+   * 把**全部**工具调用按槽位升序补成 content block（流结束时统一调用）。
+   *
+   * 第三轮审计修复（并行工具调用参数串台 —— 既存缺陷）：
+   * 旧实现在分片到达时就开块、并**立即**写 `input_json_delta`，而写入用的是"当前打开的块号"
+   * `blockIndex`。当上游交错发送两个工具调用的参数分片时（并行工具调用是常规形态）：
+   *   A(块0) → B(块1，closeBlock 关掉 A 的块) → A 的续片 → 参数被写进 **B 的块**
+   * 双方参数 JSON 都被污染（客户端 parse 失败 → 工具入参为空/报错），且这个顺序在真实
+   * 上游里很常见。现有测试只覆盖单调用（index 恒为 0），所以一直没暴露。
+   *
+   * 现在改为**延迟到流结束统一开块**：参数先在各 entry 里累积，收尾时按槽位升序逐块发出，
+   * 每块一次性带上自己的完整参数 —— 每个 tool_use 块天然连续、完整、与自己的 id/name 对齐。
+   * 代价：工具块统一出现在文本之后（Anthropic 的一个 message 内 text 与 tool_use 的先后
+   * 不影响语义；客户端本就要等 stop_reason=tool_use 才会执行工具）。
+   *
+   * 同时保留 2026-09-16 事故的修复意图：名字始终未到的条目以空名透传并记日志（绝不静默丢调用）。
+   */
+  const flushToolCalls = () => {
     for (const [idx, entry] of [...toolCalls.entries()].sort((a, b) => a[0] - b[0])) {
       if (entry.started) continue;
       if (!entry.name) log(`上游工具调用缺少 name（index=${idx}）→ 以空名透传（上游协议异常）`);
@@ -3320,7 +3400,7 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
   if (clientGone) return { ok: false };
 
   ensureStart();
-  flushPendingToolCalls();   // 兜底：名字始终没到的调用也要开块（流式会写事件；聚合只补数据），绝不静默丢调用
+  flushToolCalls();   // 延迟开块：全部工具调用在此一次性、连续地补出（并行调用不会串台）
   closeBlock();
   const outTok = usage && Number(usage.completion_tokens) > 0
     ? Number(usage.completion_tokens)
@@ -3340,7 +3420,10 @@ async function translateOpenAIStreamToAnthropic({ res, upstream, model, inputTok
     stopReason: toolCalls.size && stopReason === 'end_turn' ? 'tool_use' : stopReason,
     text: outText,
     thinking: outThinking,
-    toolCalls: [...toolCalls.values()],
+    // 第四轮审计修复：按**槽位序**返回，而不是 Map 插入序。插入序 = "分片首次出现的顺序"，
+    // 当上游先发 index=5 再发 index=0 时，聚合出的 tool_use 顺序会颠倒（与流式路径的
+    // flushToolCalls 排序不一致）。客户端虽按 id 区分调用，但顺序应与上游 index 一致。
+    toolCalls: [...toolCalls.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v),
     finished,
   };
 }
@@ -3362,6 +3445,13 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
   const picked = pickAccount(provider, scopeModel);
   if (picked.acct === null && picked.cooling > 0) {
     log(`provider ${provider.id}: ${picked.cooling} 个账户全部冷却中 → 交给下一家`);
+    // 第二轮审计修复（P1）：这里占用了 breakerAcquire 的半开探测名额，却直接 return ——
+    // 名额悬空后该家会被 `skip ... (breaker: cooldown or half-open probe already in flight)`
+    // 挡到 BREAKER_STALE_MS（180s）才回收，**且影响该家的所有模型**；客户端还会拿到
+    // "all providers ... breaker cooldown"（把"账户全冷却"误报成"供应商熔断"）。
+    // 本函数其余所有 return/continue 路径都已结算（见各分支处的 breakerRecordSuccess/
+    // breakerRecordFail），只有这一条遗漏。语义上"账户冷却"不构成供应商故障 → 交还名额。
+    breakerRecordSuccess(provider.id);
     return false;
   }
   const attemptAccounts = picked.acct ? [picked.acct, ...picked.accounts.filter((a) => a !== picked.acct && accountUsable(provider.id, a, scopeModel))] : [null];
@@ -3491,12 +3581,35 @@ async function forwardAnthropicViaOpenAI(provider, upstreamBaseHeaders, body, re
           if (looksError) {
             const detail = head.replace(/\s+/g, ' ').slice(0, 200);
             log(`upstream ${provider.id} HTTP 200 但 SSE 首事件是错误 → 判定该家失败并换下一家：${maskSecrets(detail)}`);
-            const kind = acct ? classifyAccountFailure(200, detail) || classifyAccountFailure(402, detail) : null;
-            if (acct && kind) { markAccountFailure(provider.id, acct, kind, detail, scopeModel); }
+            // 第二轮审计修复（严重）：这里原本是
+            //     classifyAccountFailure(200, detail) || classifyAccountFailure(402, detail)
+            // 而 `classifyAccountFailure` 第一句就是 `if (status === 402) return 'credit'`
+            //（只看状态码、不看文案）→ **或运算的后半段恒为真**，于是任何"HTTP 200 + 首事件是
+            // 错误"（瞬时 503、上下文超限、不支持 thinking……）都会把该 Key 按"额度耗尽"标记，
+            // 走 ACCOUNT_CREDIT_COOLDOWN_MS = 30 分钟的**账户级**冷却 —— 该 Key 上**所有模型**
+            // 连坐半小时（真实上游确实以 200+SSE 返回这些错误，见 cline/amd 的历史日志）。
+            // 正确语义：只按**文案**判额度/会话类失败（WORKBUDDY_CREDIT_RE / SESSION_RE 已覆盖
+            // "insufficient credit / quota exceeded / 余额不足 / 额度用尽"等），
+            // 其它 200+SSE 错误交给下面的 breakerRecordFail 做**供应商级**短熔断就够了。
+            // 分类用**未截断**的 head（额度文案可能排在 error 对象靠后处，200 字符会把它截掉）；
+            // 截断值只留给日志。与下方非 2xx 分支（500 字符、同一套正则）保持一致。
+            const classifyText = head.replace(/\s+/g, ' ').slice(0, 500);
+            const kind = acct ? classifyAccountFailure(200, classifyText) : null;
+            if (kind) {
+              // 账户级失败（额度/会话）→ 换**同供应商的下一把 Key**，且不计供应商熔断。
+              // 第三轮审计修复：原实现在这里一律 `return false`，只换下一家供应商 —— 与函数契约
+              //（"额度耗尽/会话失效/限流 → 换同供应商的下一个账户；全部不可用才交给下一家"）
+              // 以及上方非 2xx 分支的 `continue` 都不一致，等于把多 Key 容灾在这条路径上废掉。
+              // 这里尚未向客户端写任何字节、上游流已取消，continue 是安全的。
+              markAccountFailure(provider.id, acct, kind, classifyText, scopeModel);
+              log(`upstream ${provider.id} HTTP 200 但 SSE 首事件报账户级失败（${kind}）→ 换同供应商的下一把 Key`);
+              try { await peekReader.cancel(); } catch { /* 忽略 */ }
+              continue;
+            }
             catalogCache.set(provider.id, { models: null, ts: Date.now(), failed: true });
             breakerRecordFail(provider.id, 0);
             try { await peekReader.cancel(); } catch { /* 忽略 */ }
-            return false;   // 未写任何字节 → 交给账户池/下一家供应商
+            return false;   // 未写任何字节 → 交给下一家供应商
           }
           peekReader.releaseLock();
         } catch (peekErr) {
@@ -4288,6 +4401,30 @@ function installShutdown(server) {
  * 只动 llm-pi-ai → providers → gateway 这一条路径，绝不触碰文件里其它位置同名/同缩进的键。
  * 返回新文本（无改动时返回原文本）。
  */
+/**
+ * 宽松判断"某个键已在该层级出现过"（允许尾随注释 / flow 风格 `{}` / 引号别名）。
+ *
+ * 第四轮审计修复：写 settings.yaml 时的定位正则都要求"键独占一行、无尾随内容"
+ *（`/^ {2}providers:\s*$/` 之类）。命中不了时旧实现会**追加第二个同名键**，而 YAML 解析器
+ * 默认 `uniqueKeys: true`，重复键直接报错；宿主是"先 rename 再 parse"，一抛错则该文件
+ * **所有 section 都不导入**（模型全丢）。这里用宽松匹配兜底：既然存在却改不动，就明确中止，
+ * 而不是写出一个必然解析失败的文件。
+ *
+ * @param {string[]} lines - 文件行。
+ * @param {number} from - 起（含）。
+ * @param {number} to - 止（不含）。
+ * @param {number} indent - 期望缩进空格数。
+ * @param {string} name - 键名。
+ * @returns {boolean} true = 该层级已存在同名键。
+ */
+function hasLooseKey(lines, from, to, indent, name) {
+  const re = new RegExp('^' + ' '.repeat(indent) + name + '\\s*:');
+  for (let i = from; i < to; i++) {
+    if (re.test(lines[i])) return true;
+  }
+  return false;
+}
+
 function upsertGatewayInSettings(settings, block) {
   const lines = settings.split('\n');
   const at = (i) => lines[i].replace(/\r$/, '');
@@ -4306,7 +4443,10 @@ function upsertGatewayInSettings(settings, block) {
     }
   }
   if (pi < 0) {
-    // 整个 llm-pi-ai 段都不存在 → 追加
+    // 整个 llm-pi-ai 段都不存在 → 追加（但若它以改不动的形式存在，宁可中止，见 hasLooseKey）
+    if (hasLooseKey(lines, 0, lines.length, 0, 'llm-pi-ai')) {
+      throw new Error('settings.yaml 已含 llm-pi-ai，但不是可安全改写的形式（需该键独占一行、无尾随内容）。已中止，以免写出重复键导致整份配置无法解析。');
+    }
     const suffix = settings.trimEnd().length > 0 ? '\n' : '';
     return settings + suffix + 'llm-pi-ai:\n  providers:\n' + block + '\n';
   }
@@ -4316,6 +4456,9 @@ function upsertGatewayInSettings(settings, block) {
     if (/^ {2}providers:\s*$/.test(at(i))) { pIdx = i; break; }
   }
   if (pIdx < 0) {
+    if (hasLooseKey(lines, pi + 1, piEnd, 2, 'providers')) {
+      throw new Error('settings.yaml 的 llm-pi-ai 段已含 providers，但不是可安全改写的形式。已中止，以免写出重复键。');
+    }
     lines.splice(piEnd, 0, '  providers:', ...block.split('\n'));
     return lines.join('\n');
   }
@@ -4347,6 +4490,9 @@ function upsertGatewayInSettings(settings, block) {
     if (lines.slice(g, gEnd).join('\n') === blockLines.join('\n')) return settings;   // 内容一致 → 不动
     lines.splice(g, gEnd - g, ...blockLines);
   } else {
+    if (hasLooseKey(lines, pIdx + 1, pEnd, 4, 'gateway')) {
+      throw new Error('settings.yaml 的 llm-pi-ai.providers 段已含 gateway，但不是可安全改写的形式。已中止，以免写出重复键。');
+    }
     let ins = pEnd;
     while (ins > pIdx + 1 && at(ins - 1).trim() === '') ins--;
     lines.splice(ins, 0, ...blockLines);
@@ -4361,14 +4507,42 @@ function upsertGatewayInSettings(settings, block) {
  * (models merged from the gateway config) and ensures `DSH_GATEWAY_API_KEY` exists
  * in the credentials refs so dsh's llm layer can resolve apiKeyEnv.
  */
+/**
+ * 原子写文件 + 首次备份 + 自动建目录（第四轮审计修复）。
+ *
+ * 为什么必须原子：write-dsh 直接覆写 dsh 的 `settings.yaml` / `.credentials.yaml`，而宿主是
+ * **先 rename 再 parse**（dsh-settings 的 importLegacyDocument）——半截写入会让 YAML 解析抛错，
+ * 后果是**该文件所有 section 一个都不导入**（模型全丢），且原文件已被改名，不会自愈。
+ * 同项目的 gateway-manager.saveConfig 早已用 tmp+rename，这里对齐。
+ * 顺带修掉"父目录不存在即 ENOENT"（新机器上 `~/.dsh` 还没被 dsh 创建时点「写入 dsh 配置」）。
+ *
+ * @param {string} file - 目标文件。
+ * @param {string} text - 完整内容。
+ * @param {string} [backupSuffix] - 首次备份后缀（`.bak-gateway`）；备份已存在则不覆盖，保留最原始那份。
+ */
+function writeFileAtomicDsh(file, text, backupSuffix) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (backupSuffix && fs.existsSync(file)) {
+    const bak = file + backupSuffix;
+    try { if (!fs.existsSync(bak)) fs.copyFileSync(file, bak); } catch { /* 备份失败不阻断主流程 */ }
+  }
+  const tmp = file + '.tmp-write-dsh';
+  fs.writeFileSync(tmp, text, 'utf8');
+  fs.renameSync(tmp, file);
+}
+
 function writeDshConfig(args) {
   const get = (flag) => {
     const i = args.indexOf(flag);
     return i >= 0 && i + 1 < args.length ? args[i + 1] : undefined;
   };
   const cfgPath = get('--config') || CONFIG_PATH;
-  const settingsPath = get('--settings') || process.env.DSH_SETTINGS || path.join(os.homedir(), '.dsh', 'settings.yaml');
-  const credsPath = get('--credentials') || process.env.DSH_CREDENTIALS || path.join(os.homedir(), '.dsh', '.credentials.yaml');
+  // 第四轮审计修复：尊重 DSH_HOME（与 plugin-snapshot / default-plugins / market / watchdog 一致）。
+  // 旧实现硬编码 `os.homedir()/.dsh` —— 用户设了 DSH_HOME 时配置会被写进**另一个目录**，
+  // 命令报告成功、dsh 却完全不认（宿主侧 dsh-credentials-local 同样按 DSH_HOME 解析）。
+  const dshHome = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+  const settingsPath = get('--settings') || process.env.DSH_SETTINGS || path.join(dshHome, 'settings.yaml');
+  const credsPath = get('--credentials') || process.env.DSH_CREDENTIALS || path.join(dshHome, '.credentials.yaml');
   if (!fs.existsSync(cfgPath)) {
     console.error(`[write-dsh] gateway config not found: ${cfgPath}`);
     process.exit(1);
@@ -4418,7 +4592,12 @@ function writeDshConfig(args) {
 
   // YAML 安全转义：模型 ID / key 可能含特殊字符（#、冒号、引号等），
   // 统一用单引号包裹并把内部单引号加倍（YAML 单引号语法），防注入/破坏配置。
-  const yamlQuote = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  //
+  // 第四轮审计修复：**换行必须压掉**。单引号标量里不允许裸换行，而值可能来自 JSON 转义
+  // （key 或模型名含 \n）——直接写会得到一个跨行标量，续行落在第 0 列（远小于节点缩进），
+  // 结果是 YAML 报错或被折叠成别的值。凭据文件被写坏影响面尤其大（dsh 解析不出任何 key）。
+  // 换行在 key/模型名里没有任何合法用途，压成空格即可（与 settings.html 的请求头处理一致）。
+  const yamlQuote = (s) => `'${String(s).replace(/[\r\n]+/g, ' ').replace(/'/g, "''")}'`;
   const apiKeyYaml = yamlQuote(apiKey);
 
   // R12：模型条目统一声明 reasoningEfforts（否则 pi-ai 回退已安装目录能力——
@@ -4487,11 +4666,8 @@ ${modelLines}`;
   settings = upsertGatewayInSettings(settings, block);
   if (settings === before) console.log('[write-dsh] settings.yaml: no change needed');
   else {
-    try {
-      const bak = settingsPath + '.bak-gateway';
-      if (!fs.existsSync(bak)) fs.copyFileSync(settingsPath, bak);
-    } catch { /* 备份失败不阻断 */ }
-    fs.writeFileSync(settingsPath, settings, 'utf8');
+    // 第四轮审计修复：原子写 + 建目录（见 writeFileAtomicDsh 注释）
+    writeFileAtomicDsh(settingsPath, settings, '.bak-gateway');
     console.log('[write-dsh] settings.yaml: llm-pi-ai.providers.gateway upserted');
   }
 
@@ -4509,7 +4685,9 @@ ${modelLines}`;
       creds = `version: 1\nrefs:\n  DSH_GATEWAY_API_KEY: ${apiKeyYaml}\n`;
     }
   }
-  fs.writeFileSync(credsPath, creds, 'utf8');
+  // 第四轮审计修复：原子写 + 建目录 + 首次备份（credentials 此前**完全没有备份**，
+  // 而它装着用户全部供应商密钥）
+  writeFileAtomicDsh(credsPath, creds, '.bak-gateway');
   console.log(`[write-dsh] credentials.yaml: DSH_GATEWAY_API_KEY set`);
   console.log(`[write-dsh] OK — gateway registered at ${baseURL} with ${models.length} models`);
 }
@@ -4528,7 +4706,20 @@ process.on('exit', (code) => {
 });
 
 if (process.argv.includes('--write-dsh')) {
-  writeDshConfig(process.argv.slice(2));
+  // 第四轮审计修复（严重）：失败必须**以非零退出码结束**。
+  // 旧实现里 writeDshConfig 的裸抛（配置被手改坏/BOM → JSON.parse 抛；写文件 ENOENT/EACCES/
+  // 被编辑器独占 → writeFileSync 抛）会冒泡到上面那个只记日志、既不 exit 也不设 exitCode 的
+  // uncaughtException 处理器 → 进程"正常"收尾、**退出码 0、stdout 为空**。
+  // 而调用方正是按退出码判定成败（gateway-manager.js: `if (code === 0)`）→ UI 弹
+  // "已写入 dsh 配置"，实际一个字节都没写。这里捕获取代兜底，明确返回 2。
+  try {
+    writeDshConfig(process.argv.slice(2));
+  } catch (err) {
+    const msg = err && err.stack ? err.stack : String(err);
+    log(`[write-dsh] 失败：${msg}`);
+    console.error(`[write-dsh] FAILED: ${err && err.message ? err.message : err}`);
+    process.exit(2);
+  }
 } else {
   // 服务启动：--config / --log 可覆盖默认的 %APPDATA%\DSHDesktop 路径，
   // 使 dsh-app/桌面助手能把配置与日志指向自己的数据目录（否则误读/写旧位置）
