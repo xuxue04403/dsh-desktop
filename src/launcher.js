@@ -17,6 +17,8 @@ const { EventEmitter } = require('events');
 const { resolveCmdExe, comSpecIsStale } = require('./winutil');
 // 同上：workDir 可能来自另一台电脑（settings.json 随目录复制）→ cwd 无效同样 ENOENT
 const { workDirOrHome } = require('./paths');
+// v1.9.1：dsh 的安装标签/镜像（不再写死 @latest，见 dsh-tag.js 的版本分叉事故说明）
+const { dshInstallSpec, dshRegistry } = require('./dsh-tag');
 
 // dsh web 的 stdout 就绪行
 const REGEX_URL_LINE = /dsh web:\s*(https?:\/\/[^\s\)]+)/;
@@ -716,16 +718,17 @@ class Launcher extends EventEmitter {
         // v1.5.17c：默认走 npmmirror 镜像——npm 默认源在国内网络会部分包下载残缺
         // （实测 zod 目录存在但 index.js 缺失 → dsh 启动报 ERR_MODULE_NOT_FOUND）；
         // DSH_NPM_REGISTRY 可覆盖。加 --force 确保残缺安装被完整重装。
-        const registry = process.env.DSH_NPM_REGISTRY || 'https://registry.npmmirror.com';
+        // v1.9.1：包规格跟随 DSH_DSH_TAG（缺省 latest）——与 updater 同一处决策，
+        // 避免"首次装 latest、升级追 next"这类版本分叉把共享的 ~/.dsh 改坏。
         const { spawn: spawnAsync } = require('child_process');
         const install = await new Promise((resolve) => {
           const child = spawnAsync(this.nodePath, [npmCli, 'install', '-g', '--prefix', prefix,
-            '@deepseek-ai/dsh@latest', '--no-fund', '--no-audit', '--force', '--registry', registry], {
+            dshInstallSpec(), '--no-fund', '--no-audit', '--force', '--registry', dshRegistry()], {
             windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'], env: prep.env,
           });
           this.installChild = child;   // 审计修复：暴露句柄，stop() 可取消安装
           let out = '';
-          const t = setTimeout(() => { try { child.kill(); } catch (_) { /* 忽略 */ } resolve({ status: 1, output: out + '\n[超时] 5 分钟' }); }, 5 * 60 * 1000);
+          const t = setTimeout(() => { killTree(child); resolve({ status: 1, output: out + '\n[超时] 5 分钟' }); }, 5 * 60 * 1000);
           if (child.stdout) child.stdout.on('data', (c) => { out += c; });
           if (child.stderr) child.stderr.on('data', (c) => { out += c; });
           child.on('error', (e) => { clearTimeout(t); resolve({ status: 1, output: String(e) }); });
@@ -824,6 +827,51 @@ class Launcher extends EventEmitter {
     return null;
   }
 
+  /**
+   * 等待进程真正退出（P0-2 修复）。
+   *
+   * `spawnSync('taskkill', …)` 返回 **不等于** 目标进程已经消失——Windows 在
+   * TerminateProcess 之后、被终止进程完成收尾（释放句柄/监听套接字）之前就返回。
+   * 旧实现拿到返回值就 `return`，紧接着 `start()` 拉起新进程，于是旧进程还占着
+   * 3080 → 新进程 EADDRINUSE，或两个 dsh 同时存活（"重启后连的其实是旧实例"）。
+   * 网关侧早有同款等待（gateway-manager.waitPortFree），这里补齐 dsh 这一侧。
+   *
+   * @param {number} pid - 目标进程 PID。
+   * @param {number} [timeoutMs] - 等待上限（毫秒）。
+   * @returns {Promise<boolean>} true = 已确认退出（或本就不存在）。
+   */
+  async waitExit(pid, timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 5000);
+    for (;;) {
+      if (!isProcessAlive(pid)) return true;
+      if (Date.now() >= deadline) return false;
+      await sleep(100);
+    }
+  }
+
+  /**
+   * 等待端口释放（P0-2）。用 TCP 连接探测：连上=仍被占用，超时/拒绝=已空闲。
+   * 与 `gateway-manager.waitPortFree` 同一实现，避免两处再漂移。
+   *
+   * @param {number} port - 目标端口。
+   * @param {number} [timeoutMs] - 等待上限（毫秒）。
+   * @returns {Promise<boolean>} true = 端口已空闲。
+   */
+  async waitPortFree(port, timeoutMs) {
+    const net = require('net');
+    const tryOnce = () => new Promise((resolve) => {
+      const s = net.connect({ host: '127.0.0.1', port }, () => { s.destroy(); resolve(false); });
+      s.setTimeout(600, () => { s.destroy(); resolve(true); });
+      s.on('error', () => resolve(true));
+    });
+    const deadline = Date.now() + (timeoutMs || 4000);
+    while (Date.now() < deadline) {
+      if (await tryOnce()) return true;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return false;
+  }
+
   async stop() {
     const p = this.proc;
     this.proc = null;
@@ -836,20 +884,78 @@ class Launcher extends EventEmitter {
     this.ready = false;
     // 首次安装进行中 → 允许取消（安装子进程不在 this.proc 上）
     if (this.installChild) {
-      try { this.installChild.kill(); this.log('已取消进行中的 dsh 安装。'); } catch (_) { /* 忽略 */ }
+      // P0-2：树杀（npm 会派生 postinstall 的 node，只杀父进程会让它继续写 node_modules）
+      killTree(this.installChild);
+      this.log('已取消进行中的 dsh 安装。');
       this.installChild = null;
     }
     this._installToken = (this._installToken || 0) + 1;   // 使在途安装任务的收尾失效
     this.installing = false;                              // 让紧随其后的 start() 能重新发起
     if (!p || p.exitCode !== null) return;
+    // P0-2：先记录"杀之前它是否真的活着"——只有真的活着才值得等（测试桩/已退出进程
+    // 的 PID 并不存在，此时等待纯属浪费时间，还会让退出路径白白卡住数秒）。
+    const pid = p.pid;
+    const wasAlive = isProcessAlive(pid);
     try {
       // Windows 进程树终止
-      const r = spawnSync('taskkill', ['/pid', String(p.pid), '/T', '/F'], { windowsHide: true });
+      const r = spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
       if (r.status !== 0) p.kill();
     } catch (_) {
       try { p.kill(); } catch (_) { /* 忽略 */ }
     }
+    if (!wasAlive) return;
+    // P0-2：确认"真的退出"再返回——调用方（看门狗 relaunch / startService）紧随其后就
+    // start()，旧实现此时旧进程可能还在监听 3080。
+    if (!await this.waitExit(pid, 5000)) {
+      this.log('停止服务：进程 ' + pid + ' 在 5 秒内未退出，补一次树杀。');
+      try { spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true }); } catch (_) { /* 忽略 */ }
+      await this.waitExit(pid, 2000);
+    }
+    // P0-2：端口释放（树杀后监听套接字回收仍有延迟）。
+    const port = this.settings && this.settings.data ? this.settings.data.port : 0;
+    if (port && !await this.waitPortFree(port, 4000)) {
+      this.log('停止服务：端口 ' + port + ' 在 4 秒内未释放，可能被其它程序占用（继续启动时可能 EADDRINUSE）。');
+    }
   }
+}
+
+/**
+ * 进程是否仍存在（P0-2）。
+ * 信号 0 不投递、只做存在性检查：抛 ESRCH = 不存在；抛 EPERM = 存在但无权限（仍算存活）。
+ *
+ * @param {number} pid - 目标 PID。
+ * @returns {boolean} true = 进程存在。
+ */
+function isProcessAlive(pid) {
+  if (!pid || typeof pid !== 'number') return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return !!(err && err.code === 'EPERM');
+  }
+}
+
+/**
+ * 终止一个子进程**及其整棵进程树**（P0-2）。
+ *
+ * 为什么不能只 `child.kill()`：npm 安装会再派生 postinstall 的 node 进程，杀掉父进程后
+ * 孙进程仍在写同一个 `node_modules`，与紧随其后的重装/npx 并发 → 目录残缺，正是
+ * "zod 目录存在但 index.js 缺失"那类启动即崩的成因。
+ *
+ * 无 PID 可用时（单测桩、异常路径）退回 `child.kill()`。
+ *
+ * @param {import('child_process').ChildProcess} child - 目标子进程。
+ */
+function killTree(child) {
+  if (!child) return;
+  try {
+    if (process.platform === 'win32' && typeof child.pid === 'number' && child.pid > 0) {
+      const r = spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true });
+      if (r.status === 0) return;   // 树杀成功，不再补刀
+    }
+  } catch (_) { /* 落到 child.kill() */ }
+  try { child.kill(); } catch (_) { /* 忽略 */ }
 }
 
 function sleep(ms) {
