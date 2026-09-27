@@ -192,11 +192,24 @@ if (!dropDsh && fs.existsSync(path.join(work, 'DSH-App.exe'))) {
     + "for(const m of ['sharp','node-pty','@vscode/ripgrep']){try{require(m);r.push(m+':OK');}catch(e){r.push(m+':FAIL');}}"
     + "try{const p=JSON.parse(fs.readFileSync('package.json','utf8'));let ok=0,bad=0;for(const d of Object.keys(p.dependencies||{})){try{require.resolve(d);ok++;}catch(_){bad++;}}r.push('deps:'+ok+'/'+(ok+bad));}catch(e){r.push('deps:ERR');}"
     + 'fs.writeFileSync(' + JSON.stringify(outFile) + ",r.join(' '));";
-  spawnSync(path.join(work, 'DSH-App.exe'), ['-e', script], {
+  const r = spawnSync(path.join(work, 'DSH-App.exe'), ['-e', script], {
     cwd: dshDir, stdio: 'ignore', windowsHide: true,
     env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }),
   });
+  // 第二轮审计修复：旧实现丢弃 spawnSync 的返回值、且 stdio:'ignore' 吞掉子进程报错 ——
+  // 子进程根本没跑起来（盘被禁止执行 / cwd 不存在 / 杀软拦截）时 outFile 不生成，
+  // smoke 变成 '（无输出）'，既不匹配下面的 /FAIL|ERR/ 也不触发中止，
+  // 于是"原生模块全挂"的产物被当作校验通过发布出去。现在显式判失败并中止。
+  if (r.error || r.status !== 0) {
+    console.error('[FAIL] 冒烟子进程未能执行（' + (r.error ? r.error.message : 'exit ' + r.status) + '）'
+      + '，无法验证原生模块可用性，已中止，不生成 zip。');
+    process.exit(1);
+  }
   try { smoke = fs.readFileSync(outFile, 'utf8').trim(); } catch { smoke = '（无输出）'; }
+  if (!smoke || smoke === '（无输出）') {
+    console.error('[FAIL] 冒烟未产出结果文件（' + outFile + '），已中止，不生成 zip。');
+    process.exit(1);
+  }
 }
 console.log('[4/5] 校验：入口缺失(精简造成)=' + caused.length + '  原生模块/依赖冒烟: ' + smoke);
 if (caused.length > 0 || /FAIL|ERR/.test(smoke)) {
