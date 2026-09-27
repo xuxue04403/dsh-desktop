@@ -27,6 +27,8 @@ const os = require('os');
 const path = require('path');
 // 时间戳口径与日志一致（缺省北京时间，见 timestamp.js）
 const { stamp } = require('./timestamp');
+// junction/symlink 安全删除（与 default-plugins 共用同一实现）
+const { removePath, copyTreeSafe } = require('./fs-safe');
 
 const SNAPSHOT_NAME = 'plugin-snapshot.json';
 const APPLIED_NAME = 'plugin-snapshot.applied.json';
@@ -115,16 +117,27 @@ function dirSize(p) {
   return total;
 }
 
-/** 目录复制（跳过 .bin 之类的软链；插件包本身是普通文件树） */
+/** 目录复制（junction 安全：删除目标时先摘链接，见 fs-safe.copyTreeSafe） */
 function copyTree(src, dst) {
-  fs.rmSync(dst, { recursive: true, force: true });
-  fs.mkdirSync(path.dirname(dst), { recursive: true });
-  fs.cpSync(src, dst, { recursive: true, force: true, dereference: false, errorOnExist: false });
+  copyTreeSafe(src, dst);
 }
 
-/** 文本归一（用于 patch 条目去重/比对：忽略空白差异） */
+/**
+ * 文本归一（用于 patch 条目去重/比对：忽略空白差异与**整行注释**差异）。
+ *
+ * 第二轮审计修复：旧实现保留整行注释。`splitPatchBlocks` 会把块**中间**的注释行进块
+ *（只剥尾部注释），于是"同一逻辑条目 + 多一行注释"的归一文本不相等 →
+ * `existingNorm.includes(nb)` 判为"新条目" → **重复追加**同 id 条目，正是模块注释里
+ * 警告的"轻则重复挂载、重则加载器报错"。注释不承载语义，不应参与去重比对。
+ */
 function normalizeBlock(s) {
-  return String(s || '').replace(/\r\n/g, '\n').trim().replace(/[ \t]+$/gm, '');
+  return String(s || '')
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .filter((l) => !/^\s*#/.test(l))
+    .join('\n')
+    .trim()
+    .replace(/[ \t]+$/gm, '');
 }
 
 /** 该依赖名是否"宿主内置"（不纳入快照） */
@@ -208,6 +221,66 @@ function splitPatchBlocks(text) {
     .map((b) => b.replace(/\n+(#[^\n]*\n?)*\s*$/g, '').trim())   // 去掉条目尾部的空行/尾随注释
     .filter((b) => b.length > 0);
   return { isList: sawItem, blocks: cleaned };
+}
+
+/**
+ * 顶层列表项之前的"前言"（注释头 / %YAML 指令 / 空行）。
+ *
+ * 第二轮审计修复：重写 cordis.patch.yml 时旧实现是 `header + blocks`，而 blocks 只由
+ * `- ` 开头的行组成 → 原文件的注释头被**整体丢掉**（default-plugins 的 profile 模板
+ * 恰恰是"注释 + []"形态，每次合并都会累积丢失说明性文字）。这里把前言取出来保留。
+ *
+ * @param {string} text - 文件原文。
+ * @returns {string} 前言（已去尾部空白）。
+ */
+function preambleOf(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  const out = [];
+  for (const line of lines) {
+    if (/^-\s/.test(line) || line.trim() === '-') break;   // 遇到第一个顶层列表项即停
+    out.push(line);
+  }
+  return out.join('\n').replace(/\s+$/, '');
+}
+
+/**
+ * 前言是否"无实质内容"（只含注释 / 空行 / YAML 指令 / 空列表标记 `[]`）。
+ * 用于判断"把快照条目追加进去会不会破坏文件结构"：前言若含真实键值（映射），
+ * 追加序列会写出"映射与序列同层"的非法 YAML。
+ */
+function preambleIsInert(preamble) {
+  return String(preamble || '').split('\n').every((l) => {
+    const t = l.trim();
+    return t === '' || t.startsWith('#') || t === '[]' || t === '---' || t.startsWith('%YAML');
+  });
+}
+
+/**
+ * 该 patch 条目是否仍是"未填写的占位"（P1 二次复核修复）。
+ *
+ * 用于决定"同 id 条目能不能被快照覆盖"：占位可以覆盖（这是迁移快照的价值），
+ * 用户已经填过的**不能**（否则就是"配置被改回去"）。
+ *
+ * 判据（满足任一即视为占位）：
+ *   · 含默认模板里的示例值 —— `example.com` / `you@` / `change-me` / `your-xxx`
+ *     （默认模板见 default-plugins.DEFAULT_PATCH_BLOCK）；
+ *   · 不含任何"像真实值"的内容 —— 既没有非 example.com 的邮箱，也没有形如
+ *     `host: imap.qq.com` 的真实主机名。这样连只剩空壳的占位（`imap: { host: "" }`，
+ *     即默认插件机制在配置残缺时写下的形态）也能被识别。
+ *
+ * @param {string} block - 单条 patch 条目文本。
+ * @returns {boolean} true = 仍是占位，可被快照配置替换。
+ */
+function looksPlaceholder(block) {
+  const t = String(block || '');
+  if (/example\.com|you@|change[-_]?me|your[-_]?(?:email|password|host|user|server)/i.test(t)) return true;
+  // 真实邮箱（非 example.com）→ 已填写
+  const emails = t.match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g) || [];
+  if (emails.some((e) => !/@example\.com$/i.test(e))) return false;
+  // 真实主机（host/server/url 后跟带点的域名，且非 example.com）→ 已填写
+  const hosts = t.match(/\b(?:host|server|url)\s*:\s*["']?([A-Za-z0-9.-]+\.[A-Za-z]{2,})/gi) || [];
+  if (hosts.some((h) => !/example\.com/i.test(h))) return false;
+  return true;   // 没有任何真实值 → 仍是占位
 }
 
 /** patch 条目里引用到的包名（`name: xxx` 或裸包名出现） */
@@ -315,13 +388,20 @@ function capture(o) {
   }
 
   // 清理已不在插件清单里的旧随包目录（卸载过的插件不该继续随包走）
+  //
+  // 第二轮审计修复：判据从 `p.bundled` 改为"该插件**仍在快照清单里**"。
+  // `p.bundled` 只在**本次复制成功**时才置真（见上面的复制循环），于是：
+  //   · 插件体积涨过 BUNDLE_COPY_MAX_BYTES 被正常跳过 → 本次没复制 → bundled 为假
+  //     → 这里把它**上次已经随包好的目录删掉**；
+  //   · copyTree 偶发失败（copyFail++）同理。
+  // 而快照 JSON 仍然列着这个插件 → 新机器离线装不上（verify 报 missingBundles），
+  // 且删除不可逆（用户整体拷走绿色目录时该插件已丢失）。清理只应针对"真的已被卸载"。
   try {
     const root = bundleRoot(dataDir);
     if (fs.existsSync(root)) {
+      const listed = new Set(plugins.map((p) => p && p.name).filter(Boolean));
       for (const d of fs.readdirSync(root)) {
-        if (!plugins.some((p) => p.name === d && p.bundled)) {
-          fs.rmSync(path.join(root, d), { recursive: true, force: true });
-        }
+        if (!listed.has(d)) removePath(path.join(root, d));
       }
     }
   } catch (_) { /* 忽略 */ }
@@ -454,15 +534,16 @@ function pluginPresent(profile, name) {
   return fs.existsSync(path.join(profile, 'node_modules', name, 'package.json'));
 }
 
-/** 删除路径（junction 安全）：junction/symlink 用 unlink，真实目录才 recursive 删 */
+/**
+ * 删除路径（junction 安全）。**委托给共享实现 fs-safe.removePath**。
+ *
+ * 第二轮审计修复：原实现只处理"目标本身是链接"的情况，对**目录内部嵌套的 junction**
+ * （pnpm 布局、default-plugins 的 linkMissingHostPackages 建的 @deepseek-ai/*）无防护，
+ * `rmSync(recursive)` 会穿透链接删掉**宿主包的真实内容**。default-plugins 的同类函数
+ * 早已补上"先递归摘链接"这一步，这里改为共用，杜绝两处漂移。
+ */
 function removePathSafe(p) {
-  let st = null;
-  try { st = fs.lstatSync(p); } catch (_) { return; }
-  if (st.isSymbolicLink()) {
-    try { fs.unlinkSync(p); } catch (_) { try { fs.rmdirSync(p); } catch (_) { /* 忽略 */ } }
-    return;
-  }
-  try { fs.rmSync(p, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
+  removePath(p);
 }
 
 /** Node 解析宿主包时的查找根（与 default-plugins.hostPackagesResolvable 同序） */
@@ -620,6 +701,7 @@ async function applyIfNeeded(o) {
   //    轻则重复挂载、重则加载器报错。用户自己机器上的那份才是真配置，替换它即可。
   let patchAdded = 0;
   let patchReplaced = 0;
+  let patchKept = 0;
   try {
     const patchFile = path.join(profilePath, 'cordis.patch.yml');
     const text = readText(patchFile);
@@ -640,9 +722,19 @@ async function applyIfNeeded(o) {
         const id = idOf(b);
         const idx = id ? next.findIndex((x) => idOf(x) === id) : -1;
         if (idx >= 0) {
-          // 同 id 的占位条目 → 用来源机器的真配置替换
-          next[idx] = b;
-          patchReplaced++;
+          // 同 id 条目已存在。**只有它仍是未填写的占位**时才用快照里的真配置替换。
+          //
+          // P1（二次复核修复）：旧实现无条件 `next[idx] = b`。同一台机器一旦被判为"换机"
+          //（改计算机名、换 Windows 账号、域账号漫游 —— machineId() = hostname|username），
+          // sameMachine 守卫失效 → 重新应用快照，把**快照里旧的**配置覆盖回用户当前已经
+          // 改好的条目。这正是用户反馈的"配置被改回去 / 那个 bug 又回来了"。
+          // 现在：占位 → 替换（保留原有价值）；已填写 → 保留用户的值，只记日志。
+          if (looksPlaceholder(next[idx])) {
+            next[idx] = b;
+            patchReplaced++;
+          } else {
+            patchKept++;
+          }
           continue;
         }
         next.push(b);
@@ -650,14 +742,32 @@ async function applyIfNeeded(o) {
         addedNames.push(id || '(匿名条目)');
       }
       if (patchAdded || patchReplaced) {
-        const header = '# ── 以下条目由 dsh-app 插件迁移快照同步（来源机器：' + (snap.machine || '未知')
-          + ' @ ' + (snap.capturedAtLocal || snap.capturedAt || '') + '）──\n';
-        const out = (cur.isList ? header : header) + next.join('\n\n') + '\n';
-        backupFile(patchFile, 'pluginsnapshot');
-        fs.writeFileSync(patchFile, out, 'utf8');
-        if (patchAdded) log('已补回 ' + patchAdded + ' 条 cordis.patch.yml 条目：' + addedNames.join(', '));
-        if (patchReplaced) log('已用本机迁移快照的配置替换 ' + patchReplaced + ' 条同 id 占位条目');
+        const preamble = preambleOf(text || '');
+        // 结构守卫：不是顶层列表、且前言含实质内容（映射/其它结构）→ 追加会写出非法 YAML。
+        // 宁可这次不合并（用户文件保持原样），也不写出一个加载器读不了的文件。
+        if (!cur.isList && !preambleIsInert(preamble)) {
+          log('cordis.patch.yml 不是顶层列表结构，已跳过条目合并（避免写出非法 YAML）');
+        } else {
+          const header = '# ── 以下条目由 dsh-app 插件迁移快照同步（来源机器：' + (snap.machine || '未知')
+            + ' @ ' + (snap.capturedAtLocal || snap.capturedAt || '') + '）──\n';
+          // 第二轮审计修复：保留原注释头（旧实现把前言整体丢掉），并去掉已被真实列表取代的
+          // 空列表标记 `[]`。原先这里是 `(cur.isList ? header : header)` —— 三元两支相同，
+          // 属未完成代码，一并去掉。
+          const keptPreamble = preamble
+            .split('\n')
+            .filter((l) => l.trim() !== '[]')
+            .join('\n')
+            .replace(/\s+$/, '');
+          const out = (keptPreamble ? keptPreamble + '\n\n' : '') + header + next.join('\n\n') + '\n';
+          backupFile(patchFile, 'pluginsnapshot');
+          fs.writeFileSync(patchFile, out, 'utf8');
+          if (patchAdded) log('已补回 ' + patchAdded + ' 条 cordis.patch.yml 条目：' + addedNames.join(', '));
+          if (patchReplaced) log('已用本机迁移快照的配置替换 ' + patchReplaced + ' 条同 id 占位条目');
+        }
       }
+      // 保留了用户已填写的同 id 条目：这是**有意不覆盖**，必须留痕，否则用户无从判断
+      // "为什么快照没有生效"。
+      if (patchKept) log('已保留 ' + patchKept + ' 条同 id 条目（本机已填写真实配置，不被快照覆盖）');
     }
   } catch (err) {
     log('patch 条目合并失败：' + (err && err.message ? err.message : err));
@@ -747,12 +857,21 @@ function verify(dataDir) {
 
   const issues = [];
   const plugins = Array.isArray(snap.plugins) ? snap.plugins : [];
-  const bundles = Array.isArray(snap.bundles) ? snap.bundles : [];
-  const bundledSet = new Set(bundles);
+  // 第四轮审计修复（语义误用）：这里要的是**"随包"这个事实**，即每个插件的 `p.bundled`
+  //（只有 copyTree 真的成功才会置真），而不是 `snap.bundles` —— 后者采集自 profile 的
+  // `pkg.dsh.profile.bundles`，是"挂载声明"，与是否随包无关。旧实现把两者混用，后果：
+  //   · 假失败：插件体积超过随包上限（或复制失败/依赖未装）时 capture 明确"不随包"并继续，
+  //     但 bundles 仍原样采集 → verify 把它们报成 missingBundles/ok:false，把**按设计不随包**
+  //     误报成缺陷；同一份输出又用 bundledSet 把它们排除出 registry（"既说缺失、又说不需联网装"）。
+  //   · 假通过：包体真丢了但名字不在 bundles 里时（dsh 停用插件会从 profile.bundles 摘名、
+  //     却把依赖留在 package.json），verify 报 ok:true，而快照 JSON 自己写着 "bundled": true。
+  // 现在以 p.bundled 为准（与 status() 的判据一致）；bundles 仅用于"挂载声明"的展示。
+  const mountedBundles = Array.isArray(snap.bundles) ? snap.bundles : [];
+  const bundledNames = plugins.filter((p) => p && p.name && p.bundled).map((p) => p.name);
 
   // 1) 随包插件的包体是否真的在
   const missingBundles = [];
-  for (const name of bundles) {
+  for (const name of bundledNames) {
     try {
       if (!fs.existsSync(path.join(bundleDirFor(dataDir, name), 'package.json'))) missingBundles.push(name);
     } catch (_) { missingBundles.push(name); }
@@ -775,15 +894,16 @@ function verify(dataDir) {
   }
 
   // 3) 无随包的插件需要联网安装——不是缺陷，但要如实报出来（离线机器会装不上）
+  const bundledSet = new Set(bundledNames);
   const registry = plugins.filter((p) => p && p.name && !bundledSet.has(p.name)
     && !(p.fromVendor && !p.spec)).map((p) => p.name);
 
-  const summary = bundles.length + ' 个随包插件、' + (cfg.files || []).length + ' 个配置文件';
+  const summary = bundledNames.length + ' 个随包插件、' + (cfg.files || []).length + ' 个配置文件';
   return {
     ok: issues.length === 0,
     snapshotExists: true,
     capturedAt: snap.capturedAtLocal || snap.capturedAt || null,
-    plugins: { total: plugins.length, bundled: bundles.length, registry },
+    plugins: { total: plugins.length, bundled: bundledNames.length, mounted: mountedBundles.length, registry },
     config: { files: (cfg.files || []).length, dirs: (cfg.dirs || []).length },
     missingBundles,
     missingConfig,
@@ -802,6 +922,7 @@ module.exports = {
   bundleDirFor,
   dshConfigRoot,
   splitPatchBlocks,
+  looksPlaceholder,
   resolveProfileDir,
   SNAPSHOT_NAME,
   BUNDLE_DIR_NAME,
