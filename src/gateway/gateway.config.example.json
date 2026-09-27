@@ -1,6 +1,7 @@
 {
   "_说明": [
-    "选路顺序 = providers 数组顺序（2026-09-16 起）；priority 为保留字段，不再参与排序——配置页 ▲▼ 只调顺序。",
+    "选路顺序：**先按 priority 升序，同一 priority 内按 providers 数组顺序**（2026-09-17 起 priority 重新参与排序）。",
+    "注意：配置页的 ▲▼ 只调整数组顺序，因此**改动只在同一 priority 内生效**；跨优先级调整请直接改 priority 字段。",
     "models 每项：字符串 = 上游 ID 与逻辑名相同；对象 = { id: 上游真实 ID, as: 逻辑名, vision?: true }。",
     "vision: true 表示支持图片输入：会写进 dsh 配置的 input: [text, image]（否则 dsh 拦下图片），",
     "并且带图片的请求只发给声明了 vision 的家。",
