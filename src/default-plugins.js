@@ -26,6 +26,9 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+// junction/symlink 安全删除（第二轮审计：从本文件抽出为共享模块，plugin-snapshot 也用它，
+// 避免两处各自实现同一套防护而漂移）
+const { removePath } = require('./fs-safe');
 
 // @deepseek-ai 宿主包：优先经 $DSH_HOME/profiles/node_modules 兜底闭包解析（不 junction）
 const HOST_PACKAGES = ['dsh-tools', 'dsh-llm', 'dsh-credentials', 'schemastery'];
@@ -94,42 +97,9 @@ function backupFile(file, tag) {
   } catch (_) { /* 备份失败继续（原文件仍在） */ }
 }
 
-/**
- * 删除路径（junction/symlink 安全版）：Electron 内置 node 的 fs.rmSync 对 junction
- * 报 ERR_FS_EISDIR，且 recursive 会**穿透 junction 删掉目标内容**（宿主包！）——
- * junction/symlink 一律 unlink（实测 Electron 与系统 node 均安全），真实目录才 recursive。
- * R25（审计补强）：真实目录**内部**也可能嵌着 junction（如 linkMissingHostPackages
- * 建的 @deepseek-ai/*）——recursive 同样会穿透。删除前先递归清掉目录树里所有
- * symlink/junction，再 rmSync。
- */
-function removePath(p) {
-  let st = null;
-  try { st = fs.lstatSync(p); } catch (_) { return; }
-  if (st.isSymbolicLink()) {
-    try { fs.unlinkSync(p); return; } catch (_) { /* 尝试 rmdir 兜底 */ }
-    try { fs.rmdirSync(p); } catch (_) { /* 忽略 */ }
-    return;
-  }
-  if (st.isDirectory()) {
-    // 先摘掉树内所有 symlink/junction（防止 rmSync recursive 穿透目标）
-    const stripLinks = (dir) => {
-      let entries;
-      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { return; }
-      for (const e of entries) {
-        const child = path.join(dir, e.name);
-        let cst = null;
-        try { cst = fs.lstatSync(child); } catch (_) { continue; }
-        if (cst.isSymbolicLink()) {
-          try { fs.unlinkSync(child); } catch (_) { /* 忽略 */ }
-        } else if (cst.isDirectory()) {
-          stripLinks(child);
-        }
-      }
-    };
-    stripLinks(p);
-  }
-  fs.rmSync(p, { recursive: true, force: true });
-}
+// removePath（junction/symlink 安全删除）已抽到 fs-safe.js —— 原实现留在本文件时，
+// plugin-snapshot 的 copyTree/随包清理用的是裸 fs.rmSync(recursive)，会穿透 junction
+// 删掉宿主包内容。两处现在共用同一实现。
 
 // ---------------- 1) vendor 源常驻 profile ----------------
 function vendorInProfile(profile) {
