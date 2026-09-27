@@ -98,7 +98,8 @@ t('REGEX_URL_LINE 匹配 dsh web 就绪行（含 token）', () => {
 // —— 模型网关：供应商配置校验 ——
 const GOOD_CFG = JSON.stringify({
   port: 3090,
-  apiKey: 'k',
+  // 第四轮：顶层统一 Key 必须 ≥16 字符（网关 authorized() 的门槛，见 validateConfigText 注释）
+  apiKey: 'dsh-gateway-testkey-0123456789',
   providers: [
     { id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk-1', models: ['m1'], priority: 1, enabled: true },
   ],
@@ -420,7 +421,7 @@ t('isolationCandidates：故障条目过多 → 判定系统性故障，不做 L
 });
 
 t('validateConfigText R22 端口校验：缺/非法端口拒绝', () => {
-  const mk = (port) => JSON.stringify({ port, apiKey: 'k', providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk', models: ['m'] }] });
+  const mk = (port) => JSON.stringify({ port, apiKey: 'dsh-gateway-testkey-0123456789', providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk', models: ['m'] }] });
   assert.strictEqual(validateConfigText(mk(3091)).ok, true, '3091 合法');
   assert.strictEqual(validateConfigText(mk(3090)).ok, true, '3090 也合法（只是约定不同）');
   const noPort = JSON.stringify({ apiKey: 'k', providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk', models: ['m'] }] });
@@ -436,6 +437,102 @@ t('main.js 接线冒烟（B1 回归）：verifyDefaultPlugins 必须导入且在
   assert.ok(/const\s*\{[^}]*verifyDefaultPlugins[^}]*\}\s*=\s*require\('\.\/default-plugins'\)/.test(src),
     'require 解构必须包含 verifyDefaultPlugins（B1：漏导入曾使 R24 自检静默失效）');
   assert.ok(src.includes('await verifyDefaultPluginsBeforeStart();'), 'startService 必须在启动前 await 自检');
+});
+
+// ================= 2026-09-27：dsh 版本分叉导致"历史会话丢失"的根因回归 =================
+// 事故链：安装/升级写死 @latest → 主目录手工装了 next(0.1.7-rc.2)、UAT 重装回 latest(0.1.5-rc.3)
+// → 两个绿色目录共用同一个 ~/.dsh（本应用不设 DSH_HOME）→ 旧版 dsh 把共享的 settings.yaml
+// 改名为 settings.yaml.imported、重写会话索引 → 另一侧"历史会话丢失"。
+// 因此这两条必须锁死：① 安装/升级标签可配置且同一处决策；② 版本变化必须留下告警。
+
+t('dsh-tag：标签可配置（DSH_DSH_TAG），非法值回退 latest，安装/查询/命令三处口径一致', () => {
+  const dshTag = require('../src/dsh-tag');
+  const saved = process.env.DSH_DSH_TAG;
+  const reload = () => { delete require.cache[require.resolve('../src/dsh-tag')]; return require('../src/dsh-tag'); };
+  try {
+    delete process.env.DSH_DSH_TAG;
+    let m = reload();
+    assert.strictEqual(m.dshDistTag(), 'latest', '缺省应为 latest（保持既有行为）');
+    assert.strictEqual(m.dshInstallSpec(), '@deepseek-ai/dsh@latest');
+    assert.ok(m.dshVersionUrl().endsWith('/@deepseek-ai/dsh/latest'), '查询端点应跟随标签：' + m.dshVersionUrl());
+    assert.strictEqual(m.dshUpgradeCommand(), 'npm i -g @deepseek-ai/dsh@latest');
+
+    process.env.DSH_DSH_TAG = 'next';
+    m = reload();
+    assert.strictEqual(m.dshDistTag(), 'next', 'DSH_DSH_TAG 应生效');
+    assert.strictEqual(m.dshInstallSpec(), '@deepseek-ai/dsh@next', '安装规格必须跟随标签');
+    assert.ok(m.dshVersionUrl().endsWith('/@deepseek-ai/dsh/next'), '查询端点必须跟随标签');
+    assert.strictEqual(m.dshUpgradeCommand(), 'npm i -g @deepseek-ai/dsh@next');
+
+    // 精确版本号也应被接受（用户可钉死版本）
+    process.env.DSH_DSH_TAG = '0.1.7-rc.2';
+    m = reload();
+    assert.strictEqual(m.dshInstallSpec(), '@deepseek-ai/dsh@0.1.7-rc.2');
+
+    // 含空格/分号等可疑字符的值一律回退，绝不拼进 npm 命令行
+    for (const bad of ['bad; rm -rf /', 'a b', '$(whoami)', 'x&y']) {
+      process.env.DSH_DSH_TAG = bad;
+      m = reload();
+      assert.strictEqual(m.dshDistTag(), 'latest', '非法标签必须回退 latest：' + bad);
+    }
+  } finally {
+    if (saved === undefined) delete process.env.DSH_DSH_TAG; else process.env.DSH_DSH_TAG = saved;
+    delete require.cache[require.resolve('../src/dsh-tag')];
+  }
+});
+
+t('dsh-home-guard：同一 home 换了 dsh 版本必须告警并记下来（静默损坏 → 可解释现象）', () => {
+  const guard = require('../src/dsh-home-guard');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-guard-'));
+  try {
+    const logs = [];
+    const log = (s) => logs.push(String(s));
+
+    // 首次：只记录，不告警
+    const r1 = guard.checkAndRecord({ dshVersion: '0.1.5-rc.3', dataDir: 'D:/UAT', dshHome: home, log });
+    assert.strictEqual(r1.checked, true, '应完成检查');
+    assert.strictEqual(r1.versionChanged, false, '首次不应告警');
+    assert.ok(fs.existsSync(path.join(home, guard.MARKER_NAME)), '应写入标记文件');
+    assert.strictEqual(logs.length, 0, '首次不应产生日志');
+
+    // 同版本再来一次：仍不告警
+    const r2 = guard.checkAndRecord({ dshVersion: '0.1.5-rc.3', dataDir: 'D:/UAT', dshHome: home, log });
+    assert.strictEqual(r2.versionChanged, false, '同版本不应告警');
+
+    // 版本变了：必须告警，且指明两侧目录与处置建议
+    const r3 = guard.checkAndRecord({ dshVersion: '0.1.7-rc.2', dataDir: 'D:/main', dshHome: home, log });
+    assert.strictEqual(r3.versionChanged, true, '版本变化必须告警');
+    assert.strictEqual(r3.previous, '0.1.5-rc.3', '应带出上一版本');
+    const text = logs.join('\n');
+    assert.ok(/版本守卫/.test(text), '日志应带守卫前缀：' + text);
+    assert.ok(/0\.1\.5-rc\.3 → 0\.1\.7-rc\.2/.test(text), '应写出前后版本：' + text);
+    assert.ok(text.includes('D:/UAT') && text.includes('D:/main'), '应指明两侧是哪个目录在用：' + text);
+    assert.ok(/DSH_DSH_TAG|DSH_HOME/.test(text), '应给出可执行的处置建议：' + text);
+
+    // 没检测到 dsh（空版本）→ 跳过，且不写标记
+    const home2 = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-guard2-'));
+    const r4 = guard.checkAndRecord({ dshVersion: '', dataDir: 'D:/x', dshHome: home2, log });
+    assert.strictEqual(r4.checked, false, '无版本信息时应跳过');
+    assert.ok(!fs.existsSync(path.join(home2, guard.MARKER_NAME)), '跳过时不应写标记');
+    fs.rmSync(home2, { recursive: true, force: true });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+t('接线回归：安装/升级路径不得再写死 @latest（否则版本分叉会再次改坏共享的 dsh home）', () => {
+  const root = path.join(__dirname, '..', 'src');
+  for (const f of ['launcher.js', 'updater.js', 'main.js']) {
+    const src = fs.readFileSync(path.join(root, f), 'utf8');
+    // 允许注释里出现（说明历史），但**代码行**不得再硬编码该包规格
+    const codeLines = src.split(/\r?\n/).filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l));
+    const bad = codeLines.filter((l) => l.includes("'@deepseek-ai/dsh@latest'") || l.includes('"@deepseek-ai/dsh@latest"'));
+    assert.strictEqual(bad.length, 0, f + ' 仍有硬编码 latest 的代码行：' + JSON.stringify(bad));
+  }
+  const mainSrc = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
+  assert.ok(/dshTag\.dshUpgradeCommand\(\)/.test(mainSrc), '升级提示应使用 dshTag.dshUpgradeCommand()');
+  assert.ok(/dshHomeGuard\.checkAndRecord\(/.test(mainSrc), '启动流程应调用版本守卫');
+  assert.ok(/已是标签/.test(mainSrc), '“无需升级”也必须留日志（否则无法分辨是否检查过）');
 });
 
 console.log('');
