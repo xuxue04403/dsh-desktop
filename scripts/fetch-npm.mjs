@@ -6,8 +6,14 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const ROOT = 'D:\\IDE\\dsh\\dsh-app';
+// 第二轮审计修复：项目根由本文件位置推导，不再硬编码开发机路径。
+// 旧实现写死 `D:\IDE\dsh\dsh-app` —— 在其它路径的克隆/副本上运行时，它会去**那个固定路径**
+// 下载并覆盖 out\_npm，而当前仓库的 out\_npm 始终缺失 → 依赖它的 build-portable /
+// build-uat / prepare-extra 三个候选源全部落空（只打印一行"未找到内嵌 npm"），
+// 产物缺少内嵌 npm，dsh 自动升级回退到 PATH 的 npm 而失败（正是本文件注释里那次事故的形态）。
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const OUT = path.join(ROOT, 'out', '_npm');
 const TAR = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe');
 const VERSION = process.argv[2] || '12.1.0';
