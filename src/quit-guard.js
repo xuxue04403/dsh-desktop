@@ -30,7 +30,13 @@ const path = require('path');
 const DEFAULT_WINDOW_MS = 20 * 1000;
 
 // 目录异常膨胀时的扫描上限：退出路径绝不能因为 readdir/stat 卡住。
-const MAX_ENTRIES = 2000;
+// P1（二次复核修复）：旧值 2000 太小且语义有洞——`readdirSync` 的返回顺序**与时间无关**
+// （NTFS 通常按名称序，而会话目录名是随机 id），被截断掉的那部分里可能正包含**当前最活跃**
+// 的会话。结果不是"扫得慢"，而是**退出保护静默失效**（真实忙却被判空闲，任务被直接打断）。
+// 模块头注释里"145 个文件"是新装机的数字；重度/多项目用户突破 2000 只是时间问题。
+// 现在把上限提到 10000，并加一个墙钟预算兜底，保证退出路径总耗时仍有上界。
+const MAX_ENTRIES = 10000;
+const SCAN_BUDGET_MS = 250;   // 超过即停止扫描（宁可少看几个，也不能卡住退出）
 
 /** 解析 DSH_HOME（与 default-plugins / market / watchdog 同一约定）。 */
 function resolveDshHome(explicit) {
@@ -47,6 +53,7 @@ function newestMtime(dir) {
   let names;
   try { names = fs.readdirSync(dir); } catch (_) { return 0; }
   const limit = Math.min(names.length, MAX_ENTRIES);
+  const deadline = Date.now() + SCAN_BUDGET_MS;
   let newest = 0;
   for (let i = 0; i < limit; i++) {
     // 只认普通文件：缓存目录里可能混有子目录（如 sessions 的子级），递归代价不值当
@@ -54,6 +61,8 @@ function newestMtime(dir) {
       const st = fs.statSync(path.join(dir, names[i]));
       if (st.isFile() && st.mtimeMs > newest) newest = st.mtimeMs;
     } catch (_) { /* 单个条目读不到 → 跳过，不影响其余判断 */ }
+    // 墙钟预算：每 128 个条目才看一次时钟，避免 Date.now() 本身成为开销
+    if ((i & 0x7f) === 0 && Date.now() > deadline) break;
   }
   return newest;
 }
