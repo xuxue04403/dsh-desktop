@@ -125,8 +125,57 @@ function probeProxy(url, timeoutMs) {
   });
 }
 
-/** 判断某个 authFile 是否"指向别处/别的用户"（本机不存在即视为失效） */
-function authFileStale(p) {
+// P1（二次复核修复）：单次探测太武断。开机自启场景下代理（clash 等）**晚于**本应用开始监听
+// 是常态，一次 1.5s 探测失败就把用户代理永久关掉——代价与收益完全不成比例。改为多次重试。
+const PROXY_PROBE_ATTEMPTS = 3;
+const PROXY_PROBE_GAP_MS = 700;
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 带重试的代理可达性探测（任一成功即返回）。 */
+async function probeProxyWithRetry(url, timeoutMs) {
+  let last = { ok: false, reason: '未探测' };
+  for (let i = 0; i < PROXY_PROBE_ATTEMPTS; i++) {
+    last = await probeProxy(url, timeoutMs);
+    if (last.ok) return last;
+    if (i < PROXY_PROBE_ATTEMPTS - 1) await sleepMs(PROXY_PROBE_GAP_MS);
+  }
+  return last;
+}
+
+/**
+ * 复检"上次被我们自动关闭的代理"是否已恢复可达（P1 二次复核修复）。
+ *
+ * 只处理**同时满足**下列全部条件的情况，任一不符即放手（绝不覆盖用户自己的选择）：
+ *   ① marker 里记着是我们自动关的；② 配置里代理仍是关闭状态；③ URL 与当初一致；
+ *   ④ 配置文件自那次改动后**没有被再写过**（mtime 未变 → 用户没动过设置页）。
+ *
+ * @returns {Promise<object|null>} 适配结果；null = 无需动作。
+ */
+async function reconcileAutoDisabledProxy(o, dataDir, configPath, marker, log) {
+  const rec = marker && marker.proxyAutoDisabled;
+  if (!rec || !rec.url) return null;
+  let mtime = 0;
+  try { mtime = fs.statSync(configPath).mtimeMs; } catch (_) { return null; }
+  // 容差 1ms：某些文件系统的时间戳精度会带来极小抖动
+  if (rec.configMtimeMs && Math.abs(mtime - rec.configMtimeMs) > 1) return null;
+  const cfg = readJson(configPath);
+  if (!cfg || !cfg.proxy || cfg.proxy.enabled !== false) return null;
+  if (String(cfg.proxy.url || '') !== String(rec.url)) return null;
+  const r = await probeProxyWithRetry(cfg.proxy.url, o.proxyTimeoutMs || 1500);
+  if (!r.ok) return null;
+  cfg.proxy.enabled = true;
+  writeJsonAtomic(configPath, cfg);
+  let nm = 0;
+  try { nm = fs.statSync(configPath).mtimeMs; } catch (_) { /* 忽略 */ }
+  writeJsonAtomic(path.join(dataDir, MARKER_NAME), Object.assign({}, marker, {
+    appliedAt: new Date().toISOString(), appliedAtLocal: stamp(), machine: machineId(),
+    proxyAutoDisabled: null, proxyReenabledAtLocal: stamp(), proxyReenabledMtimeMs: nm,
+  }));
+  log('· 代理 ' + rec.url + ' 已恢复可达 → 自动重新启用（上次因本机不可达被关闭）');
+  return { ok: true, action: 'adapted', message: '代理已恢复并重新启用', changes: ['代理重新启用：' + rec.url] };
+}
+
+/** 判断某个 authFile 是否"指向别处/别的用户"（本机不存在即视为失效） */function authFileStale(p) {
   const s = String(p || '').trim();
   if (!s) return false;                                      // 留空 = 自动发现，本来就对
   try { return !fs.statSync(s).isFile(); } catch (_) { return true; }
@@ -153,6 +202,9 @@ async function applyIfNeeded(o) {
   const marker = readJson(markerPath);
   const me = machineId();
   if (!o.force && marker && marker.machine === me) {
+    // P1（二次复核修复）："代理被自动关闭"不该是永久决定——见 reconcileAutoDisabledProxy。
+    const reconciled = await reconcileAutoDisabledProxy(o, dataDir, configPath, marker, log);
+    if (reconciled) return reconciled;
     return { ok: true, action: 'noop', message: '本机已适配过（' + me + '）', changes: [] };
   }
 
@@ -192,11 +244,14 @@ async function applyIfNeeded(o) {
   }
 
   // ③ 代理：本机连不上就关掉（否则境外供应商全部连不上，且错误会被记在上游账号头上）
+  //    P1：改为带重试探测，并把"这是自动关闭的"记进 marker，供下次启动复检。
+  let proxyAutoDisabled = null;
   if (cfg.proxy && cfg.proxy.enabled !== false && cfg.proxy.url) {
-    const r = await probeProxy(cfg.proxy.url, o.proxyTimeoutMs || 1500);
+    const r = await probeProxyWithRetry(cfg.proxy.url, o.proxyTimeoutMs || 1500);
     if (!r.ok) {
       cfg.proxy.enabled = false;
-      changes.push(`代理 ${cfg.proxy.url} 本机不可达（${r.reason}）→ 已关闭；如本机确有代理请在设置页重新启用`);
+      proxyAutoDisabled = { url: cfg.proxy.url, atLocal: stamp(), reason: String(r.reason || '') };
+      changes.push(`代理 ${cfg.proxy.url} 本机不可达（${r.reason}，已重试 ${PROXY_PROBE_ATTEMPTS} 次）→ 已关闭；下次启动会自动复检，本机确有代理也可在设置页启用`);
     }
   }
 
@@ -209,10 +264,15 @@ async function applyIfNeeded(o) {
   const bak = configPath + '.bak-machineadapt-' + Date.now();
   try { fs.copyFileSync(configPath, bak); } catch (_) { /* 备份失败不阻断 */ }
   writeJsonAtomic(configPath, cfg);
-  writeJsonAtomic(markerPath, {
+  // P1：记下写入后的 mtime —— 下次启动据此判断"用户之后是否又动过设置"，
+  // 动过（mtime 变化）就不自动改回，避免覆盖用户的主动选择。
+  if (proxyAutoDisabled) {
+    try { proxyAutoDisabled.configMtimeMs = fs.statSync(configPath).mtimeMs; } catch (_) { /* 忽略 */ }
+  }
+  writeJsonAtomic(markerPath, Object.assign({
     appliedAt: new Date().toISOString(), appliedAtLocal: stamp(), machine: me,
     from: marker ? marker.machine : null, changes,
-  });
+  }, proxyAutoDisabled ? { proxyAutoDisabled } : {}));
   changes.forEach((c) => log('· ' + c));
   return { ok: true, action: 'adapted', message: changes.length + ' 项已适配（备份 ' + path.basename(bak) + '）', changes };
 }
