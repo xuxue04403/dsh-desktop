@@ -261,7 +261,7 @@ t('gateway：saveConfig 原子落盘（不留 .tmp、内容正确）', async () 
   });
   gm.init();
   const good = JSON.stringify({
-    port: 3091, apiKey: 'k',
+    port: 3091, apiKey: 'dsh-gateway-testkey-0123456789',
     providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk-1', models: ['m'], priority: 1, enabled: true }],
   });
   const r = await gm.saveConfig(good);              // running=false → 不会 restart
@@ -413,6 +413,33 @@ t('renderer：核心 bundle 不提供「卸载」（防误卸 dsh 本体）', ()
   assert.ok(/core: \/\^@deepseek-ai\\\/\//.test(html), '已安装视图应标记核心包');
 });
 
+t('scripts：发布产物必须排除 *.bak 与 default_app.asar（第二轮审计修复）', () => {
+  const pub = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'publish.mjs'), 'utf8');
+  // set-exe-icon.cjs 会在**绿目录内部**留下 DSH-App.exe.bak（Electron 二进制，约 237MB）；
+  // 打包排除名单漏了 *.bak → 发布 zip 体积近乎翻倍，且把一个本不该公开的备份外发。
+  assert.ok(/ZIP_SKIP_FILE_RE = \/\\\.\(log\|tmp\|bak\)\$\|\\\.bak\[-\.\]\/i/.test(pub),
+    'ZIP_SKIP_FILE_RE 必须覆盖 *.bak 与 *.bak-xxx：' + (pub.match(/ZIP_SKIP_FILE_RE = .*/) || [''])[0]);
+  assert.ok(/default_app\.asar/.test(pub), 'default_app.asar 应被排除');
+  const ps1 = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'release.ps1'), 'utf8');
+  assert.ok(/'\*\.bak'/.test(ps1), 'release.ps1 的 tar 排除名单也必须含 *.bak');
+});
+
+t('renderer：供应商编辑器不静默丢弃未应用的修改，删除回调有空值守卫（第二轮审计修复）', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'settings.html'), 'utf8');
+  // ① 脏标记 + 切行前确认：旧版点列表任意一行 / 点 ▲▼ 都会无条件 gwOpenEditor() 覆盖输入框，
+  //    用户刚改的内容无提示消失。
+  assert.ok(/let gwDirty = false/.test(html), '应有未应用改动的脏标记');
+  assert.ok(/function gwConfirmDiscard\(\)/.test(html), '应有"丢弃前确认"助手');
+  assert.ok(/if \(!gwConfirmDiscard\(\)\) return;/.test(html), '切行/移动前必须调用确认');
+  assert.ok(/gwDirty = false;/.test(html), '打开编辑器与应用修改后都应清除脏标记');
+  assert.ok(/addEventListener\('input', mark, true\)/.test(html), '编辑器输入应委托标记为脏');
+  // ② 删除回调必须先判存在性：旧版直接取 gwCfg.providers[i].id，gwCfg 为 null 或下标越界时
+  //    抛 TypeError，且异常在 forEach 回调里 → 中断本次渲染，▲▼ 按钮状态停在上一轮。
+  assert.ok(/const target = gwCfg && Array\.isArray\(gwCfg\.providers\) \? gwCfg\.providers\[i\] : null;/.test(html),
+    '删除前必须做存在性检查');
+  assert.ok(!/gwCfg\.providers\[i\]\.id/.test(html), '不得再直接取 gwCfg.providers[i].id');
+});
+
 t('settings：新增默认项 trayBalloonShown（托盘气泡仅首次）', () => {
   assert.strictEqual(DEFAULTS.trayBalloonShown, false);
 });
@@ -428,6 +455,42 @@ t('settings：端口越界在 update() 内被兜底（手改/异常输入不落�
   assert.strictEqual(s.data.port, DEFAULTS.port);
   s.update({ port: 3100 });
   assert.strictEqual(s.data.port, 3100, '合法端口应保留');
+});
+
+t('settings：update() 走白名单 + 类型校验（P0-3：任意键/任意类型不得落盘）', () => {
+  const { Settings, sanitizePatch } = require(path.join(SRC, 'settings.js'));
+  const dir = fs.mkdtempSync(path.join(tmpRoot, 'sw-'));
+  const s = new Settings(dir);
+  s.load();
+
+  // ① 未知键一律丢弃（旧实现 Object.assign 会原样落盘）
+  s.update({ totallyUnknown: 'x', anotherOne: 1 });
+  assert.strictEqual(s.data.totallyUnknown, undefined, '未知键不得落盘');
+  assert.strictEqual(s.data.anotherOne, undefined, '未知键不得落盘');
+
+  // ② 类型不符不得覆盖既有值——字符串 "false" 是真值，会让"关掉退出确认"静默失效
+  s.data.minimizeToTray = true;
+  s.update({ minimizeToTray: 'false' });
+  assert.strictEqual(s.data.minimizeToTray, true, '字符串 "false" 不得覆盖布尔值');
+  s.update({ safeMode: 1 });
+  assert.strictEqual(s.data.safeMode, false, '数字不得当作 boolean 接受');
+
+  // ③ workDir 决定 dsh 子进程的 cwd，必须是字符串
+  s.update({ workDir: 12345 });
+  assert.notStrictEqual(s.data.workDir, 12345, 'workDir 非字符串必须被拒绝');
+
+  // ④ sanitizePatch 可独立验证
+  assert.deepStrictEqual(
+    sanitizePatch({ safeMode: true, safeModeLevel: 2, workDir: 'D:\\x', bogus: 1 }),
+    { safeMode: true, safeModeLevel: 2, workDir: 'D:\\x' },
+    'sanitizePatch 应只放行白名单内的合法键值');
+  assert.deepStrictEqual(sanitizePatch(null), {}, 'null 补丁应得到空对象');
+  assert.deepStrictEqual(sanitizePatch([1, 2]), {}, '数组补丁应被拒绝');
+
+  // ⑤ 合法值确实落盘，且文件是完整 JSON（原子写）
+  s.update({ port: 3200 });
+  const onDisk = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'));
+  assert.strictEqual(onDisk.port, 3200, '合法端口应落盘');
 });
 
 // ================= 6. 2026-09-10 第二轮：src 其余修复 =================
@@ -512,6 +575,25 @@ t('logger：resetWebLineState 把残留半行落盘，新进程第一行独立�
   assert.strictEqual(lines.length, 2, '残留半行应与新行分开：' + JSON.stringify(lines));
   assert.ok(/\] killed mid-line$/.test(lines[0]), '残留半行应在复位时落盘：' + lines[0]);
   assert.ok(/^\[[\d\- :]+\] fresh start$/.test(lines[1]), '新行必须独立带时间戳：' + lines[1]);
+});
+
+t('logger：落盘前统一脱敏（启动令牌/密钥不得进 app.log 与 web.log）', () => {
+  const logger = require(path.join(SRC, 'logger.js'));
+  const dir = fs.mkdtempSync(path.join(tmpRoot, 'logmask-'));
+  logger.init(dir);
+  const token = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+  // 就绪行形态（launcher.REGEX_URL_LINE 解析的那行）+ 供应商 key
+  logger.appendLog('dsh web: http://127.0.0.1:3080/?token=' + token);
+  logger.appendLog('apiKey: nvapi-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456');
+  logger.appendWeb('listing service with token=' + token + '\n');
+  const app = fs.readFileSync(path.join(dir, 'logs', 'app.log'), 'utf8');
+  const web = fs.readFileSync(path.join(dir, 'logs', 'web.log'), 'utf8');
+  assert.ok(!app.includes(token), 'app.log 不得含明文启动令牌：' + app);
+  assert.ok(!web.includes(token), 'web.log 不得含明文启动令牌：' + web);
+  assert.ok(!app.includes('nvapi-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456'), 'app.log 不得含明文供应商 key：' + app);
+  // 正常文本必须原样保留（脱敏不能把日志内容改得认不出来）
+  assert.ok(/dsh web: http:\/\/127\.0\.0\.1:3080\/\?token=/.test(app), '就绪行结构应保留：' + app);
+  assert.ok(/listing service with token=/.test(web), 'web.log 行内容应保留：' + web);
 });
 
 t('watchdog：带时间戳的 web.log 仍能正确解析故障插件（时间戳不得污染条目名）', () => {
@@ -692,7 +774,10 @@ t('main.js：输入历史按会话隔离（不再全站一个桶）', () => {
 
 t('main.js：会话 id 提取有优先级，且用会话库校验、旧历史一次性迁移', () => {
   const src = fs.readFileSync(path.join(SRC, 'main.js'), 'utf8');
-  assert.ok(/function knownSessionIds\(\)/.test(src), '应有会话库（~/.dsh/sessions）校验');
+  // 第二轮审计：knownSessionIds 增加可选 force（遇到未知 id 时强制刷新一次缓存，
+  // 否则"刚新建的会话"在 60 秒缓存期内会被判为查不到）
+  assert.ok(/function knownSessionIds\([^)]*\)/.test(src), '应有会话库（~/.dsh/sessions）校验');
+  assert.ok(/knownSessionIds\(true\)/.test(src), '未知会话 id 应强制刷新一次缓存再判');
   assert.ok(/!ids\.has\(sid\) && ihSid && ids\.has\(ihSid\)/.test(src),
     '不因为一个查不到的候选 id 丢掉已验证的会话');
   assert.ok(/legacyMigrated/.test(src) && /一次性迁移/.test(src), '旧版全站历史应一次性并入会话桶');
@@ -779,7 +864,7 @@ t('网关：配置校验接受映射条目、拒绝非法条目', () => {
 t('网关：配置校验覆盖 WorkBuddy 新字段（protocol/quirks/headers/accounts/auth）', () => {
   const { validateConfigText } = require(path.join(SRC, 'gateway-manager.js'));
   const check = (extra) => validateConfigText(JSON.stringify({
-    port: 3091, apiKey: 'k',
+    port: 3091, apiKey: 'dsh-gateway-testkey-0123456789',
     providers: [Object.assign({ id: 'p', baseURL: 'https://copilot.tencent.com/v2', apiKey: 'sk-x', models: ['m'] }, extra)],
   }));
   // 合法：完整的 WorkBuddy 形态
@@ -1173,6 +1258,14 @@ t('日志时间戳：缺省北京时间（与机器时区无关），DSH_LOG_TZ 
     near(fresh('-05:30').stamp(), Date.now() - 330 * 60000, '-05:30 应生效');
     near(fresh('+0530').stamp(), Date.now() + 330 * 60000, '+0530（无冒号）应生效');
     assert.strictEqual(fresh('乱填的值').tzOffsetMin(), 480, '非法取值应回退北京时间');
+    // 第二轮审计修复：越界偏移必须回退，否则 getTime()+off*60000 会让日志时间静默偏移
+    // 最多约 4 天（时间戳与真实事件顺序矛盾，排查被误导）。
+    assert.strictEqual(fresh('+99:00').tzOffsetMin(), 480, '+99:00 越界应回退北京时间');
+    assert.strictEqual(fresh('+99:99').tzOffsetMin(), 480, '+99:99 越界应回退北京时间');
+    assert.strictEqual(fresh('+15:00').tzOffsetMin(), 480, '+15:00 超出 UTC+14 应回退');
+    assert.strictEqual(fresh('-12:00').tzOffsetMin(), -720, '-12:00 是合法最小范围');
+    assert.strictEqual(fresh('+14:00').tzOffsetMin(), 840, '+14:00 是合法最大范围');
+    assert.strictEqual(fresh('+08:60').tzOffsetMin(), 480, '分钟 60 越界应回退');
     // 毫秒格式（网关日志）
     assert.ok(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}$/.test(fresh(undefined).stampMs()), 'stampMs 应带毫秒');
   } finally {
@@ -1756,14 +1849,34 @@ t('renderer：自定义请求头（headers）文本 ↔ 对象互转无损（真
   assert.strictEqual(Object.getPrototypeOf(gwParseHeaders('A: 1')), Object.prototype);
 });
 
+  // 第四轮审计修复（测试基础设施）：单条用例失败**不再中断整套**。
+  // 旧实现是 `for (...) { await fn(); passed++; }` —— 任何一条抛错就跳出循环，
+  // 其后的用例**一个都不跑**（一个失败掩盖后续全部回归，排查时极难定位），
+  // 而结尾又固定打印 "0 failed"（失败时那句汇总其实永远执行不到，等于双重失真）。
+  // 现在：跑完全部用例、逐条报错、汇总真实数字，并在最后按失败数决定退出码。
+  let failed = 0;
+  const failures = [];
   for (const { name, fn } of __tests) {
-    await fn();
-    passed++;
-    report('PASS  ' + name);
+    try {
+      await fn();
+      passed++;
+      report('PASS  ' + name);
+    } catch (e) {
+      failed++;
+      failures.push(name);
+      report('FAIL  ' + name);
+      const detail = String((e && e.stack) || e).split('\n').slice(0, 4).join('\n        ');
+      report('        ' + detail);
+    }
   }
-  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
   report('');
-  report('===== ' + passed + ' passed, 0 failed =====');
+  report('===== ' + passed + ' passed, ' + failed + ' failed =====');
+  if (failed) {
+    report('失败用例：');
+    failures.forEach((n) => report('  ✗ ' + n));
+    process.exit(1);
+  }
   process.exit(0);   // 桩化的子进程/定时器可能悬挂 → 显式退出
 })().catch((e) => {
   report('FAIL  ' + (e && e.stack ? e.stack : String(e)));
