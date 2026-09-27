@@ -14,6 +14,7 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { compareVersions } = require('./launcher');
+const { dshDistTag, dshRegistry, dshInstallSpec, dshVersionUrl, dshUpgradeCommand } = require('./dsh-tag');
 
 // shell 命令行参数引用（审计修复）：含空格/特殊字符时用双引号包裹并转义内部引号。
 // 仅在 Windows shell 回退路径使用（真正的 npm-cli 路径走数组传参，不经过 shell）。
@@ -23,12 +24,11 @@ function shellQuote(a) {
   return '"' + s.replace(/"/g, '\\"') + '"';
 }
 
+// 查询「本次跟随的标签」对应的版本（v1.9.1：不再写死 latest，见 dsh-tag.js 的事故说明）。
+// 返回 null 表示查询失败（断网/镜像异常），调用方按"无法判断"处理，不阻断启动。
 function latestVersion(timeoutMs = 8000) {
-  // v1.5.17c：默认 npmmirror（与安装源一致，国内网络稳定）；DSH_NPM_REGISTRY 可覆盖
-  const registry = (process.env.DSH_NPM_REGISTRY || 'https://registry.npmmirror.com')
-    .replace(/\/+$/, '');
   return new Promise((resolve) => {
-    const req = https.get(registry + '/@deepseek-ai/dsh/latest', {
+    const req = https.get(dshVersionUrl(), {
       timeout: timeoutMs,
       headers: { 'User-Agent': 'dsh-app/0.1.0' },
     }, (res) => {
@@ -54,7 +54,7 @@ async function checkForUpdate(localVersion) {
   const latest = await latestVersion();
   if (!latest) return null;
   if (compareVersions(latest, localVersion) > 0) {
-    return { local: localVersion, latest, command: 'npm i -g @deepseek-ai/dsh@latest' };
+    return { local: localVersion, latest, tag: dshDistTag(), command: dshUpgradeCommand() };
   }
   return null;
 }
@@ -77,7 +77,7 @@ function findNpmCli(nodePath) {
 }
 
 /**
- * 执行升级：npm i -g @deepseek-ai/dsh@latest
+ * 执行升级：npm i -g @deepseek-ai/dsh@<标签>（标签见 dsh-tag.js，缺省 latest）
  * v1.5.17：
  *  - nodeInfo（launcher.findNode() 结果）指定运行时；内嵌模式（embedded）时 npm-cli
  *    优先用随应用打包的（launcher.findEmbeddedNpmCli），并安装到便携前缀 prefix
@@ -91,7 +91,6 @@ function performUpgrade(opts) {
   const nodeInfo = o.nodeInfo || { exe: 'node', env: {}, embedded: false };
   const nodePath = typeof nodeInfo === 'string' ? nodeInfo : nodeInfo.exe;
   return new Promise((resolve) => {
-    const registry = process.env.DSH_NPM_REGISTRY || '';
     let npmCli;
     if (o.prefix) {
       // 内嵌/便携模式：优先随应用打包的 npm-cli（不依赖系统 npm）
@@ -101,12 +100,15 @@ function performUpgrade(opts) {
       npmCli = findNpmCli(nodePath);
     }
     const useNode = npmCli !== 'npm';
+    // v1.9.1：跟随可配置标签（DSH_DSH_TAG），不再写死 latest——否则主目录与 UAT 会
+    // 因标签不同而跑成两个 dsh 版本，而两者共用 ~/.dsh，旧版会把新版状态改坏。
+    const spec = dshInstallSpec();
     const args = useNode
-      ? [npmCli, 'install', '-g', '@deepseek-ai/dsh@latest', '--no-fund', '--no-audit', '--force']
-      : ['install', '-g', '@deepseek-ai/dsh@latest', '--no-fund', '--no-audit', '--force'];
+      ? [npmCli, 'install', '-g', spec, '--no-fund', '--no-audit', '--force']
+      : ['install', '-g', spec, '--no-fund', '--no-audit', '--force'];
     if (o.prefix) args.push('--prefix', o.prefix);
     // v1.5.17c：默认 npmmirror（默认源国内会残缺——实测 zod 缺 index.js 导致启动崩）
-    args.push('--registry', registry || 'https://registry.npmmirror.com');
+    args.push('--registry', dshRegistry());
 
     const spawnEnv = Object.assign({}, process.env,
       nodeInfo && nodeInfo.env ? nodeInfo.env : {});
