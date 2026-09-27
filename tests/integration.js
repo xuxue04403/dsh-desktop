@@ -56,7 +56,8 @@ t('网关：configPort 读取配置内端口', () => {
 t('网关：saveConfig 校验并写盘（合法）', async () => {
   const good = JSON.stringify({
     port: 3090,
-    apiKey: 'k',
+    // 第四轮：顶层统一 Key 必须 ≥16 字符（网关 authorized() 的门槛）
+    apiKey: 'dsh-gateway-testkey-0123456789',
     providers: [{ id: 'a', baseURL: 'https://a.com/v1', apiKey: 'sk-1', models: ['m'], priority: 1, enabled: true }],
   });
   const r = await gm.saveConfig(good);
