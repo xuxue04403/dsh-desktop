@@ -583,6 +583,26 @@
     let gwCfg = null;         // 当前配置对象（表格编辑的权威数据）
     let gwSel = -1;           // 选中供应商下标
     let gwUpdating = false;   // 表格→JSON 同步防回环
+    // 第二轮审计修复：编辑器输入框与 gwCfg 是两套状态，只有「应用修改」会把输入写回 gwCfg。
+    // 旧实现里点列表任意一行 / 点 ▲▼ 都会无条件 gwOpenEditor() 覆盖输入框，**静默丢弃**
+    // 用户刚改的内容（界面没有任何提示）。这里用一个脏标记 + 切行前确认来兜住。
+    let gwDirty = false;      // 编辑器有未「应用修改」的内容
+
+    /** 编辑器是否有未应用改动；有则先确认（返回 false = 用户取消本次切换） */
+    function gwConfirmDiscard() {
+      if (!gwDirty || gwSel < 0) return true;
+      return confirm('编辑器里有尚未「应用修改」的内容，继续操作会丢弃这些修改。确定继续？');
+    }
+
+    // 第二轮审计修复：编辑器内任何输入/勾选都标记为"有未应用改动"。用事件委托 + 捕获阶段，
+    // 覆盖所有字段（含动态生成的模型映射行、多行 Key / 请求头文本框），无需逐个绑定。
+    (function wireGwDirty() {
+      const box = $('gwEditorFields');
+      if (!box) return;
+      const mark = () => { if (gwSel >= 0) gwDirty = true; };
+      box.addEventListener('input', mark, true);
+      box.addEventListener('change', mark, true);
+    })();
 
     // 审计修复（P2）：日志框「上次写入的文本」——旧版每 2 秒无条件写 value + 滚到底，
     // 日志无法阅读/复制/向上滚动。
@@ -659,6 +679,7 @@
       if (i < 0 || i >= gwCfg.providers.length) return;
       const j = i + delta;
       if (j < 0 || j >= gwCfg.providers.length) return;
+      if (!gwConfirmDiscard()) return;   // 第二轮审计修复：不静默丢弃未应用的编辑
       const arr = gwCfg.providers;
       const tmp = arr[i];
       arr[i] = arr[j];
@@ -702,7 +723,8 @@
           p.enabled = e.target.checked;
           gwSyncText();
         };
-        row.onclick = () => { gwSel = i; gwRenderRows(); gwOpenEditor(i); };
+        // 第二轮审计修复：切行前先确认，避免静默丢弃编辑器里未应用的内容
+        row.onclick = () => { if (!gwConfirmDiscard()) return; gwSel = i; gwRenderRows(); gwOpenEditor(i); };
         box.appendChild(row);
       });
       // 按钮事件（edit=打开编辑面板；del=删除）
@@ -710,12 +732,21 @@
         b.onclick = (e) => {
           e.stopPropagation();
           const i = parseInt(b.dataset.i, 10);
-          if (b.dataset.act === 'edit') { gwSel = i; gwRenderRows(); gwOpenEditor(i); }
+          if (b.dataset.act === 'edit') {
+            if (!gwConfirmDiscard()) return;
+            gwSel = i; gwRenderRows(); gwOpenEditor(i);
+          }
           else {
-            if (confirm('确定删除供应商「' + (gwCfg.providers[i].id || i) + '」？')) {
+            // 第二轮审计修复：旧实现取供应商对象时**不判存在性**（gwCfg 为 null 或下标越界，
+            // 例如 confirm 弹窗期间列表被别处改短）→ TypeError；而异常发生在 forEach 回调里，
+            // 会中断本次 gwRenderRows()，使 gwSyncMoveButtons() 不执行（▲▼ 状态停在上一轮）。
+            const target = gwCfg && Array.isArray(gwCfg.providers) ? gwCfg.providers[i] : null;
+            if (!target) { gwRenderRows(); return; }
+            if (confirm('确定删除供应商「' + (target.id || i) + '」？')) {
               gwCfg.providers.splice(i, 1);
               if (gwSel > i) gwSel--;
               gwSel = -1;
+              gwDirty = false;
               gwHideEditor();
               gwSyncText();
               gwRenderRows();
@@ -1008,7 +1039,9 @@
     }
 
     function gwOpenEditor(i) {
-      const p = gwCfg.providers[i];
+      // 第二轮审计修复：同删除分支——先判 gwCfg/数组存在再取下标元素，
+      // 避免 gwCfg 为 null（配置未加载/读取失败）时抛 TypeError 中断渲染。
+      const p = gwCfg && Array.isArray(gwCfg.providers) ? gwCfg.providers[i] : null;
       if (!p) return;
       $('gwEditId').textContent = p.id || '';
       $('eId').value = p.id || '';
@@ -1045,6 +1078,8 @@
       }
       $('gwEditorEmpty').style.display = 'none';
       $('gwEditorFields').classList.remove('hidden');
+      // 第二轮审计修复：刚用 gwCfg 的值填满输入框 → 此时没有"未应用的改动"
+      gwDirty = false;
     }
 
     function gwHideEditor() {
@@ -1101,6 +1136,8 @@
       }
       gwSyncText();
       gwRenderRows();
+      // 第二轮审计修复：输入已写回 gwCfg → 清除脏标记（否则下次切行会误弹确认框）
+      gwDirty = false;
       toast('已应用到配置（点击「保存并重启网关」生效）');
       return true;
     }
@@ -1404,7 +1441,17 @@
       $('mkStatus').textContent = '已加载 ' + r.items.length + ' 个插件' + (mkCursor ? '（可再次搜索加载更多）' : '（已到末页）');
       if (isFirstPage) list.innerHTML = '';
       for (const item of r.items) list.appendChild(mkRow(item, installedSet));
-      if (!r.items.length) list.innerHTML = '<div style="color:#8a93a3;font-size:12px;padding:14px 8px;">无匹配结果。</div>';
+      // 第三轮审计修复：空结果提示只在**首页**替换列表。
+      // 旧实现无条件 `list.innerHTML = '无匹配结果。'` —— "加载更多"返回空（正常翻到末页）时，
+      // 会把已经渲染出来的整页结果**清空**，而状态栏同一时刻写着"已加载 0 个插件（已到末页）"，
+      // 用户眼睁睁看着列表消失。
+      if (!r.items.length) {
+        if (isFirstPage) {
+          list.innerHTML = '<div style="color:#8a93a3;font-size:12px;padding:14px 8px;">无匹配结果。</div>';
+        } else {
+          $('mkStatus').textContent = '没有更多了（已到末页）';
+        }
+      }
     }
 
     async function mkInstall(pkg, label) {
