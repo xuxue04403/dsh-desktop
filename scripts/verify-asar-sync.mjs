@@ -88,11 +88,41 @@ function sha256File(file) {
   return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
 }
 
+/**
+ * 递归列出源码侧应当进入 asar 的全部文件（相对项目根的 posix 路径）。
+ *
+ * 第二轮审计修复：旧默认只比对 DEFAULT_ENTRIES 里的 9 个条目，却输出
+ * "全部一致，绿目录代码 == 当前源码" —— 改过 `src/preload.js` / `renderer/status.html` /
+ * `src/settings.js` 而没重新构建时，脚本照样报通过（发布者据此以为产物与源码一致）。
+ * 现在默认做**全量**比对；显式传入条目参数时仍按传入的条目比对（保留原用法）。
+ */
+function collectSourceFiles() {
+  const out = [];
+  for (const top of ['src', 'renderer']) {
+    const root = path.join(ROOT, top);
+    if (!fs.existsSync(root)) continue;
+    const stack = [root];
+    while (stack.length) {
+      const dir = stack.pop();
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) stack.push(full);
+        else if (e.isFile()) out.push(path.relative(ROOT, full).split(path.sep).join('/'));
+      }
+    }
+  }
+  if (fs.existsSync(path.join(ROOT, 'package.json'))) out.push('package.json');
+  return out.sort();
+}
+
 function main() {
   const args = process.argv.slice(2);
   const dirArg = args[0] && !args[0].endsWith('.js') && !args[0].endsWith('.mjs') ? args[0] : 'out/DSH-App';
-  const rest = args.filter((a) => a !== dirArg);
-  const entries = rest.length ? rest : DEFAULT_ENTRIES;
+  const rest = args.filter((a) => a !== dirArg && a !== '--quick');
+  const quick = args.includes('--quick');
+  // 显式传条目 → 只比这些；--quick → 只比关键子集；否则**全量**比对 src/ + renderer/ + package.json
+  const explicit = rest.length > 0;
+  const entries = explicit ? rest : (quick ? DEFAULT_ENTRIES : collectSourceFiles());
 
   const greenDir = path.resolve(ROOT, dirArg);
   const asarPath = path.join(greenDir, 'resources', 'app.asar');
@@ -159,11 +189,25 @@ function main() {
   }
 
   console.log('');
-  if (bad || missing) {
-    console.log(`[FAIL] 不一致 ${bad} 项，缺失/无法校验 ${missing} 项`);
+  // 反向检查：asar 里 src\ / renderer\ 下还留着源码已删除的文件（陈旧副本）。
+  // 旧实现只做"源码 → asar"单向核对，源码里删掉的文件会永远留在产物里而无人发现。
+  let stale = 0;
+  if (!explicit) {
+    const want = new Set(entries);
+    for (const k of files.keys()) {
+      const rel = k.replace(/^app\//, '');
+      if (!/^(src|renderer)\//.test(rel)) continue;
+      if (want.has(rel)) continue;
+      console.log(`  [残留] ${rel.padEnd(28)} 产物内存在但源码已无此文件`);
+      stale++;
+    }
+  }
+
+  if (bad || missing || stale) {
+    console.log(`[FAIL] 不一致 ${bad} 项，缺失/无法校验 ${missing} 项，产物残留 ${stale} 项`);
     process.exit(1);
   }
-  console.log('[OK] 全部一致，绿目录代码 == 当前源码');
+  console.log(`[OK] 已比对 ${entries.length} 个条目（${explicit ? '指定条目' : quick ? '关键子集 --quick' : '全量 src/+renderer/+package.json'}），全部一致`);
 }
 
 main();
