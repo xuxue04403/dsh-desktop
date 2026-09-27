@@ -136,18 +136,67 @@ function validateConfigText(text) {
       return { ok: false, error: '缺少或非法 port（必须是 1-65535 整数；dsh-app 网关约定 3091）' };
     }
   }
+  // 第四轮审计修复：顶层统一 Key 必须能通过**运行期**的鉴权门槛。
+  // 网关 `authorized()` 要求 trim 后 ≥16 字符（fail-closed，防"空 key 绕过"），而旧校验器
+  // 完全不看这个 key —— 于是"网关运行中、/health 返回 200、但每个模型请求都 401"的配置
+  // 能被保存，用户看到的现象正是"所有网关调用均失败"。公开占位串同理（示例文件的默认值，
+  // 任何拿到它的人都能白用你的上游额度；--write-dsh 早就拒绝它，两处标准必须一致）。
+  if (cfg.apiKey !== undefined && cfg.apiKey !== null && String(cfg.apiKey).trim() !== '') {
+    const k = String(cfg.apiKey).trim();
+    if (k === 'dsh-gateway-change-me') {
+      return { ok: false, error: 'apiKey 仍是示例占位值（dsh-gateway-change-me）：本机任何进程都能白用你的上游额度，请改成自己的随机 Key' };
+    }
+    if (k.length < 16) {
+      return { ok: false, error: 'apiKey 太短（' + k.length + ' 字符）：网关鉴权要求 ≥16 字符，否则所有请求都会 401' };
+    }
+  }
+  // 第四轮审计修复：供应商 id 必须唯一。运行期一切按 `provider.id` 为键的状态（熔断、目录缓存、
+  // thinking 学习、Responses 亲和）都会在同 id 的两家之间**串味**：一家 401 会把另一家一起
+  // 熔断 30 分钟；previous_response_id 还可能被钉到没创建它的那家 → 上游 404。
+  const seenIds = new Set();
   for (const p of cfg.providers) {
     if (!p || typeof p !== 'object') return { ok: false, error: 'providers 中存在非对象条目' };
     if (!p.id || typeof p.id !== 'string') return { ok: false, error: '供应商缺少 id（字符串）' };
+    if (seenIds.has(p.id)) {
+      return { ok: false, error: '供应商 id 重复："' + p.id + '"（熔断/目录/亲和状态按 id 共享，必须唯一）' };
+    }
+    seenIds.add(p.id);
     if (!p.baseURL || typeof p.baseURL !== 'string') return { ok: false, error: '供应商 ' + (p.id || '?') + ' 缺少 baseURL' };
+    // 第四轮审计修复：baseURL 必须是 http(s) 绝对地址。旧校验只查"非空字符串"，于是
+    // 缺 scheme（`api.example.com/v1`）或纯空白的配置能存进去 → 网关正常 listen，但每次
+    // fetch 都因非法 URL 失败 → 恒 503 all providers unavailable，极难与"key 不对"区分。
+    {
+      let u = null;
+      try { u = new URL(String(p.baseURL).trim()); } catch (_) { /* 落到下面统一报错 */ }
+      if (!u || (u.protocol !== 'http:' && u.protocol !== 'https:')) {
+        return { ok: false, error: '供应商 ' + p.id + ' 的 baseURL 必须是 http(s) 绝对地址（如 https://api.example.com/v1），当前：' + JSON.stringify(p.baseURL) };
+      }
+    }
     // 模型映射（2026-09-11）：models 每项是字符串（上游 ID = 逻辑名）或 {id, as} 映射对象
     if (p.models !== undefined) {
       const who = '供应商 ' + (p.id || '?') + ' 的 models';
       if (!Array.isArray(p.models)) return { ok: false, error: who + ' 必须是数组' };
       for (const m of p.models) {
         if (typeof m === 'string') continue;
-        const up = (m && typeof m === 'object' && !Array.isArray(m)) ? (m.id ?? m.up ?? m.upstream) : undefined;
-        if (typeof up === 'string' && up.trim()) continue;
+        // 第四轮审计修复：补 `?? m.model` —— 运行期（model-gateway 的 modelEntries）与配置页
+        // 都认 `model` 这个别名，只有校验器不认 → 合法的映射条目在"高级 JSON 直接保存"时被误拒。
+        const up = (m && typeof m === 'object' && !Array.isArray(m)) ? (m.id ?? m.up ?? m.upstream ?? m.model) : undefined;
+        if (typeof up === 'string' && up.trim()) {
+          // 第四轮审计修复：条目内字段类型也要查（旧实现只确认 id 是字符串就放行）——
+          // `contextWindow: "128k"` 会被 Number() 变成 NaN 丢弃 → write-dsh 回退成默认 1024000，
+          // 等于**虚报 1M 上下文**；`vision: "true"` 因 `=== true` 不成立而静默丢失图片能力。
+          if (m.vision !== undefined && typeof m.vision !== 'boolean') {
+            return { ok: false, error: who + ' 的条目 "' + up + '" 的 vision 必须是布尔值（字符串会被忽略 → 图片能力静默丢失）' };
+          }
+          for (const nk of ['contextWindow', 'maxTokens']) {
+            if (m[nk] === undefined) continue;
+            const n = Number(m[nk]);
+            if (!Number.isFinite(n) || n <= 0) {
+              return { ok: false, error: who + ' 的条目 "' + up + '" 的 ' + nk + ' 必须是正数（当前：' + JSON.stringify(m[nk]) + '）' };
+            }
+          }
+          continue;
+        }
         return { ok: false, error: who + ' 存在非法条目——每项应为字符串，或形如 { "id": "上游真实ID", "as": "逻辑模型名" } 的对象' };
       }
     }
@@ -155,6 +204,12 @@ function validateConfigText(text) {
     // 网关只会静默忽略（例如 protocol 拼错 → 仍按 Anthropic 转发 → 上游 404，很难排查）。
     {
       const who = '供应商 ' + (p.id || '?');
+      // 第四轮审计修复：enabled 必须是布尔值。运行期用 `p.enabled !== false` 判启用，
+      // 于是字符串 "false" 被当成**启用**（语义正好相反）——用户以为关掉的家照收流量，
+      // write-dsh 也会把它的模型写进 dsh。
+      if (p.enabled !== undefined && typeof p.enabled !== 'boolean') {
+        return { ok: false, error: who + ' 的 enabled 必须是布尔值（字符串 "false" 会被运行期当成"启用"，语义相反）' };
+      }
       if (p.protocol !== undefined) {
         const proto = String(p.protocol).trim().toLowerCase();
         if (!['openai-chat', 'openai-completions', 'openai', 'anthropic', 'anthropic-messages'].includes(proto)) {
