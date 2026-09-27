@@ -12,6 +12,7 @@ const assert = require('assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { pathToFileURL } = require('url');
 
 const crashReport = require('../src/crash-report');
 const quitGuard = require('../src/quit-guard');
@@ -19,21 +20,33 @@ const webAuth = require('../src/web-auth');
 const pluginSnapshot = require('../src/plugin-snapshot');
 
 let passed = 0;
+let failed = 0;
+const failures = [];
 // 支持同步与异步两种用例：异步失败必须能被捕获到（否则断言失败会被静默吞掉、
 // 而用例照样计入 passed —— 这正是"空转绿灯"的成因）。
+// 第四轮审计修复：失败**不再 rethrow** —— 旧实现里同步用例一抛错就会中断整个文件，
+// 其后的用例一个都不跑、末尾汇总也不打印（一个失败掩盖后续全部回归，排查时极难定位）。
 const pending = [];
 function t(name, fn) {
   let r;
   try {
     r = fn();
   } catch (err) {
+    failed++;
+    failures.push(name);
     console.log('FAIL  ' + name);
-    throw err;
+    console.log('      ' + String((err && err.stack) || err).split('\n').slice(0, 3).join('\n      '));
+    return;
   }
   if (r && typeof r.then === 'function') {
     pending.push(r.then(
       () => { passed++; console.log('PASS  ' + name); },
-      (err) => { console.log('FAIL  ' + name); throw err; },
+      (err) => {
+        failed++;
+        failures.push(name);
+        console.log('FAIL  ' + name + '（异步）');
+        console.log('      ' + String((err && err.stack) || err).split('\n').slice(0, 3).join('\n      '));
+      },
     ));
     return;
   }
@@ -42,8 +55,7 @@ function t(name, fn) {
 }
 
 function mkTemp(tag) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-v190-' + tag + '-'));
-  return dir;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-v190-' + tag + '-'));  return dir;
 }
 function rm(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch (_) { /* 忽略 */ }
@@ -338,7 +350,9 @@ t('plugin-snapshot.verify：随包插件包体缺失必须被报出', () => {
   try {
     fs.writeFileSync(pluginSnapshot.snapshotPath(dir), JSON.stringify({
       capturedAt: '2026-09-25T00:00:00.000Z',
-      plugins: [{ name: 'p-alpha', spec: '1.0.0' }, { name: 'p-beta', spec: '2.0.0' }],
+      // 第四轮修正夹具：判据是**每个插件的 bundled 标记**（capture 只在该插件真的随包成功时才置真），
+      // 而不是 `bundles`（那是 profile 的挂载声明）。旧夹具用 bundles 代替 bundled，固化了错误语义。
+      plugins: [{ name: 'p-alpha', spec: '1.0.0', bundled: true }, { name: 'p-beta', spec: '2.0.0', bundled: true }],
       bundles: ['p-alpha', 'p-beta'],
       dshConfig: { files: [], dirs: [] },
     }), 'utf8');
@@ -388,7 +402,8 @@ t('plugin-snapshot.verify：无随包的插件被列为"需联网安装"而非�
   try {
     fs.writeFileSync(pluginSnapshot.snapshotPath(dir), JSON.stringify({
       capturedAt: '2026-09-25T00:00:00.000Z',
-      plugins: [{ name: 'p-inline', spec: '1.0.0' }, { name: 'p-remote', spec: '3.0.0' }],
+      // p-inline 真的随包（bundled:true）；p-remote 没有 bundled 标记 → 需联网装
+      plugins: [{ name: 'p-inline', spec: '1.0.0', bundled: true }, { name: 'p-remote', spec: '3.0.0' }],
       bundles: ['p-inline'],
       dshConfig: { files: [], dirs: [] },
     }), 'utf8');
@@ -399,6 +414,42 @@ t('plugin-snapshot.verify：无随包的插件被列为"需联网安装"而非�
     const v = pluginSnapshot.verify(dir);
     assert.strictEqual(v.ok, true, '缺随包不算缺陷（可联网装），实得：' + v.message);
     assert.deepStrictEqual(v.plugins.registry, ['p-remote']);
+  } finally { rm(dir); }
+});
+
+t('plugin-snapshot.verify：随包标记为真但不在挂载声明里 → 包体缺失仍须报出（第四轮修复假通过）', () => {
+  // 触发场景（真实可复现）：dsh 停用插件时会从 profile 的 dsh.profile.bundles 摘名，
+  // 但依赖仍留在 package.json → capture 照旧复制包体并置 bundled=true，而名字不在 bundles 里。
+  // 旧 verify 只看 bundles → 包体即使被删也报 ok:true（假通过），新机器离线装不上。
+  const dir = mkTemp('pv5');
+  try {
+    fs.writeFileSync(pluginSnapshot.snapshotPath(dir), JSON.stringify({
+      capturedAt: '2026-09-25T00:00:00.000Z',
+      plugins: [{ name: 'p-orphan', spec: '1.0.0', bundled: true }],
+      bundles: [],                       // ← 挂载声明里没有它（已被停用）
+      dshConfig: { files: [], dirs: [] },
+    }), 'utf8');
+    const v = pluginSnapshot.verify(dir);
+    assert.strictEqual(v.ok, false, '随包标记为真但包体不在，必须判为不完整：' + v.message);
+    assert.deepStrictEqual(v.missingBundles, ['p-orphan']);
+  } finally { rm(dir); }
+});
+
+t('plugin-snapshot.verify：按设计不随包（体积超限/复制失败）不得误报为缺失', () => {
+  // capture 在体积超过随包上限或复制失败时会明确"不随包"（不置 bundled），
+  // 旧实现却按 bundles 判定 → 把"按设计不随包"误报成缺陷。
+  const dir = mkTemp('pv6');
+  try {
+    fs.writeFileSync(pluginSnapshot.snapshotPath(dir), JSON.stringify({
+      capturedAt: '2026-09-25T00:00:00.000Z',
+      plugins: [{ name: 'p-huge', spec: '1.0.0' }],   // 没有 bundled 标记 = 本次未随包
+      bundles: ['p-huge'],                            // 但它仍挂在 profile.bundles 里
+      dshConfig: { files: [], dirs: [] },
+    }), 'utf8');
+    const v = pluginSnapshot.verify(dir);
+    assert.strictEqual(v.ok, true, '未随包不算缺陷（可联网装）：' + v.message);
+    assert.deepStrictEqual(v.missingBundles, []);
+    assert.deepStrictEqual(v.plugins.registry, ['p-huge'], '应如实列为需联网安装');
   } finally { rm(dir); }
 });
 
@@ -564,11 +615,108 @@ t('launcher 补丁：R19 在 0.1.7 上识别「上游已自带」而不是误报
   assert.ok(/src\.includes\('dwFlags: 257'\)/.test(src), '判定上游已修的依据必须写进代码');
 });
 
+// ============ 5. renderer-guard（P0-1 安全修复）============
+// 这条判据同时守着 `will-navigate`（能不能导航过去）与 IPC 守卫（能不能调壳级通道）。
+// 旧实现 = 「file:// 开头」+「路径以 /renderer/x.html 结尾」，磁盘上任意位置的同形路径
+// 都能通过 → 该页面即可 get-config 导出全部明文 API Key。下面重点是**同形路径必须被拒**。
+
+const rendererGuard = require('../src/renderer-guard');
+
+/** 把绝对路径转成 file:// URL（Windows 盘符由 pathToFileURL 正确处理）。 */
+function fileUrl(p) { return pathToFileURL(p).href; }
+
+t('renderer-guard：本应用 renderer 下的 .html 放行', () => {
+  const root = path.join(__dirname, '..', 'renderer');
+  assert.strictEqual(rendererGuard.isAppRendererPage(fileUrl(path.join(root, 'status.html')), root), true,
+    'status.html 必须放行（否则状态页的壳级按钮全部失效）');
+  assert.strictEqual(rendererGuard.isAppRendererPage(fileUrl(path.join(root, 'settings.html')), root), true,
+    'settings.html 必须放行');
+});
+
+t('renderer-guard：任意位置的同形 /renderer/x.html 必须拒绝（P0-1 的核心）', () => {
+  const root = path.join(__dirname, '..', 'renderer');
+  const dir = mkTemp('guard');
+  try {
+    // 攻击者可控的三个位置：临时目录、用户下载目录形态、与应用同级
+    const evil = path.join(dir, 'renderer', 'evil.html');
+    fs.mkdirSync(path.dirname(evil), { recursive: true });
+    fs.writeFileSync(evil, '<script>window.dshApp.gwAction("get-config")</script>', 'utf8');
+    assert.strictEqual(rendererGuard.isAppRendererPage(fileUrl(evil), root), false,
+      '临时目录下的 renderer/evil.html 必须被拒绝（旧实现会放行 → 泄露全部 API Key）');
+
+    const sibling = path.join(dir, 'renderer-evil', 'x.html');
+    fs.mkdirSync(path.dirname(sibling), { recursive: true });
+    fs.writeFileSync(sibling, 'x', 'utf8');
+    assert.strictEqual(rendererGuard.isAppRendererPage(fileUrl(sibling), root), false,
+      '同级 renderer-evil/ 必须被拒绝（前缀比较漏掉尾部分隔符就会误放行）');
+  } finally { rm(dir); }
+});
+
+t('renderer-guard：路径穿越与非 html 必须拒绝', () => {
+  const root = path.join(__dirname, '..', 'renderer');
+  // renderer/../../secret.html —— path.resolve 归一化后会落到 root 之外
+  const escape = path.join(root, '..', '..', 'secret.html');
+  assert.strictEqual(rendererGuard.isAppRendererPage(fileUrl(escape), root), false,
+    '穿越出 renderer 的路径必须被拒绝（归一化后再比较）');
+  assert.strictEqual(rendererGuard.isAppRendererPage(fileUrl(path.join(root, 'preload.js')), root), false,
+    'renderer 下的非 .html 文件不应被当作页面放行');
+});
+
+t('renderer-guard：非 file:// 与畸形输入一律 fail-closed', () => {
+  const root = path.join(__dirname, '..', 'renderer');
+  for (const bad of [
+    'http://127.0.0.1:3080/',                    // dsh web 页面本身
+    'http://127.0.0.1:3080/renderer/x.html',     // 伪造成 renderer 路径的 http
+    'https://evil.example/renderer/x.html',
+    'file:///D:/tmp/renderer/x.html',            // 不同盘/目录
+    'javascript:alert(1)',
+    'not-a-url',
+    '',
+    null,
+    undefined,
+  ]) {
+    assert.strictEqual(rendererGuard.isAppRendererPage(bad, root), false,
+      '必须拒绝：' + JSON.stringify(bad));
+  }
+});
+
+// ============ 6. plugin-snapshot 占位判据（P1：配置被改回去）============
+
+t('plugin-snapshot.looksPlaceholder：占位可被快照替换，已填真实值不可', () => {
+  const { looksPlaceholder } = pluginSnapshot;
+  // 默认插件机制写下的"空壳占位"（只剩空值）→ 应可替换
+  assert.strictEqual(
+    looksPlaceholder('- insert:\n    - id: email\n      name: dsh-email-bridge\n      config:\n        imap: { host: "" }'),
+    true, '空壳占位应判为占位（否则新机器装不回真配置）');
+  // default-plugins.DEFAULT_PATCH_BLOCK 的示例值 → 应可替换
+  assert.strictEqual(
+    looksPlaceholder('- insert:\n    - id: email\n      config:\n        imap:\n          host: imap.example.com\n          user: you@example.com'),
+    true, '默认模板应判为占位');
+  // 用户已填写真实主机/邮箱 → **不得**被替换（这正是"配置被改回去"的修复点）
+  assert.strictEqual(
+    looksPlaceholder('- insert:\n    - id: email\n      config:\n        imap:\n          host: imap.qq.com\n          user: me@qq.com'),
+    false, '已填真实值的条目不得被快照覆盖');
+  // 只有真实主机、没有邮箱
+  assert.strictEqual(
+    looksPlaceholder('- insert:\n    - id: x\n      config:\n        smtp:\n          host: smtp.163.com'),
+    false, '有真实主机即视为已填写');
+  // 空/异常输入不应抛错
+  assert.strictEqual(looksPlaceholder(''), true, '空块视为占位');
+  assert.strictEqual(looksPlaceholder(null), true, 'null 不应抛错');
+});
+
 console.log('');
+// 第四轮审计修复：汇总打印**真实**失败数（旧实现固定写 "0 failed"），并按失败数决定退出码。
+// 异步用例的拒绝处理已不再 rethrow，Promise.all 恒 resolve；下面的 catch 仅作最后兜底。
 Promise.all(pending).then(() => {
-  console.log('===== ' + passed + ' passed, 0 failed =====');
+  console.log('===== ' + passed + ' passed, ' + failed + ' failed =====');
+  if (failed) {
+    console.log('失败用例：');
+    failures.forEach((n) => console.log('  ✗ ' + n));
+    process.exit(1);
+  }
 }).catch((err) => {
   console.error(err && err.stack ? err.stack : err);
-  console.error('===== ' + passed + ' passed, ' + pending.length + ' async pending, FAILED =====');
+  console.error('===== ' + passed + ' passed, ' + failed + ' failed（汇总阶段异常）=====');
   process.exit(1);
 });
