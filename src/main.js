@@ -25,6 +25,8 @@ const machineAdapt = require('./machine-adapt');       // v1.8.3：换机首启�
 const crashReport = require('./crash-report');         // v1.9.0：致命错误现场落盘（独立于滚动日志，可整体拷走）
 const quitGuard = require('./quit-guard');             // v1.9.0：退出前任务确认（旁路信号，见模块头注释）
 const webAuth = require('./web-auth');                 // v1.9.0：用启动令牌换 cookie，页面 URL 不再带 token
+const dshTag = require('./dsh-tag');                   // v1.9.1：dsh 安装/升级跟随的发行标签（DSH_DSH_TAG）
+const dshHomeGuard = require('./dsh-home-guard');      // v1.9.1：共用 dsh home 的版本守卫（多实例版本分叉告警）
 let marketOps = null;                 // 市场安装/卸载执行器（懒初始化，detect 后可用）
 let defaultPluginsDone = false;       // 默认插件安装幂等闸（每进程最多装一次）
 
@@ -41,6 +43,10 @@ const WINDOW_ICON = (() => {
 })();
 
 const IS_AUTOSTART = process.argv.includes('--autostart');
+
+// 本应用渲染页判定（安全，P0-1 修复）：`file://` 导航放行与 IPC 来源校验**共用同一判据**，
+// 实现与"为什么必须这样判"的完整说明见 renderer-guard.js（该模块有独立单测）。
+const { isAppRendererPage } = require('./renderer-guard');
 
 let mainWindow = null;
 let settingsWindow = null;
@@ -140,9 +146,14 @@ function createMainWindow() {
     return { action: 'deny' };
   });
   mainWindow.webContents.on('will-navigate', (e, url) => {
-    if (url.startsWith('file://')) return;
+    // P0-1 修复：旧版 `if (url.startsWith('file://')) return;` 无条件放行任意本地文件导航，
+    // 等于把 preload 桥交给磁盘上任意 HTML。现在只放行本应用自带渲染页（见 isAppRendererPage）。
+    if (isAppRendererPage(url)) return;
     const allowed = 'http://127.0.0.1:' + state.port;
-    if (!url.startsWith(allowed)) {
+    // P0-1 加固：按 origin 比较（旧版用 startsWith 前缀比较，语义不严谨）
+    let sameOrigin = false;
+    try { sameOrigin = new URL(url).origin === allowed; } catch (_) { /* 非法 URL → 拦截 */ }
+    if (!sameOrigin) {
       e.preventDefault();
       if (url.startsWith('http')) shell.openExternal(url);
     }
@@ -219,6 +230,10 @@ function ensureMainWindow() {
     // 服务已就绪 → 直接载入 dsh 界面（否则停留本地状态页）
     // v1.9.0：走统一入口（先换 cookie 再加载，失败自动回退带令牌 URL）
     if (launcher && launcher.ready && launcher.authUrl && mainWindow && !mainWindow.isDestroyed()) {
+      // P1（第二轮审计修复）：上一次换发失败时 `webAuthTried` 仍是 true → 重开窗口会**直接**
+      // 以带令牌 URL 加载（令牌进入 location 与导航历史，页面里还有第三方插件脚本），
+      // 而 web-auth.js 的全部设计目标正是消除这一点。cookie 未就绪时允许重试一次换发。
+      if (!webAuthPrimed) webAuthTried = false;
       loadWebUI(mainWindow);
     }
   }
@@ -251,9 +266,20 @@ let ihSessionHook = null;
 // 会话 id 是否真的存在于 dsh 的会话库（~/.dsh/sessions/<工作目录>/<会话id>）。
 // 用于过滤掉帧里偶然出现的、非当前会话的临时 id：不因为一个查不到的 id 丢掉已验证会话。
 let sessionIdCache = { at: 0, ids: new Set() };
-function knownSessionIds() {
+/**
+ * 会话 id 是否真的存在于 dsh 的会话库。
+ *
+ * P1（第二轮审计修复）：新增 `force`。缓存 TTL 是 60 秒，而**新建会话**的 id 在缓存里
+ * 还没有记录 → 上报的新 sid 被判为"查不到"而被拒绝（见 dsh:ih-state 的过滤器），
+ * 于是新会话开头最多 60 秒的输入历史会被记到**上一个会话**的桶里（历史串会话）。
+ * 现在只在"遇到未知 id"时才强制刷新一次：正常路径不多付 IO 代价。
+ *
+ * @param {boolean} [force] - 忽略缓存，强制重新扫描。
+ * @returns {Set<string>} 已知会话 id 集合。
+ */
+function knownSessionIds(force) {
   const now = Date.now();
-  if (now - sessionIdCache.at < 60000) return sessionIdCache.ids;
+  if (!force && now - sessionIdCache.at < 60000) return sessionIdCache.ids;
   const ids = new Set();
   try {
     const root = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'sessions');
@@ -606,7 +632,8 @@ function createSettingsWindow(section) {
   // 审计修复（P3）：设置窗此前没有 will-navigate 守卫。设置页只应停留在本地文件，
   // 任何外部导航一律拒绝并交系统浏览器（与主窗口同策略，纵深防御）。
   settingsWindow.webContents.on('will-navigate', (e, url) => {
-    if (url.startsWith('file://')) return;
+    // P0-1 修复：同主窗口——只放行本应用自带渲染页，其余 file:// 一律拒绝
+    if (isAppRendererPage(url)) return;
     e.preventDefault();
     if (url.startsWith('http')) shell.openExternal(url).catch(() => { /* 忽略 */ });
   });
@@ -888,8 +915,9 @@ async function stopService() {
 }
 
 // ---------------- dsh 自动升级（v1.5.17）----------------
-// 流程：停服（防 Windows 文件占用）→ npm i -g @deepseek-ai/dsh@latest → detect 刷新版本 →
+// 流程：停服（防 Windows 文件占用）→ npm i -g @deepseek-ai/dsh@<标签> → detect 刷新版本 →
 // 若之前在运行则重启服务。任何失败都写日志并回退提示手动命令。
+// v1.9.1：标签由 dsh-tag 统一解析（DSH_DSH_TAG，缺省 latest），不再写死 latest。
 let upgrading = false;   // 升级互斥（自动触发与手动按钮并发保护）
 
 async function upgradeDsh(trigger) {
@@ -921,7 +949,7 @@ async function upgradeDsh(trigger) {
     });
     if (!r.ok) {
       logger.appendLog('[升级] 安装失败：' + r.output.slice(-600));
-      state.update({ phase: 'dsh 升级失败（详见日志），可手动执行: npm i -g @deepseek-ai/dsh@latest' });
+      state.update({ phase: 'dsh 升级失败（详见日志），可手动执行: ' + dshTag.dshUpgradeCommand() });
       // 失败回退：若之前在运行，重启旧版继续可用
       if (wasRunning) { await startService(); }
       return { ok: false, error: r.output.slice(-300) };
@@ -1098,9 +1126,9 @@ function fromLocalPage(event) {
     if (!frame) return false;
     const sender = event.sender;
     if (sender && sender.mainFrame && frame !== sender.mainFrame) return false;
-    const u = String(frame.url || '');
-    if (!u.startsWith('file://')) return false;
-    return /\/renderer\/[A-Za-z0-9._-]+\.html$/i.test(u);
+    // P0-1 修复：旧实现是 `/\/renderer\/[A-Za-z0-9._-]+\.html$/i.test(u)`——只看后缀形态，
+    // 任意磁盘位置的 `…\renderer\x.html` 都能通过。改为真实路径前缀比较（isAppRendererPage）。
+    return isAppRendererPage(frame.url);
   } catch (_) {
     return false;   // senderFrame 已销毁时取属性会抛错 → 视为非本地
   }
@@ -1119,6 +1147,11 @@ function registerIpc() {
   ipcMain.on('dsh:ih-state', (event, s) => {
     try {
       if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+      // P1（第二轮审计修复）：必须是**主框架**。旧实现只校验 sender，页面内的 iframe
+      //（dsh 页面里跑着第三方插件渲染的内容）同样能上报，从而污染输入框镜像——
+      // 表现为 ↑ 键被劫持、输入内容被替换成别的文本。与 fromLocalPage 的校验保持一致。
+      if (event.senderFrame && event.sender.mainFrame
+        && event.senderFrame !== event.sender.mainFrame) return;
       const input = (s && s.input && typeof s.input === 'object' && typeof s.input.val === 'string')
         ? { val: s.input.val.slice(0, 100000), atTop: !!s.input.atTop, tag: String(s.input.tag || '') }
         : null;
@@ -1126,7 +1159,10 @@ function registerIpc() {
       const sid = (s && typeof s.sid === 'string') ? s.sid.slice(0, 80) : '';
       if (sid && sid !== ihSid) {
         // 会话库校验：不因为一个"查不到"的候选 id 丢掉已确认的会话
-        const ids = knownSessionIds();
+        let ids = knownSessionIds();
+        // P1：未知 id 可能是**刚新建的会话**（缓存 60 秒未刷新）→ 强制刷新一次再判，
+        // 否则新会话开头的历史会被错误归到上一个会话桶。
+        if (!ids.has(sid)) { ids = knownSessionIds(true); }
         if (!ids.has(sid) && ihSid && ids.has(ihSid)) return;
         ihSid = sid;
         // 会话 id 刚学到：把"提交时还不知道会话"的那条历史补记到正确的会话桶，并迁移旧历史
@@ -1138,9 +1174,12 @@ function registerIpc() {
   handle('dsh:settings', () => settings.data);
   handle('dsh:save-settings', (_e, patch) => {
     settings.update(patch);
-    // 端口变化即时同步到状态机（导航白名单/状态显示依赖）
-    if (patch && typeof patch.port === 'number' && patch.port > 0) {
-      state.port = patch.port;
+    // P0-3 修复：端口同步读**落盘后的权威值**（settings.data.port）。
+    // 旧版用未校验的 `patch.port` 直接赋给 state.port，而 settings.update 内部会把非法端口
+    // 回退成 3080 → state.port 与 settings.data.port 分叉，导航白名单、托盘提示、探活目标
+    // 全部指向一个并不存在的端口。
+    if (patch && Object.prototype.hasOwnProperty.call(patch, 'port')) {
+      state.update({ port: settings.data.port });
     }
     // 开机自启（Windows/macOS 均支持）
     try {
@@ -1171,7 +1210,7 @@ function registerIpc() {
         ensureMainWindow();
         break;
       case 'copy-upgrade-command':
-        clipboard.writeText('npm i -g @deepseek-ai/dsh@latest');
+        clipboard.writeText(dshTag.dshUpgradeCommand());
         break;
       case 'upgrade-dsh':
         return await upgradeDsh('手动');
@@ -1328,6 +1367,11 @@ function quitAll(confirmed) {
     } catch (e) {
       logger.appendLog('退出清理异常: ' + (e && e.message ? e.message : e));
     }
+    // 第三轮审计修复：把 web.log 的**暂存半行**落盘后再退出。
+    // logger.appendWeb 只在见到 \n 时才立即落盘，未带换行的最后一段暂存在内存里（等 250ms 定时器）；
+    // 而退出流程会直接 app.quit() —— 那一段往往正是子进程的最后遗言（崩溃原因），却因此丢失。
+    // 启动侧（launcher.start）早有同款 flush，退出侧此前漏了。
+    try { logger.flushWebNow(); } catch (_) { /* 忽略 */ }
     app.quit();
   };
   stopAll();
@@ -1364,6 +1408,34 @@ async function bootstrap() {
   const prunedCrashes = crashReport.prune();
   if (prunedCrashes > 0) {
     logger.appendLog('已清理 ' + prunedCrashes + ' 份旧崩溃报告（保留最近 ' + crashReport.MAX_KEEP + ' 份）');
+  }
+
+  // 第三轮审计修复：会话权限显式收紧（此前全仓库没有任何权限处理器）。
+  // 主窗口既加载本地状态页、也加载 dsh web 页面（页面里跑着第三方插件的客户端脚本），
+  // 无处理器时 Electron 对部分权限的默认行为随版本而异（有些默认放行）。
+  //
+  // 名单是**实测得出**的，不是照抄通用建议：
+  //   · 拒绝：经 grep 全量 dsh 客户端产物确认**没有任何使用点**的敏感权限
+  //     （geolocation / hid / serial / usb / midi / display-capture / idle-detection /
+  //       local-fonts / speaker-selection / window-management / storage-access）；
+  //   · **故意放行** clipboard-read 与 media —— dsh 真的在用：
+  //     `dsh-client-ui-sidebar-terminal` / `…-documentpreview` 调 `clipboard.readText`（粘贴），
+  //     `dsh-experimental-client-ui-voice-input` 调 `getUserMedia`（语音输入）。
+  //     按"通用最佳实践"一律拒绝会直接弄坏这两个功能。
+  try {
+    const DENY_PERMISSIONS = new Set([
+      'geolocation', 'hid', 'serial', 'usb', 'midi', 'midiSysex',
+      'display-capture', 'idle-detection', 'local-fonts', 'speaker-selection',
+      'window-management', 'storage-access', 'top-level-storage-access',
+    ]);
+    session.defaultSession.setPermissionRequestHandler((_wc, permission, cb) => {
+      cb(!DENY_PERMISSIONS.has(String(permission)));
+    });
+    session.defaultSession.setPermissionCheckHandler((_wc, permission) => (
+      !DENY_PERMISSIONS.has(String(permission))
+    ));
+  } catch (err) {
+    logger.appendLog('[安全] 权限处理器注册失败（不影响启动）：' + (err && err.message ? err.message : err));
   }
   // R22：兜底未捕获异常/Promise 拒绝——主进程缺 handler 时 Node 默认直接 throw，
   // 用户操作路径上偶发的 openExternal/加载失败即可带崩整个壳
@@ -1480,22 +1552,39 @@ async function bootstrap() {
   if (launcher.found) {
     state.update({ dshVersion: launcher.found.version });
     logger.appendLog('检测到 dsh ' + launcher.found.version + ' @ ' + launcher.found.dir);
+    // v1.9.1：共用 dsh home 的版本守卫（多实例跑不同 dsh 版本会互相改坏 settings/会话索引）
+    dshHomeGuard.checkAndRecord({
+      dshVersion: launcher.found.version,
+      dataDir: APP_USERDATA,
+      log: (s) => logger.appendLog(s),
+    });
     ensureDefaultPlugins('启动检测后').catch(() => { /* 内部已记录 */ });   // v1.7.0：默认插件随 app 分发
     if (settings.data.checkUpdates) {
       // v1.5.17：开启"启动时检查更新"→ 检测到新版**自动升级**（停服→npm i -g→重启）
       updater.checkForUpdate(launcher.found.version).then((info) => {
         if (info) {
-          logger.appendLog('发现新版本 dsh ' + info.latest + '（当前 ' + info.local + '），开始自动升级…');
+          logger.appendLog('发现新版本 dsh ' + info.latest + '（当前 ' + info.local + '），开始自动升级…'
+            + '（标签 ' + (info.tag || dshTag.dshDistTag()) + '，镜像 ' + dshTag.dshRegistry() + '）');
           state.update({ phase: '发现新版本 dsh ' + info.latest + '，自动升级中…' });
           upgradeDsh('启动自动').then((r) => {
             if (r && r.ok) {
               logger.appendLog('自动升级成功：' + r.from + ' → ' + r.to);
             } else {
-              logger.appendLog('自动升级失败，可手动执行: npm i -g @deepseek-ai/dsh@latest');
+              logger.appendLog('自动升级失败，可手动执行: ' + dshTag.dshUpgradeCommand());
             }
           });
+        } else {
+          // v1.9.1（用户反馈"发现 UAT 启动时未自动更新"却毫无线索）：
+          // 旧实现只在**发现新版本时**打日志，于是"检查过、无需升级"与"检查根本没跑/查询失败"
+          // 在日志里完全一样，无法区分。现在把结论写清楚（含跟随的标签与镜像）。
+          logger.appendLog('[启动更新] 当前 dsh ' + launcher.found.version
+            + ' 已是标签 ' + dshTag.dshDistTag() + ' 上的版本（镜像 ' + dshTag.dshRegistry() + '），无需升级');
         }
+      }).catch((err) => {
+        logger.appendLog('[启动更新] 检查失败（不影响启动）：' + (err && err.message ? err.message : err));
       });
+    } else {
+      logger.appendLog('[启动更新] 设置里「启动时检查更新」为关闭 —— 跳过版本检查');
     }
   } else {
     state.update({ phase: '未发现本机 dsh，启动时将通过 npx 自动获取' });
