@@ -10,6 +10,24 @@ const { stamp, tzLabel } = require('./timestamp');
 
 const MAX_SIZE = 1024 * 1024;
 
+// 日志脱敏（P1 二次复核修复）。
+//
+// 旧实现把文本**原文**落盘，而这个应用把 dsh 子进程 stdout/stderr 全量喂进 web.log——
+// 其中包含就绪行 `dsh web: http://127.0.0.1:<port>/?token=<启动令牌>`（launcher.REGEX_URL_LINE
+// 解析的那行），以及插件/子进程打印的配置（可能含供应商 Key、邮箱密码）。慢启动时
+// main.logSlowBootDetails 还会把 web.log 尾部**抄进 app.log**，而 app.log 正是"用户随手贴出来
+// 求助"的文件；整个 logs\ 目录又会随绿色目录被拷到别的机器。
+//
+// crash-report 早已有脱敏规则（因为它同样会被拷走），这里复用它，避免两套规则各自漂移。
+// 取不到就退化为不脱敏——绝不因日志组件的缺失影响主流程。
+// 注意：write() 的 try/catch 会吞掉一切异常，所以这里的 redact **必须**保证可用且不抛错，
+// 否则表现为"日志静默停止"（比泄漏更难排查）。
+let redact = (s) => s;
+try {
+  const cr = require('./crash-report');
+  if (cr && typeof cr.redact === 'function') redact = cr.redact;
+} catch (_) { /* 忽略：退化为不脱敏 */ }
+
 let logDir = null;
 let logFile = null;
 let webLogFile = null;
@@ -115,7 +133,11 @@ function flushWebNow() {
 function write(file, text) {
   try {
     if (!file) return;
-    const buf = Buffer.from(text, 'utf8');
+    // P1：落盘前统一脱敏（app.log 与 web.log 同一条路径，不存在漏网的出口）。
+    // 脱敏自身失败时退回原文——**宁可记下原文，也不能因为脱敏而丢日志**。
+    let safe = text;
+    try { safe = redact(text); } catch (_) { safe = text; }
+    const buf = Buffer.from(safe, 'utf8');
     rotateIfNeeded(file, buf.length);
     fs.appendFileSync(file, buf);
     sizes.set(file, (sizes.get(file) || 0) + buf.length);
