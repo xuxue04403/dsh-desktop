@@ -373,7 +373,21 @@ class Watchdog {
     const poll = async () => {
       while (Date.now() < deadline) {
         if (this.launcher.ready) return;
-        if (await this.launcher.probeHealth(this.settings.data.port, 1500)) return;
+        // P1（第二轮审计修复）：**"端口有人应答"不足以证明"重启成功"**。
+        // 端口可能是上一个尚未收尾的实例占着（或 3080 上跑着别的程序）——旧实现据此
+        // 直接 return，UI 显示"已就绪"，但用户操作的其实是旧实例（旧配置、旧插件集），
+        // 安全模式"禁用故障插件"根本没生效（假安全模式）。必须同时确认**本次拉起的新进程
+        // 仍然存活**；新进程已死时端口由谁应答都与我们无关。
+        const p = this.launcher.proc;
+        const alive = !!(p && p.exitCode === null);
+        if (alive) {
+          if (await this.launcher.probeHealth(this.settings.data.port, 1500)) return;
+        } else if (!this.launcher.installing) {
+          // 不是"还在安装"但进程已不存在 → 再等 90 秒没有意义，立即进入恢复流程
+          this.log('重启后 dsh 进程未存活，立即进入恢复流程。');
+          this.tryRecover().catch(() => { /* 忽略 */ });
+          return;
+        }
         await new Promise((r) => setTimeout(r, 1500));
       }
       if (!this.launcher.ready) {
