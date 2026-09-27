@@ -230,8 +230,15 @@ function gate(targets, label, { allowScrub = false, skipDirs } = {}) {
 // 会把第三方包里的合法同名目录一并删掉（实测 resources\node_modules\npm\node_modules\
 // node-gyp\gyp\data、pnpm 内的同名目录），导致内嵌 node-gyp 缺 data\。
 const ZIP_SKIP_DIRS = new Set(['data', 'logs']);
-const ZIP_SKIP_FILES = new Set(['node.exe']);
-const ZIP_SKIP_FILE_RE = /\.(log|tmp)$/i;
+// default_app.asar：Electron 的兜底应用。构建时删除失败只告警（build-portable.mjs），
+// 且它不会被加载，属无害但多余的 ~2.4MB —— 没有理由打进发布包。
+const ZIP_SKIP_FILES = new Set(['node.exe', 'default_app.asar']);
+// 第二轮审计修复：补 `*.bak*`。set-exe-icon.cjs 会在**被分发的绿目录内部**把
+// DSH-App.exe 复制一份成 DSH-App.exe.bak（Electron 二进制，约 237MB），而这里原先只排除
+// log/tmp → 一旦在绿目录上跑过图标脚本，发布包会**体积近乎翻倍**且多一个本不该公开的备份。
+// data\ 下的 `*.bak-machineadapt-*` 配置备份同理。源码上传侧（syncSources）早已有
+// `.bak($|-)` 规则并注明"没有理由公开"，产物侧此前漏了同款判断。
+const ZIP_SKIP_FILE_RE = /\.(log|tmp|bak)$|\.bak[-.]/i;
 
 function buildPortableZip(green, zipOut) {
   const stage = path.join(root, 'out', '_zip-stage');
