@@ -167,9 +167,10 @@ foreach ($name in @('data', 'logs')) {
 $zipFailed = $false
 try {
     if ($tarExe) {
-        Write-Host "[..] packing zip (tar: $tarExe; 已移出 data\ logs\，另排除 node.exe *.log *.tmp) ..."
+        Write-Host "[..] packing zip (tar: $tarExe; 已移出 data\ logs\，另排除 node.exe *.log *.tmp *.bak) ..."
         $tarArgs = @('-a', '-cf', $zipPath, '-C', $greenDir)
-        foreach ($x in @('node.exe', '*.log', '*.tmp')) { $tarArgs += @('--exclude', $x) }
+        # *.bak / *.bak-*：set-exe-icon.cjs 会在绿目录内留 DSH-App.exe.bak（约 237MB）
+        foreach ($x in @('node.exe', '*.log', '*.tmp', '*.bak', '*.bak-*')) { $tarArgs += @('--exclude', $x) }
         $tarArgs += '.'
         & $tarExe @tarArgs
         if ($LASTEXITCODE -ne 0) {
