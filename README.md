@@ -299,15 +299,17 @@ supported Electron versions: 43.0.0, 44.0.0, 45.0.0-alpha.6
 # 3) 同步 package.json 的 devDependencies.electron 与 node_modules\electron\package.json 的 version
 ```
 
-**dsh 怎么升**：0.1.7-rc.2 在 npm 的 **`next`** tag 下（`latest` 仍是 0.1.5-rc.3），所以「启动时检查更新」**不会**跟到它——需要显式装：
+**dsh 怎么升（v1.9.2 起：启动检查已改为「多标签取高者」）**：注册表上同一个包可能同时挂着多个标签、各自指向不同版本——实测 2026-09-29：`latest = 0.1.7-rc.2`、`next = 0.2.0-rc.1`（更早一次是 `latest = 0.1.5-rc.3`、`next = 0.1.7-rc.2`）。**只查 `latest` 的实现永远看不到发在 `next` 上的新版本**，用户看到的现象就是"启动时没有自动更新"（2026-09-29 实际报过）。现在启动时**并行查询全部候选标签（缺省 `latest` + `next`）、按 semver 取版本最高者**，更高才升级，且安装的是**判定出的确切版本**（检查与安装之间标签可能被上游移动）。日志无论升不升都会写出各自版本：`已比较 latest=0.1.7-rc.2 / next=0.2.0-rc.1`。
+
+若某次仍需手工装（例如先只升 UAT 验证插件兼容性）：
 
 ```powershell
 & "<绿目录>\DSH-App.exe" "<绿目录>\resources\node_modules\npm\bin\npm-cli.js" `
-  install -g @deepseek-ai/dsh@0.1.7-rc.2 --prefix "<绿目录>\data\node-global" `
+  install -g @deepseek-ai/dsh@0.2.0-rc.1 --prefix "<绿目录>\data\node-global" `
   --registry https://registry.npmmirror.com --no-fund --no-audit --force
 ```
 
-（升级后 `updater` 仍只比对 `latest`=0.1.5-rc.3，比当前版本低，因此**不会**把它降回去。）
+**想固定在某一条通道**（不自动取高者）：设 `DSH_DSH_TAG=<标签或精确版本>`（如 `latest`），启动检查就**只评估该标签**。
 
 **补丁随版本变化**：0.1.7 把 R19 想修的两处**自己修好了**（`dsh-subprocess-local` 重写为 runner 机制且自带 `windowsHide: true`；`dsh-win32-process` 直接用 `dwFlags: 257, wShowWindow: 0`），所以 R19 现在只在**锚点存在时**才打补丁，否则记录"上游已自带"而不是误报"版本变化"。R28 则多了一个上游字段（`inputModalities`），已做**多版本锚点适配**——锚点与替换体必须成对，否则会把该字段从补丁后的代码里吃掉（模型静默丢掉图片能力）。
 
