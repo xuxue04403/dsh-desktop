@@ -14,8 +14,21 @@ const { pngFromPixels, renderIcon, iconDataURL, iconPngBuffer, iconIcoBuffer, CO
 const zlib = require('zlib');
 
 let passed = 0;
+let failed = 0;
+// 异步用例的待决 promise（v1.9.2：多标签择优是 async 逻辑，必须真等到它跑完再统计）。
+// 旧实现 `fn()` 不 await —— 异步用例会先打印 PASS、断言却还没执行，失败变成未处理拒绝，
+// 等于"看起来通过、其实没测"。这与 v190.test.js 修过的"一个失败掩盖后续全部"是同类问题。
+const pending = [];
 function t(name, fn) {
-  fn();
+  let r;
+  try { r = fn(); } catch (e) { throw e; }   // 同步用例沿用原语义：抛出即整体失败
+  if (r && typeof r.then === 'function') {
+    pending.push(r.then(
+      () => { passed++; console.log('PASS  ' + name); },
+      (e) => { failed++; console.error('FAIL  ' + name + '\n      ' + (e && e.message ? e.message : e)); },
+    ));
+    return;
+  }
   passed++;
   console.log('PASS  ' + name);
 }
@@ -445,20 +458,29 @@ t('main.js 接线冒烟（B1 回归）：verifyDefaultPlugins 必须导入且在
 // 改名为 settings.yaml.imported、重写会话索引 → 另一侧"历史会话丢失"。
 // 因此这两条必须锁死：① 安装/升级标签可配置且同一处决策；② 版本变化必须留下告警。
 
-t('dsh-tag：标签可配置（DSH_DSH_TAG），非法值回退 latest，安装/查询/命令三处口径一致', () => {
+t('dsh-tag：缺省同时评估 latest + next（不写死单标签）；DSH_DSH_TAG 可钉住；非法值回退', () => {
   const dshTag = require('../src/dsh-tag');
   const saved = process.env.DSH_DSH_TAG;
   const reload = () => { delete require.cache[require.resolve('../src/dsh-tag')]; return require('../src/dsh-tag'); };
   try {
     delete process.env.DSH_DSH_TAG;
     let m = reload();
-    assert.strictEqual(m.dshDistTag(), 'latest', '缺省应为 latest（保持既有行为）');
+    // v1.9.2 核心：缺省不是"跟随 latest"，而是"评估 latest 与 next，取高者"
+    assert.deepStrictEqual(m.dshCandidateTags(), ['latest', 'next'],
+      '缺省候选必须是 latest + next —— 只跟 latest 会永远看不到发在 next 上的新版本');
+    assert.strictEqual(m.dshDistTag(), 'latest', '无显式指定时，首次安装仍走稳定通道');
     assert.strictEqual(m.dshInstallSpec(), '@deepseek-ai/dsh@latest');
     assert.ok(m.dshVersionUrl().endsWith('/@deepseek-ai/dsh/latest'), '查询端点应跟随标签：' + m.dshVersionUrl());
     assert.strictEqual(m.dshUpgradeCommand(), 'npm i -g @deepseek-ai/dsh@latest');
+    // 按标签/按确切版本取端点与规格
+    assert.ok(m.dshVersionUrlFor('next').endsWith('/@deepseek-ai/dsh/next'));
+    assert.strictEqual(m.dshInstallSpecFor('0.2.0-rc.1'), '@deepseek-ai/dsh@0.2.0-rc.1');
+    assert.strictEqual(m.dshUpgradeCommandFor('0.2.0-rc.1'), 'npm i -g @deepseek-ai/dsh@0.2.0-rc.1');
 
+    // 显式钉住：只评估这一个（不再自动取高者）
     process.env.DSH_DSH_TAG = 'next';
     m = reload();
+    assert.deepStrictEqual(m.dshCandidateTags(), ['next'], '显式钉住时不应再自动比较其它标签');
     assert.strictEqual(m.dshDistTag(), 'next', 'DSH_DSH_TAG 应生效');
     assert.strictEqual(m.dshInstallSpec(), '@deepseek-ai/dsh@next', '安装规格必须跟随标签');
     assert.ok(m.dshVersionUrl().endsWith('/@deepseek-ai/dsh/next'), '查询端点必须跟随标签');
@@ -468,16 +490,109 @@ t('dsh-tag：标签可配置（DSH_DSH_TAG），非法值回退 latest，安装/
     process.env.DSH_DSH_TAG = '0.1.7-rc.2';
     m = reload();
     assert.strictEqual(m.dshInstallSpec(), '@deepseek-ai/dsh@0.1.7-rc.2');
+    assert.deepStrictEqual(m.dshCandidateTags(), ['0.1.7-rc.2']);
 
-    // 含空格/分号等可疑字符的值一律回退，绝不拼进 npm 命令行
+    // 含空格/分号等可疑字符的值一律当作"未指定"，绝不拼进 npm 命令行
     for (const bad of ['bad; rm -rf /', 'a b', '$(whoami)', 'x&y']) {
       process.env.DSH_DSH_TAG = bad;
       m = reload();
       assert.strictEqual(m.dshDistTag(), 'latest', '非法标签必须回退 latest：' + bad);
+      assert.deepStrictEqual(m.dshCandidateTags(), ['latest', 'next'], '非法值应按"未指定"处理：' + bad);
     }
   } finally {
     if (saved === undefined) delete process.env.DSH_DSH_TAG; else process.env.DSH_DSH_TAG = saved;
     delete require.cache[require.resolve('../src/dsh-tag')];
+  }
+});
+
+// v1.9.2 回归：多标签"取版本最高者"的判定逻辑（不联网——直接喂假的标签查询结果）
+// 事故背景：2026-09-29 用户报"0.2.0-rc1 已发布，启动时为什么没有自动更新"——
+// latest 追平到 0.1.7-rc.2 的同时 next 前进到 0.2.0-rc.1，只查 latest 的实现永远看不到它。
+t('updater.bestRelease：同时查多个标签并取版本最高者；单标签失败降级、全失败返回 null', async () => {
+  const updaterPath = require.resolve('../src/updater');
+  const tagPath = require.resolve('../src/dsh-tag');
+  const saved = process.env.DSH_DSH_TAG;
+  delete process.env.DSH_DSH_TAG;
+
+  // 用假的 dsh-tag 顶替真实模块：候选固定，端点无关紧要
+  const realTag = require('../src/dsh-tag');
+  const fakeTag = Object.assign({}, realTag, {
+    dshCandidateTags: () => ['latest', 'next'],
+    dshVersionUrlFor: (t) => 'fake://' + t,
+  });
+  require.cache[tagPath] = { id: tagPath, filename: tagPath, loaded: true, exports: fakeTag };
+  delete require.cache[updaterPath];
+  const updater = require('../src/updater');
+
+  const scenarios = {
+    // next 更高 → 选 next（注入点收到的是**标签名**，不是 URL）
+    'next': '0.2.0-rc.1',
+    'latest': '0.1.7-rc.2',
+  };
+  const stub = (map) => {
+    updater.__setFetchForTest(async (tag) => (tag in map ? map[tag] : null));
+  };
+  assert.strictEqual(typeof updater.__setFetchForTest, 'function',
+    'updater 必须暴露测试用的查询注入点（否则多标签择优逻辑无法离线回归）');
+
+  try {
+    stub(scenarios);
+    let best = await updater.bestRelease();
+    assert.strictEqual(best.version, '0.2.0-rc.1', '应选版本更高的 next');
+    assert.strictEqual(best.tag, 'next');
+    assert.strictEqual(best.tags.length, 2, '应带回两个标签各自的查询结果');
+    assert.strictEqual(await updater.latestVersion(), '0.2.0-rc.1', '兼容入口应返回候选中的最高版本');
+
+    // latest 更高 → 选 latest（不能因为 next 存在就无脑选 next）
+    stub({ 'latest': '0.3.0', 'next': '0.2.0-rc.1' });
+    best = await updater.bestRelease();
+    assert.strictEqual(best.tag, 'latest', '版本更高的是 latest 时应选 latest');
+
+    // 相等 → 保留先出现的那个（候选顺序 latest 在前），且版本仍是它
+    stub({ 'latest': '0.2.0-rc.1', 'next': '0.2.0-rc.1' });
+    best = await updater.bestRelease();
+    assert.strictEqual(best.version, '0.2.0-rc.1');
+
+    // next 查询失败 → 只用 latest，不整体失败
+    stub({ 'latest': '0.1.7-rc.2' });
+    best = await updater.bestRelease();
+    assert.strictEqual(best.tag, 'latest', '一个标签失败不应拖垮整体');
+    assert.strictEqual(best.tags.find((t) => t.tag === 'next').version, null, '失败标签应记为 null');
+
+    // 全部失败 → null（调用方按"无法判断"处理，不阻断启动）
+    stub({});
+    assert.strictEqual(await updater.bestRelease(), null, '全部失败应返回 null');
+    assert.strictEqual(await updater.latestVersion(), null);
+
+    // evaluate：本地已是最新 → needed=false，但仍带回比较明细；本地更低 → needed=true 且给出确切版本
+    stub({ 'latest': '0.1.7-rc.2', 'next': '0.2.0-rc.1' });
+    let ev = await updater.evaluate('0.2.0-rc.1');
+    assert.strictEqual(ev.needed, false, '本地等于最高版本时不应升级');
+    assert.strictEqual(ev.tags.length, 2, '无需升级也要能说清比过哪些标签');
+
+    ev = await updater.evaluate('0.1.7-rc.2');
+    assert.strictEqual(ev.needed, true, '本地低于最高版本时应升级');
+    assert.strictEqual(ev.best.version, '0.2.0-rc.1');
+    assert.strictEqual(ev.spec, '@deepseek-ai/dsh@0.2.0-rc.1',
+      '安装规格必须钉在**确切版本**上（检查与安装之间标签可能被上游移动）');
+    assert.strictEqual(ev.command, 'npm i -g @deepseek-ai/dsh@0.2.0-rc.1');
+
+    // 本地比两端都新（手工装过更新版）→ 不降级
+    stub({ 'latest': '0.1.7-rc.2', 'next': '0.2.0-rc.1' });
+    ev = await updater.evaluate('0.3.0');
+    assert.strictEqual(ev.needed, false, '本地更高时绝不能"升级"成更低的版本');
+
+    // 全部查不到 → best=null、needed=false、spec=null
+    stub({});
+    ev = await updater.evaluate('0.1.7-rc.2');
+    assert.strictEqual(ev.best, null);
+    assert.strictEqual(ev.needed, false);
+    assert.strictEqual(ev.spec, null);
+  } finally {
+    updater.__setFetchForTest(null);
+    delete require.cache[updaterPath];
+    delete require.cache[tagPath];
+    if (saved === undefined) delete process.env.DSH_DSH_TAG; else process.env.DSH_DSH_TAG = saved;
   }
 });
 
@@ -532,8 +647,23 @@ t('接线回归：安装/升级路径不得再写死 @latest（否则版本分�
   const mainSrc = fs.readFileSync(path.join(root, 'main.js'), 'utf8');
   assert.ok(/dshTag\.dshUpgradeCommand\(\)/.test(mainSrc), '升级提示应使用 dshTag.dshUpgradeCommand()');
   assert.ok(/dshHomeGuard\.checkAndRecord\(/.test(mainSrc), '启动流程应调用版本守卫');
-  assert.ok(/已是标签/.test(mainSrc), '“无需升级”也必须留日志（否则无法分辨是否检查过）');
+  // v1.9.2：启动检查必须走"多标签取高者"的 evaluate，而不是单标签的 checkForUpdate
+  assert.ok(/updater\.evaluate\(/.test(mainSrc), '启动更新检查应调用 updater.evaluate()（多标签择优）');
+  assert.ok(/已是候选通道中的最高版本/.test(mainSrc), '“无需升级”也必须留日志（否则无法分辨是否检查过）');
+  assert.ok(/已比较 ' \+ detail/.test(mainSrc), '日志必须列出**每个候选标签各自**的查询结果');
+  assert.ok(/upgradeDsh\('启动自动', r\.spec\)/.test(mainSrc),
+    '自动升级必须把判定出的**确切版本规格**传给 upgradeDsh（避免检查与安装之间标签被移动）');
+  const updSrc = fs.readFileSync(path.join(root, 'updater.js'), 'utf8');
+  assert.ok(/bestRelease/.test(updSrc) && /CANDIDATE|dshCandidateTags/.test(updSrc),
+    'updater 必须实现多候选择优');
+  assert.ok(/const spec = String\(o\.spec \|\| ''\)\.trim\(\) \|\| dshInstallSpec\(\)/.test(updSrc),
+    'performUpgrade 必须优先使用调用方判定的确切版本规格');
 });
 
-console.log('');
-console.log('===== ' + passed + ' passed, 0 failed =====');
+// 等所有异步用例结束后再出汇总，并把真实失败数写进退出码（旧版恒为 "0 failed" 且恒 exit 0）
+(async () => {
+  await Promise.all(pending);
+  console.log('');
+  console.log('===== ' + passed + ' passed, ' + failed + ' failed =====');
+  if (failed > 0) process.exit(1);
+})();
