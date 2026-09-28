@@ -920,7 +920,7 @@ async function stopService() {
 // v1.9.1：标签由 dsh-tag 统一解析（DSH_DSH_TAG，缺省 latest），不再写死 latest。
 let upgrading = false;   // 升级互斥（自动触发与手动按钮并发保护）
 
-async function upgradeDsh(trigger) {
+async function upgradeDsh(trigger, spec) {
   if (upgrading) {
     logger.appendLog('[升级] 已有升级进行中，忽略重复触发（' + trigger + '）');
     return { ok: false, error: 'upgrade-in-progress' };
@@ -945,11 +945,13 @@ async function upgradeDsh(trigger) {
     const r = await updater.performUpgrade({
       nodeInfo: launcher.nodeInfo || { exe: 'node', env: {}, embedded: false },
       prefix,
+      spec,   // v1.9.2：多标签取高者判定的确切版本；缺省回退到标签形态
       onProgress: (line) => logger.appendLog('[npm] ' + line),
     });
     if (!r.ok) {
       logger.appendLog('[升级] 安装失败：' + r.output.slice(-600));
-      state.update({ phase: 'dsh 升级失败（详见日志），可手动执行: ' + dshTag.dshUpgradeCommand() });
+      state.update({ phase: 'dsh 升级失败（详见日志），可手动执行: '
+        + (spec ? 'npm i -g ' + spec : dshTag.dshUpgradeCommand()) });
       // 失败回退：若之前在运行，重启旧版继续可用
       if (wasRunning) { await startService(); }
       return { ok: false, error: r.output.slice(-300) };
@@ -1561,24 +1563,33 @@ async function bootstrap() {
     ensureDefaultPlugins('启动检测后').catch(() => { /* 内部已记录 */ });   // v1.7.0：默认插件随 app 分发
     if (settings.data.checkUpdates) {
       // v1.5.17：开启"启动时检查更新"→ 检测到新版**自动升级**（停服→npm i -g→重启）
-      updater.checkForUpdate(launcher.found.version).then((info) => {
-        if (info) {
-          logger.appendLog('发现新版本 dsh ' + info.latest + '（当前 ' + info.local + '），开始自动升级…'
-            + '（标签 ' + (info.tag || dshTag.dshDistTag()) + '，镜像 ' + dshTag.dshRegistry() + '）');
-          state.update({ phase: '发现新版本 dsh ' + info.latest + '，自动升级中…' });
-          upgradeDsh('启动自动').then((r) => {
-            if (r && r.ok) {
-              logger.appendLog('自动升级成功：' + r.from + ' → ' + r.to);
+      // v1.9.2：不再"只跟 latest"，而是**同时评估全部候选标签（latest + next）取版本最高者**。
+      //   起因（2026-09-29 用户反馈"0.2.0-rc1 已发布，启动时为什么没有自动更新"）：
+      //   `latest` 追平到 0.1.7-rc.2 的同时 `next` 前进到 0.2.0-rc.1，只查 latest 的实现
+      //   永远看不到它——检查确实跑了，结论却是"无需升级"，用户无从分辨。
+      updater.evaluate(launcher.found.version).then((r) => {
+        // 把每个候选标签各自的查询结果写成一行，便于事后核对"到底比了什么"
+        const detail = r.tags.map((t) => t.tag + '=' + (t.version || '查询失败')).join(' / ');
+        const mirror = '镜像 ' + dshTag.dshRegistry();
+        if (r.needed) {
+          logger.appendLog('发现新版本 dsh ' + r.best.version + '（当前 ' + r.local + '，来自标签 '
+            + r.best.tag + '），开始自动升级…（已比较 ' + detail + '；' + mirror + '）');
+          state.update({ phase: '发现新版本 dsh ' + r.best.version + '，自动升级中…' });
+          // 传**确切版本**而不是标签名：检查与安装之间标签可能被上游移动
+          upgradeDsh('启动自动', r.spec).then((res) => {
+            if (res && res.ok) {
+              logger.appendLog('自动升级成功：' + res.from + ' → ' + res.to);
             } else {
-              logger.appendLog('自动升级失败，可手动执行: ' + dshTag.dshUpgradeCommand());
+              logger.appendLog('自动升级失败，可手动执行: ' + r.command);
             }
           });
+        } else if (r.best) {
+          // 无需升级也要写清楚比过哪些标签（v1.9.1 起的可观测性要求）
+          logger.appendLog('[启动更新] 当前 dsh ' + r.local + ' 已是候选通道中的最高版本'
+            + '（已比较 ' + detail + '；' + mirror + '），无需升级');
         } else {
-          // v1.9.1（用户反馈"发现 UAT 启动时未自动更新"却毫无线索）：
-          // 旧实现只在**发现新版本时**打日志，于是"检查过、无需升级"与"检查根本没跑/查询失败"
-          // 在日志里完全一样，无法区分。现在把结论写清楚（含跟随的标签与镜像）。
-          logger.appendLog('[启动更新] 当前 dsh ' + launcher.found.version
-            + ' 已是标签 ' + dshTag.dshDistTag() + ' 上的版本（镜像 ' + dshTag.dshRegistry() + '），无需升级');
+          logger.appendLog('[启动更新] 所有候选标签均查询失败（已比较 ' + detail + '；' + mirror
+            + '）—— 无法判断是否有新版本，不影响启动');
         }
       }).catch((err) => {
         logger.appendLog('[启动更新] 检查失败（不影响启动）：' + (err && err.message ? err.message : err));
