@@ -14,7 +14,10 @@ const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const { compareVersions } = require('./launcher');
-const { dshDistTag, dshRegistry, dshInstallSpec, dshVersionUrl, dshUpgradeCommand } = require('./dsh-tag');
+const {
+  dshCandidateTags, dshRegistry, dshInstallSpec, dshInstallSpecFor,
+  dshVersionUrlFor, dshUpgradeCommand, dshUpgradeCommandFor,
+} = require('./dsh-tag');
 
 // shell 命令行参数引用（审计修复）：含空格/特殊字符时用双引号包裹并转义内部引号。
 // 仅在 Windows shell 回退路径使用（真正的 npm-cli 路径走数组传参，不经过 shell）。
@@ -24,11 +27,11 @@ function shellQuote(a) {
   return '"' + s.replace(/"/g, '\\"') + '"';
 }
 
-// 查询「本次跟随的标签」对应的版本（v1.9.1：不再写死 latest，见 dsh-tag.js 的事故说明）。
-// 返回 null 表示查询失败（断网/镜像异常），调用方按"无法判断"处理，不阻断启动。
-function latestVersion(timeoutMs = 8000) {
+// 查询**指定标签**对应的版本（v1.9.1：不再写死 latest）。
+// 返回 null 表示该标签查不到（断网 / 镜像异常 / 标签不存在）——只影响它自己，不牵连其它候选。
+function fetchTagVersion(tag, timeoutMs = 8000) {
   return new Promise((resolve) => {
-    const req = https.get(dshVersionUrl(), {
+    const req = https.get(dshVersionUrlFor(tag), {
       timeout: timeoutMs,
       headers: { 'User-Agent': 'dsh-app/0.1.0' },
     }, (res) => {
@@ -48,15 +51,79 @@ function latestVersion(timeoutMs = 8000) {
   });
 }
 
-// 生成升级引导信息（返回 null 表示无需升级）
+// 测试注入点：把"按标签查版本"换成可控实现，使**多标签择优**逻辑可以离线回归
+// （不联网、不依赖镜像当时恰好把某个版本挂在哪个标签上）。生产路径永远走 fetchTagVersion。
+let fetchOverride = null;
+function __setFetchForTest(fn) { fetchOverride = typeof fn === 'function' ? fn : null; }
+function queryTag(tag, timeoutMs) {
+  if (fetchOverride) {
+    try { return Promise.resolve(fetchOverride(tag)); } catch (err) { return Promise.resolve(null); }
+  }
+  return fetchTagVersion(tag, timeoutMs);
+}
+
+/**
+ * 同时评估全部候选标签（缺省 `latest` + `next`），返回**版本最高**的那个。
+ *
+ * 为什么不是"跟随某一个标签"：实测 2026-09-29 —— `latest` 追平到 0.1.7-rc.2，而 `next`
+ * 前进到 0.2.0-rc.1；只跟 `latest` 的实现**永远看不到**发在 `next` 上的新版本，
+ * 用户会认为"启动时没有自动更新"（真实发生过）。
+ *
+ * 失败隔离：某个标签查不到只记 null，其余候选照常参与比较；全部失败才返回 null。
+ *
+ * @param {number} [timeoutMs] 单个标签的查询超时
+ * @returns {Promise<{version:string, tag:string, tags:Array<{tag:string, version:string|null}>}|null>}
+ */
+async function bestRelease(timeoutMs = 8000) {
+  const cands = dshCandidateTags();
+  const results = await Promise.all(
+    cands.map(async (tag) => ({ tag, version: await queryTag(tag, timeoutMs) })),
+  );
+  let best = null;
+  for (const r of results) {
+    if (!r.version) continue;
+    if (!best || compareVersions(r.version, best.version) > 0) best = { version: r.version, tag: r.tag };
+  }
+  if (!best) return null;
+  return { version: best.version, tag: best.tag, tags: results };
+}
+
+// 兼容入口（旧调用/测试）：候选中的最高版本；null 表示"一个候选都查不到"。
+async function latestVersion(timeoutMs = 8000) {
+  const best = await bestRelease(timeoutMs);
+  return best ? best.version : null;
+}
+
+/**
+ * 评估"要不要升级"，**永远返回结构化结果**（含每个候选标签各自的查询结果）。
+ * 与 {@link checkForUpdate} 的分工：这个给日志用（说明"比过哪些标签、为什么升/不升"），
+ * 那个给 IPC/界面用（无需升级时返回 null，保持既有契约）。
+ *
+ * `spec` 用**确切版本**而不是标签名：检查与安装之间标签可能被上游移动，装我们刚判定过的那个版本才确定。
+ *
+ * @returns {Promise<{local:string|null, best:{version:string,tag:string}|null,
+ *   tags:Array<{tag:string,version:string|null}>, needed:boolean, spec:string|null, command:string}>}
+ */
+async function evaluate(localVersion) {
+  const best = await bestRelease();
+  const tags = best ? best.tags : dshCandidateTags().map((tag) => ({ tag, version: null }));
+  const needed = !!(best && localVersion && compareVersions(best.version, localVersion) > 0);
+  return {
+    local: localVersion || null,
+    best: best ? { version: best.version, tag: best.tag } : null,
+    tags,
+    needed,
+    spec: best ? dshInstallSpecFor(best.version) : null,
+    command: best ? dshUpgradeCommandFor(best.version) : dshUpgradeCommand(),
+  };
+}
+
+// 生成升级引导信息（返回 null 表示无需升级 —— 界面据此判断"已是最新"）
 async function checkForUpdate(localVersion) {
   if (!localVersion) return null;
-  const latest = await latestVersion();
-  if (!latest) return null;
-  if (compareVersions(latest, localVersion) > 0) {
-    return { local: localVersion, latest, tag: dshDistTag(), command: dshUpgradeCommand() };
-  }
-  return null;
+  const r = await evaluate(localVersion);
+  if (!r.needed) return null;
+  return { local: r.local, latest: r.best.version, tag: r.best.tag, tags: r.tags, command: r.command };
 }
 
 /** 定位 npm-cli.js（node 旁的 npm）：
@@ -83,7 +150,9 @@ function findNpmCli(nodePath) {
  *    优先用随应用打包的（launcher.findEmbeddedNpmCli），并安装到便携前缀 prefix
  *    （data\node-global——绿色随程序走，升级即同前缀替换，dsh 的 ~/.dsh 配置不受影响）；
  *  - 非 prefix 时装系统全局（npm i -g 默认）。
- * @param {object} opts { nodeInfo, prefix, onProgress }
+ * @param {object} opts { nodeInfo, prefix, onProgress, spec }
+ *   `spec` 为要安装的包规格（如 `@deepseek-ai/dsh@0.2.0-rc.1`）——由调用方传入
+ *   {@link evaluate} 判定的**确切版本**；缺省才回退到标签形态（首次安装/手动触发）。
  * @returns {Promise<{ok: boolean, output: string}>}
  */
 function performUpgrade(opts) {
@@ -102,7 +171,8 @@ function performUpgrade(opts) {
     const useNode = npmCli !== 'npm';
     // v1.9.1：跟随可配置标签（DSH_DSH_TAG），不再写死 latest——否则主目录与 UAT 会
     // 因标签不同而跑成两个 dsh 版本，而两者共用 ~/.dsh，旧版会把新版状态改坏。
-    const spec = dshInstallSpec();
+    // v1.9.2：优先用调用方判定的确切版本（多标签取高者的结果），避免检查与安装之间标签被移动。
+    const spec = String(o.spec || '').trim() || dshInstallSpec();
     const args = useNode
       ? [npmCli, 'install', '-g', spec, '--no-fund', '--no-audit', '--force']
       : ['install', '-g', spec, '--no-fund', '--no-audit', '--force'];
@@ -152,4 +222,7 @@ function performUpgrade(opts) {
   });
 }
 
-module.exports = { latestVersion, checkForUpdate, performUpgrade, findNpmCli };
+module.exports = {
+  latestVersion, bestRelease, evaluate, fetchTagVersion, checkForUpdate, performUpgrade, findNpmCli,
+  __setFetchForTest,
+};
