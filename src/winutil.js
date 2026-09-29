@@ -59,4 +59,42 @@ function comSpecIsStale() {
   try { return !fs.existsSync(com); } catch (_) { return true; }
 }
 
-module.exports = { resolveCmdExe, comSpecIsStale };
+/**
+ * 找出 env 对象里 PATH 的**实际键名**（大小写不敏感）。
+ *
+ * 为什么需要它（2026-09-29 实测事故）：Windows 上这个变量的名字通常是 **`Path`（混合大小写）**，
+ * 而 `Object.assign({}, process.env, …)` 产出的是**普通对象**——键名大小写敏感。于是
+ * `spawnEnv.PATH = …` 不是"更新原值"，而是**新建了一个 `PATH` 键**：原 `Path` 仍在对象里，
+ * 但 Node 序列化环境块时按大小写不敏感去重、后设的 `PATH` 胜出 → **完整 PATH 被整个丢掉**。
+ * 实测后果：应用被资源管理器（PATH 19 项）启动，它交给 dsh 的子进程只剩 2 个目录，
+ * 继而使 DSH 的 shell 里 `icacls`/`robocopy`/`git`/`cmd` 全部按名字调不到
+ * （实测：Explorer 侧键名 `Path` 19 项 / DSH shell 侧键名 `PATH` 3 项）。
+ *
+ * @param {object} env 环境对象
+ * @returns {string} 现有键名；不存在时返回 'PATH'
+ */
+function pathKeyOf(env) {
+  for (const k of Object.keys(env || {})) {
+    if (k.toLowerCase() === 'path') return k;
+  }
+  return 'PATH';
+}
+
+/**
+ * 把若干目录**前置**到 env 的 PATH（就地更新既有键，绝不新建大小写不同的重复键）。
+ *
+ * @param {object} env 环境对象（就地修改）
+ * @param {string[]} dirs 要前置的目录（空值自动跳过）
+ * @returns {string} 实际使用的键名
+ */
+function prependPath(env, dirs) {
+  const target = env || {};
+  const key = pathKeyOf(target);
+  const cur = typeof target[key] === 'string' ? target[key] : '';
+  const head = (dirs || []).filter((d) => d && String(d).trim()).map(String);
+  const parts = head.concat(cur ? [cur] : []);
+  target[key] = parts.join(path.delimiter);
+  return key;
+}
+
+module.exports = { resolveCmdExe, comSpecIsStale, pathKeyOf, prependPath };
