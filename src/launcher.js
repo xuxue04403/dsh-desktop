@@ -14,7 +14,7 @@ const http = require('http');
 const { EventEmitter } = require('events');
 // 可移植性修复（2026-09-11）：cmd.exe 解析不再依赖 process.env.ComSpec（克隆机的该变量
 // 常残留旧系统盘路径 → spawn ENOENT → dsh 起不来）
-const { resolveCmdExe, comSpecIsStale } = require('./winutil');
+const { resolveCmdExe, comSpecIsStale, prependPath } = require('./winutil');
 // 同上：workDir 可能来自另一台电脑（settings.json 随目录复制）→ cwd 无效同样 ENOENT
 const { workDirOrHome } = require('./paths');
 // v1.9.1：dsh 的安装标签/镜像（不再写死 @latest，见 dsh-tag.js 的版本分叉事故说明）
@@ -152,7 +152,11 @@ function prepareEmbeddedInstallEnv(prefix, baseEnv) {
         fs.copyFileSync(process.execPath, nodeExe);     // 回退复制（同目录，DLL 完整）
       }
     }
-    env.PATH = appDir + path.delimiter + (env.PATH || '');
+    // 关键（2026-09-29 实测事故）：必须用大小写不敏感的 helper —— Windows 上这个变量通常叫
+    // `Path`，而这里 `env` 是 Object.assign 出来的**普通对象**（键名大小写敏感）；直接写
+    // `env.PATH = …` 会新建一个 `PATH` 键，序列化去重后**把完整的原 PATH 整个丢掉**
+    // （实测：Explorer 19 项 → 交给 dsh 的子进程只剩 2 个目录）。
+    prependPath(env, [appDir]);
     return { env, nodeExe };
   } catch (_) {
     return { env, nodeExe: null };
@@ -569,7 +573,8 @@ class Launcher extends EventEmitter {
             'exit /b %errorlevel%',
             '',
           ].join('\r\n'), 'utf8');
-          spawnEnv.PATH = appDir + path.delimiter + privBin + path.delimiter + (spawnEnv.PATH || '');
+          // 同上：大小写不敏感前置，否则会新建 `PATH` 键并把原 `Path` 整份丢掉
+          prependPath(spawnEnv, [appDir, privBin]);
           spawnEnv.NODE = path.join(appDir, 'node.exe');
         }
       } catch (_) { /* pnpm 注入失败不阻塞启动 */ }
@@ -751,9 +756,22 @@ class Launcher extends EventEmitter {
     }
     // 回退：npx（系统 node 环境）——零依赖机器上 npx 不存在时也会触发 error 事件（UI 显示失败）
     if (!this.proc) {
-      this.log('未发现本机 dsh，使用 npx 自动下载安装并启动…');
-      this.proc = spawn('npx', ['--yes', '@deepseek-ai/dsh'].concat(args), {
+      // 2026-09-29 实测事故（UAT）：原来的 `npx --yes @deepseek-ai/dsh` **不带版本**，
+      // npx 于是解析 `latest`。实测那次 `latest`=0.1.7-rc.2 而本机已装 0.2.0-rc.2 ——
+      // 回退反而**把运行版本降级了**（且没有任何提示）。而且原来没有传 `env`，
+      // 应用注入的 PATH（含 node.exe 与 pnpm shim 目录）在这一路径上全部丢失。
+      // 现在：① 与启动更新检查同一套"多候选标签取版本最高者"逻辑决定规格；
+      //       ② 传入 spawnEnv，行为与正常启动路径一致。
+      let spec = dshInstallSpec();
+      try {
+        // 懒加载避免模块级循环依赖（updater 顶层 require 本模块）
+        const best = await require('./updater').bestRelease(6000);
+        if (best && best.version) spec = '@deepseek-ai/dsh@' + best.version;
+      } catch (_) { /* 查询失败 → 回退到标签形态，不阻断启动 */ }
+      this.log('未发现本机 dsh，使用 npx 自动下载安装并启动…（' + spec + '）');
+      this.proc = spawn('npx', ['--yes', spec].concat(args), {
         cwd: this.safeWorkDir(), windowsHide: true, shell: true, stdio: ['ignore', 'pipe', 'pipe'],
+        env: spawnEnv,
       });
       this.running = true;
       this._wireProc();
