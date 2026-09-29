@@ -258,12 +258,62 @@ function patchEntryPresent(text) {
   return false;
 }
 
+// ---------------- 4.1) 用户真实配置的暂存/回填（2026-09-29 实测事故修复）----------------
+// 事故：宿主包一时不可解析时本模块会**摘除** email 挂载条目防 dsh 启动失败（见主入口 4.5），
+// 而环境恢复后 `ensurePatchEntry` 重新挂载插入的是 `DEFAULT_PATCH_BLOCK`（imap.example.com /
+// you@example.com 之类的**占位模板**）——用户填好的 IMAP/SMTP 主机、账号、**密码**就此被抹掉。
+// 实测证据（~/.dsh/profiles/web）：20:30 备份含真实值 → 21:03 条目被摘除（37 条）→ 21:09 重新
+// 挂载后变成占位值（38 条），整份文件 14 行差异全部落在 email 段。
+//
+// 现在：摘除**之前**先把条目原文暂存成 `cordis.patch.yml.bak-emailstash`，重新挂载时优先回填
+// 暂存内容；只有从未暂存过（真正的首次挂载）才用占位模板。每次摘除都会用当时的真实内容刷新暂存，
+// 因此用户之后改过的值同样会被保住。
+const EMAIL_STASH_SUFFIX = '.bak-emailstash';
+
+function emailStashPath(profile) {
+  return path.join(profile, 'cordis.patch.yml' + EMAIL_STASH_SUFFIX);
+}
+
+/** 是否仍是内置占位模板（占位值没有暂存价值，也不该被当作"用户配置"回填）。 */
+function looksLikePlaceholder(text) {
+  return /example\.com|you@example\.com/.test(String(text || ''));
+}
+
+/** 摘除前暂存条目原文；返回是否真的暂存了。只读+单文件写，任何异常都不阻断调用方。 */
+function stashEmailEntry(profile, block, log) {
+  try {
+    if (!block || !patchEntryPresent(block)) return false;
+    if (looksLikePlaceholder(block)) return false;   // 占位值无需暂存
+    fs.mkdirSync(profile, { recursive: true });
+    fs.writeFileSync(emailStashPath(profile), block.replace(/\s*$/, '\n'), 'utf8');
+    if (log) log('默认插件：已暂存 email 挂载条目的**现有配置**（摘除前）→ cordis.patch.yml' + EMAIL_STASH_SUFFIX);
+    return true;
+  } catch (e) {
+    if (log) log('默认插件：暂存 email 配置失败（不阻断摘除）：' + (e && e.message ? e.message : e));
+    return false;
+  }
+}
+
+function readEmailStash(profile) {
+  try {
+    const p = emailStashPath(profile);
+    if (!fs.existsSync(p)) return '';
+    const t = fs.readFileSync(p, 'utf8');
+    return t.trim() ? t : '';
+  } catch (_) { return ''; }
+}
+
 function ensurePatchEntry(profile, log, patchBlock) {
-  const block = typeof patchBlock === 'string' && patchBlock.trim().length > 0 ? patchBlock : DEFAULT_PATCH_BLOCK;
+  const fallback = typeof patchBlock === 'string' && patchBlock.trim().length > 0 ? patchBlock : DEFAULT_PATCH_BLOCK;
   const patchFile = path.join(profile, 'cordis.patch.yml');
   let text = '';
   try { text = fs.readFileSync(patchFile, 'utf8'); } catch (_) { text = ''; }
   if (patchEntryPresent(text)) return { changed: false, reason: 'already-mounted' };
+
+  // 2026-09-29 事故修复：优先回填"摘除前暂存的用户真实配置"——绝不拿占位模板覆盖用户填过的值。
+  const stashed = readEmailStash(profile);
+  const block = stashed || fallback;
+  const fromStash = Boolean(stashed);
 
   let next;
   // 有效内容 = 去掉注释行后的文本（profile 模板是「注释 + []」，不能按整段文本判列表）
@@ -289,8 +339,9 @@ function ensurePatchEntry(profile, log, patchBlock) {
     if (text.trim().length > 0) backupFile(patchFile, 'defaultplugin');
     fs.mkdirSync(profile, { recursive: true });
     fs.writeFileSync(patchFile, next, 'utf8');
-    if (log) log('默认插件：已在 cordis.patch.yml 挂载 ' + PLUGIN_DIR_NAME + '（id: ' + PATCH_ENTRY_ID + '）');
-    return { changed: true, reason: 'inserted' };
+    if (log) log('默认插件：已在 cordis.patch.yml 挂载 ' + PLUGIN_DIR_NAME + '（id: ' + PATCH_ENTRY_ID + '）'
+      + (fromStash ? '——**回填了摘除前暂存的真实配置**（未被占位模板覆盖）' : '（首次挂载，使用占位模板）'));
+    return { changed: true, reason: fromStash ? 'inserted-from-stash' : 'inserted' };
   } catch (err) {
     if (log) log('默认插件：写入 cordis.patch.yml 失败：' + (err && err.message ? err.message : err));
     return { changed: false, reason: 'write-failed' };
@@ -322,6 +373,9 @@ function removePatchEntry(profile, log) {
       }
       const block = lines.slice(i, j).join('\n');
       if (patchEntryPresent(block)) {
+        // 2026-09-29 事故修复：**摘除前先暂存**——否则用户填好的 IMAP/SMTP 账号与密码
+        // 会随着这段被删掉，而之后重新挂载插入的是占位模板（实测就是这么丢的）。
+        stashEmailEntry(profile, block, log);
         removed = true;
         i = j;
         continue;
@@ -540,4 +594,10 @@ module.exports = {
   PATCH_ENTRY_ID,
   DEP_SPEC,
   HOST_PACKAGES,
+  // 2026-09-29：供回归测试直接驱动"摘除即暂存 / 重挂即回填"（removePatchEntry 早已导出）
+  ensurePatchEntry,
+  stashEmailEntry,
+  readEmailStash,
+  emailStashPath,
+  EMAIL_STASH_SUFFIX,
 };
