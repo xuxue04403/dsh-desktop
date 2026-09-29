@@ -860,6 +860,15 @@ function runServiceOp(label, fn) {
 }
 
 async function startService() {
+  // v1.9.3（2026-09-29 实测竞态）：升级期间**不得**拉起服务。
+  // 事故：启动流程的 startService() 与升级的 `npm install` 抢跑——安装窗口内 `node-global`
+  // 被腾空，findDsh 只找得到 npx 缓存里的旧版（实测 0.1.7-rc.2），于是进程在 21:09:57 起来、
+  // 而升级 21:10:14 才完成；日志写着"自动升级成功 0.2.0-rc.2"，**实际运行的却是旧版**。
+  // 现在启动流程让位，由升级流程在安装完成后负责拉起（见 upgradeDsh 的 shouldRunAfter）。
+  if (upgrading) {
+    logger.appendLog('[启动] 升级进行中 —— 暂不拉起服务（升级完成后会自动拉起）');
+    return { ok: false, error: 'upgrade-in-progress' };
+  }
   return runServiceOp('启动', async () => {
     readyHandled = false;
     // v1.9.0：新一次启动 = 新 authority 令牌，会话 cookie 必须重换（见 loadWebUI）
@@ -893,11 +902,15 @@ async function startService() {
 function logSlowBootDetails(bootMs) {
   try {
     const p = logger.webLogPath();
-    if (!p || !fs.existsSync(p)) {
+    // 2026-09-29 修复：本文件**没有顶层 `fs` 绑定**（别处一律用内联 require('fs') 或 fsExists()，
+    // 第 456 行还专门注明"避免顶层绑定的命名冲突"）。这里原先直接写 `fs.existsSync` / `fs.readFileSync`
+    // → 每次抛 ReferenceError: fs is not defined → 被下面的 catch 吞掉，日志只留一行
+    // "读取 web.log 失败：fs is not defined"。**该功能自 2026-09-11 加入以来从未工作过。**
+    if (!p || !fsExists(p)) {
       logger.appendLog('[启动诊断] web.log 不存在（dsh 未输出？）');
       return;
     }
-    const lines = String(fs.readFileSync(p, 'utf8')).split(/\r?\n/).filter((l) => l.trim());
+    const lines = String(require('fs').readFileSync(p, 'utf8')).split(/\r?\n/).filter((l) => l.trim());
     const tail = lines.slice(-25);
     logger.appendLog('[启动诊断] dsh 就绪耗时 ' + Math.round(bootMs / 1000) + 's（偏慢）；web.log 末尾 '
       + tail.length + ' 行（共 ' + lines.length + ' 行）：');
@@ -927,6 +940,10 @@ async function upgradeDsh(trigger, spec) {
   }
   upgrading = true;
   const wasRunning = launcher.running;
+  // v1.9.3（2026-09-29 实测竞态）：启动流程也会调 startService()，它与本函数的 npm install
+  // 抢跑会导致"装完却跑着旧版"。现在启动流程在 upgrading 期间让位（见 startService 的守卫），
+  // 因此这里必须把"本次是启动自动触发"也视为**应当拉起服务**，否则升级完成后没人拉服务。
+  const shouldRunAfter = wasRunning || trigger === '启动自动';
   try {
     const before = launcher.found ? launcher.found.version : '(未安装)';
     logger.appendLog('[升级] 开始自动升级 dsh（' + trigger + '，当前 ' + before + '）…');
@@ -952,8 +969,8 @@ async function upgradeDsh(trigger, spec) {
       logger.appendLog('[升级] 安装失败：' + r.output.slice(-600));
       state.update({ phase: 'dsh 升级失败（详见日志），可手动执行: '
         + (spec ? 'npm i -g ' + spec : dshTag.dshUpgradeCommand()) });
-      // 失败回退：若之前在运行，重启旧版继续可用
-      if (wasRunning) { await startService(); }
+      // 失败回退：原本在跑、或本次是启动自动触发 → 拉起服务（让位期间没人拉）
+      if (shouldRunAfter) { await startService(); }
       return { ok: false, error: r.output.slice(-300) };
     }
 
@@ -968,9 +985,10 @@ async function upgradeDsh(trigger, spec) {
     }
     state.update({ dshVersion: after });
 
-    // 4) 之前在运行 → 重启服务
-    if (wasRunning) {
-      logger.appendLog('[升级] 重启 dsh web 服务…');
+    // 4) 拉起服务：原本在跑 → 重启；启动自动触发 → 也要拉起（启动流程已让位）
+    if (shouldRunAfter) {
+      logger.appendLog('[升级] ' + (wasRunning ? '重启' : '启动') + ' dsh web 服务…（确保运行的是刚装好的 '
+        + after + '，避免安装窗口内抢跑选中旧版）');
       await startService();
     } else {
       state.update({ phase: 'dsh 已升级到 ' + after });
@@ -980,7 +998,7 @@ async function upgradeDsh(trigger, spec) {
   } catch (err) {
     const msg = err && err.message ? err.message : String(err);
     logger.appendLog('[升级] 异常：' + msg);
-    if (wasRunning) { try { await startService(); } catch (_) { /* 忽略 */ } }
+    if (shouldRunAfter) { try { await startService(); } catch (_) { /* 忽略 */ } }
     return { ok: false, error: msg };
   } finally {
     upgrading = false;
