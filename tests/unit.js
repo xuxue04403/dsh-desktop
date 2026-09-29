@@ -660,7 +660,191 @@ t('接线回归：安装/升级路径不得再写死 @latest（否则版本分�
     'performUpgrade 必须优先使用调用方判定的确切版本规格');
 });
 
+// ================= 2026-09-29：PATH 键名大小写事故（真实缺陷，症状极隐蔽）=================
+// 事故链：Windows 上 PATH 的键名通常是 `Path`（混合大小写），而 `Object.assign({}, process.env, …)`
+// 产出的是**普通对象**（键名大小写敏感）。旧的 `env.PATH = appDir + ';' + (env.PATH || '')` 因此
+// **不是更新原值，而是新建了一个 `PATH` 键**（原值被当成空串）；Node 序列化环境块时按大小写不敏感
+// 去重、后设的 `PATH` 胜出 → **完整 PATH 被整个丢掉**。
+// 实测：应用被资源管理器（`Path`，19 项）启动，交给 dsh 的子进程只剩 2 个目录，DSH 的 shell 里
+// `icacls`/`robocopy`/`git`/`cmd` 全部按名字调不到（也让 ACL 诊断首轮直接 INCOMPLETE）。
+
+t('winutil.prependPath：不得新建大小写不同的重复 PATH 键（否则整份原 PATH 会被丢掉）', () => {
+  const { pathKeyOf, prependPath } = require('../src/winutil');
+
+  // 形态 1：键名是 Windows 常见的 `Path` —— 必须**就地更新**，绝不能多出一个 `PATH`
+  const env1 = { Path: 'C:\\Windows\\system32;C:\\Program Files\\Git\\cmd', ComSpec: 'x' };
+  const key1 = prependPath(env1, ['D:\\app', 'D:\\app\\market']);
+  assert.strictEqual(key1, 'Path', '应识别出既有键名是 Path');
+  assert.deepStrictEqual(Object.keys(env1).filter((k) => k.toLowerCase() === 'path'), ['Path'],
+    '不得出现第二个（大小写不同的）PATH 键 —— 这正是原 PATH 被丢弃的成因');
+  assert.strictEqual(env1.Path, 'D:\\app;D:\\app\\market;C:\\Windows\\system32;C:\\Program Files\\Git\\cmd',
+    '前置后应保留完整原值');
+  assert.ok(!('PATH' in env1), '不得额外创建 PATH 键');
+
+  // 形态 2：键名本就是大写 `PATH` —— 保持原键名
+  const env2 = { PATH: 'C:\\Windows\\system32' };
+  assert.strictEqual(prependPath(env2, ['D:\\app']), 'PATH');
+  assert.deepStrictEqual(Object.keys(env2), ['PATH'], '不应新增其它键');
+
+  // 形态 3：完全没有 PATH —— 才创建 `PATH`
+  const env3 = { ComSpec: 'x' };
+  assert.strictEqual(prependPath(env3, ['D:\\app']), 'PATH');
+  assert.strictEqual(env3.PATH, 'D:\\app');
+
+  // 形态 4：空目录项应被跳过，且空/未定义的原值不留分隔符残渣
+  const env4 = { Path: '' };
+  prependPath(env4, ['D:\\app', '', null, undefined, 'D:\\b']);
+  assert.strictEqual(env4.Path, 'D:\\app;D:\\b', '空项应跳过、结尾不应有多余分隔符');
+
+  assert.strictEqual(pathKeyOf({ Path: 'x' }), 'Path');
+  assert.strictEqual(pathKeyOf({ PATH: 'x' }), 'PATH');
+  assert.strictEqual(pathKeyOf({}), 'PATH');
+
+  // 关键反例：证明旧写法确实会丢值（同一对象上用旧写法，出现两个键）
+  const buggy = Object.assign({}, { Path: 'C:\\Windows\\system32;C:\\Program Files\\Git\\cmd' });
+  buggy.PATH = 'D:\\app;' + (buggy.PATH || '');
+  assert.strictEqual(Object.keys(buggy).length, 2,
+    '旧写法确实产生了 Path + PATH 两个键（这就是缺陷本体）');
+  assert.strictEqual(buggy.PATH, 'D:\\app;', '旧写法把原值当成了空串');
+  assert.strictEqual(buggy.Path, 'C:\\Windows\\system32;C:\\Program Files\\Git\\cmd',
+    '原值仍挂在 Path 键上 —— 序列化去重时被后设的 PATH 覆盖，于是整份丢失');
+});
+
+t('接线回归：launcher/market 不得再用 `env.PATH =` 这种大小写敏感写法', () => {
+  const root = path.join(__dirname, '..', 'src');
+  for (const f of ['launcher.js', 'market.js']) {
+    const src = fs.readFileSync(path.join(root, f), 'utf8');
+    // 注释里可以提（说明历史），代码行不行
+    const codeLines = src.split(/\r?\n/).filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l));
+    const bad = codeLines.filter((l) => /\.PATH\s*=/.test(l));
+    assert.strictEqual(bad.length, 0, f + ' 仍有大小写敏感的 PATH 赋值：' + JSON.stringify(bad));
+    assert.ok(/prependPath\(/.test(src), f + ' 应改用 winutil.prependPath()');
+  }
+});
+
+// ================= 2026-09-29（UAT 实测）：两个"静默失效"的真实缺陷 =================
+// ① main.js 没有顶层 `fs` 绑定（别处一律内联 require('fs')），慢启动取证却直接写 `fs.existsSync`
+//    → 每次抛 ReferenceError 被 catch 吞掉，日志只留一行"读取 web.log 失败：fs is not defined"，
+//    该功能自 2026-09-11 加入以来**从未工作过**。
+// ② launcher 的 npx 回退用 `npx --yes @deepseek-ai/dsh`（不带版本）→ npx 解析 latest；实测那次
+//    latest=0.1.7-rc.2 而本机已装 0.2.0-rc.2，**回退反而把运行版本降级了**；且没传 spawnEnv，
+//    应用注入的 PATH 在该路径上全部丢失。
+
+t('接线回归：慢启动取证不得引用未定义的 fs（否则该诊断永远只打印 ReferenceError）', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+  assert.ok(!/^\s*const\s+fs\s*=\s*require\('fs'\)/m.test(src),
+    '前提：main.js 刻意不做顶层 fs 绑定（第 456 行有注释说明）');
+  const codeLines = src.split(/\r?\n/).filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l));
+  // 裸 `fs.`（既不是 require('fs'). 也不是某个 xxx.fs.）一律是 ReferenceError
+  const bad = codeLines.filter((l) => /(^|[^.\w'"])fs\.[a-zA-Z]/.test(l) && !/require\('fs'\)/.test(l));
+  assert.strictEqual(bad.length, 0, 'main.js 出现未定义的 fs 引用：' + JSON.stringify(bad));
+  assert.ok(/fsExists\(p\)/.test(src) && /require\('fs'\)\.readFileSync\(p/.test(src),
+    '慢启动取证应改用 fsExists() 与内联 require(fs)');
+});
+
+t('接线回归：npx 回退必须带版本并传 spawnEnv（否则可能降级、并丢失注入的环境）', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'launcher.js'), 'utf8');
+  const at = src.indexOf('回退：npx');
+  assert.ok(at > 0, '应能找到 npx 回退段落');
+  const block = src.slice(at, at + 1600);
+  assert.ok(/bestRelease\(/.test(block),
+    'npx 回退应复用"多候选标签取版本最高者"，避免 npx 默认解析 latest 造成降级');
+  assert.ok(/env:\s*spawnEnv/.test(block), 'npx 回退必须传 spawnEnv（与正常启动路径一致）');
+  assert.ok(!/\['--yes',\s*'@deepseek-ai\/dsh'\]/.test(src),
+    '不得再出现不带版本的 npx 规格');
+});
+
+// 2026-09-29（主目录实测）
+t('接线回归：升级期间不得拉起服务（否则会与 npm install 抢跑、选中 npx 缓存里的旧版）', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'main.js'), 'utf8');
+
+  // ① startService 必须在真正启动动作**之前**检查 upgrading
+  const at = src.indexOf('async function startService()');
+  assert.ok(at > 0, '应能找到 startService 定义');
+  const head = src.slice(at, at + 1200);
+  const guard = head.indexOf('if (upgrading)');
+  const opStart = head.indexOf("runServiceOp('启动'");
+  assert.ok(guard > 0, 'startService 必须在开头检查 upgrading 并让位');
+  assert.ok(opStart > guard, '守卫必须早于 runServiceOp(启动)，否则等于没生效');
+
+  // ② upgradeDsh 必须把"启动自动"也视为应拉起服务（启动流程已让位，否则没人拉）
+  assert.ok(/const shouldRunAfter = wasRunning \|\| trigger === '启动自动'/.test(src),
+    'upgradeDsh 必须定义 shouldRunAfter 并把"启动自动"计入');
+
+  // ③ 成功 / 失败 / 异常三条路径都不得再用裸 wasRunning 决定是否拉服务
+  const up = src.slice(src.indexOf('async function upgradeDsh'), src.indexOf('async function upgradeDsh') + 5000);
+  const stale = up.split(/\r?\n/).filter((l) => /if \(wasRunning\)[^\n]*startService\(\)/.test(l));
+  assert.strictEqual(stale.length, 0, '仍有按 wasRunning 决定拉服务的旧写法：' + JSON.stringify(stale));
+  assert.ok(/if \(shouldRunAfter\) \{ await startService\(\); \}/.test(up), '失败路径应用 shouldRunAfter');
+  const hits = (up.match(/shouldRunAfter/g) || []).length;
+  assert.ok(hits >= 4, 'shouldRunAfter 应覆盖定义处 + 三条路径，实际出现 ' + hits + ' 次');
+});
+
 // 等所有异步用例结束后再出汇总，并把真实失败数写进退出码（旧版恒为 "0 failed" 且恒 exit 0）
+// 2026-09-29（真实数据事故）：默认插件的"摘除 → 重新挂载"会抹掉用户的真实配置
+t('default-plugins：摘除 email 条目必须先暂存真实配置，重新挂载时回填真值而非占位模板', () => {
+  const dp = require('../src/default-plugins');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dp-'));
+  const patchFile = path.join(dir, 'cordis.patch.yml');
+  const REAL = [
+    '',
+    '- id: email',
+    '  name: dsh-email-bridge',
+    '  config:',
+    '    imap:',
+    "      host: 'imap.corp.invalid'",
+    '      port: 993',
+    "      user: 'real-user@corp.invalid'",
+    '    smtp:',
+    "      host: 'smtp.corp.invalid'",
+    "      password: 'REAL-SECRET'",
+    '',
+    '- id: other',
+    '  name: some-other-plugin',
+    '',
+  ].join('\n');
+  const logs = [];
+  const log = (s) => logs.push(String(s));
+  try {
+    fs.writeFileSync(patchFile, REAL, 'utf8');
+
+    // ① 摘除：条目消失，但真实配置被暂存下来
+    assert.strictEqual(dp.removePatchEntry(dir, log), true, '应摘除 email 条目');
+    const afterRemove = fs.readFileSync(patchFile, 'utf8');
+    assert.ok(!/dsh-email-bridge/.test(afterRemove), '摘除后不应再有 email 条目');
+    assert.ok(/some-other-plugin/.test(afterRemove), '别的条目不得被误删');
+    const stash = dp.emailStashPath(dir);
+    assert.ok(fs.existsSync(stash), '摘除前必须暂存条目原文：' + stash);
+    const stashed = fs.readFileSync(stash, 'utf8');
+    assert.ok(/imap\.corp\.invalid/.test(stashed) && /REAL-SECRET/.test(stashed),
+      '暂存的必须是用户的真实值：\n' + stashed);
+
+    // ② 重新挂载：必须回填真值，绝不能写占位模板
+    const r = dp.ensurePatchEntry(dir, log, ['', '- id: email', '  name: dsh-email-bridge',
+      '  config:', '    imap:', '      host: imap.example.com', '      user: you@example.com', ''].join('\n'));
+    assert.strictEqual(r.changed, true);
+    assert.strictEqual(r.reason, 'inserted-from-stash', '应走"从暂存回填"路径，而不是插入占位');
+    const afterMount = fs.readFileSync(patchFile, 'utf8');
+    assert.ok(/imap\.corp\.invalid/.test(afterMount) && /REAL-SECRET/.test(afterMount),
+      '重新挂载后必须仍是用户的真实配置：\n' + afterMount);
+    assert.ok(!/example\.com/.test(afterMount), '不得出现占位值 example.com：\n' + afterMount);
+    assert.strictEqual((afterMount.match(/id:\s*email/g) || []).length, 1, '不得出现重复条目');
+    assert.ok(logs.some((l) => /已暂存 email 挂载条目的/.test(l)), '日志应写明已暂存');
+
+    // ③ 占位模板本身不该被暂存（没有保存价值，也不该覆盖真正的暂存）
+    const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-dp2-'));
+    try {
+      fs.writeFileSync(path.join(dir2, 'cordis.patch.yml'),
+        ['', '- id: email', '  name: dsh-email-bridge', '  config:', '    imap:',
+          '      host: imap.example.com', '      user: you@example.com', ''].join('\n'), 'utf8');
+      dp.removePatchEntry(dir2, () => {});
+      assert.ok(!fs.existsSync(dp.emailStashPath(dir2)), '占位模板不应被暂存');
+    } finally { fs.rmSync(dir2, { recursive: true, force: true }); }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 (async () => {
   await Promise.all(pending);
   console.log('');
