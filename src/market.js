@@ -19,7 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 // 可移植性修复（2026-09-11）：cmd.exe 解析不再依赖 process.env.ComSpec（克隆机上常失效）
-const { resolveCmdExe } = require('./winutil');
+const { resolveCmdExe, prependPath } = require('./winutil');
 
 // ---------------- 源 ----------------
 // 默认源：dshfind（官方 market 的合作源；标准 provider page 契约 /market/v1/plugins，
@@ -303,7 +303,9 @@ class MarketOps {
         'exit /b %errorlevel%',
         '',
       ].join('\r\n'), 'utf8');
-      env.PATH = appDir + path.delimiter + privBin + path.delimiter + (env.PATH || '');
+      // 同 launcher：必须大小写不敏感前置 —— Windows 上变量名通常是 `Path`，而 `env` 是
+      // Object.assign 出来的普通对象（键名大小写敏感），写 `env.PATH` 会新建重复键并丢掉原 PATH。
+      prependPath(env, [appDir, privBin]);
       env.NODE = path.join(appDir, 'node.exe');
     } catch (e) {
       this.log('pnpm 环境准备失败：' + (e && e.message ? e.message : e));
